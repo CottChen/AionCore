@@ -1,10 +1,17 @@
 mod auth;
+mod conversation;
 mod lifecycle;
 mod provider;
 mod response;
 mod system;
 mod websocket;
 
+pub use conversation::{
+    CloneConversationRequest, ConversationListResponse, ConversationResponse,
+    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse,
+    MessageResponse, MessageSearchItem, MessageSearchResponse, SearchMessagesQuery,
+    UpdateConversationRequest,
+};
 pub use auth::{
     AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser,
     QrLoginRequest, RefreshResponse, RefreshTokenRequest, UserInfoResponse, WsTokenResponse,

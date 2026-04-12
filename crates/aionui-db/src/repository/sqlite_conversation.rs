@@ -165,22 +165,7 @@ impl IConversationRepository for SqliteConversationRepository {
             binds.push(BindValue::Str(cursor_id.clone()));
         }
 
-        if let Some(ref source) = filters.source {
-            where_parts.push("c.source = ?".to_string());
-            binds.push(BindValue::Str(source.clone()));
-        }
-
-        if let Some(ref cron_job_id) = filters.cron_job_id {
-            where_parts.push(
-                "json_extract(c.extra, '$.cronJobId') = ?".to_string(),
-            );
-            binds.push(BindValue::Str(cron_job_id.clone()));
-        }
-
-        if let Some(pinned) = filters.pinned {
-            where_parts.push("c.pinned = ?".to_string());
-            binds.push(BindValue::Bool(pinned));
-        }
+        append_filter_conditions(filters, &mut where_parts, &mut binds);
 
         let where_clause = where_parts.join(" AND ");
 
@@ -566,14 +551,14 @@ fn bind_value_as<'q, T>(
     }
 }
 
-/// Builds a count query and bind values for the total (ignoring cursor).
-fn build_count_sql(
-    user_id: &str,
+/// Appends shared filter conditions (source, cron_job_id, pinned) to WHERE
+/// clause parts and bind values. Used by both `list_paginated` and the count
+/// query to keep filter logic in one place.
+fn append_filter_conditions(
     filters: &ConversationFilters,
-) -> (String, Vec<BindValue>) {
-    let mut where_parts = vec!["c.user_id = ?".to_string()];
-    let mut binds: Vec<BindValue> = vec![BindValue::Str(user_id.to_string())];
-
+    where_parts: &mut Vec<String>,
+    binds: &mut Vec<BindValue>,
+) {
     if let Some(ref source) = filters.source {
         where_parts.push("c.source = ?".to_string());
         binds.push(BindValue::Str(source.clone()));
@@ -588,6 +573,17 @@ fn build_count_sql(
         where_parts.push("c.pinned = ?".to_string());
         binds.push(BindValue::Bool(pinned));
     }
+}
+
+/// Builds a count query and bind values for the total (ignoring cursor).
+fn build_count_sql(
+    user_id: &str,
+    filters: &ConversationFilters,
+) -> (String, Vec<BindValue>) {
+    let mut where_parts = vec!["c.user_id = ?".to_string()];
+    let mut binds: Vec<BindValue> = vec![BindValue::Str(user_id.to_string())];
+
+    append_filter_conditions(filters, &mut where_parts, &mut binds);
 
     let sql = format!(
         "SELECT COUNT(*) FROM conversations c WHERE {}",
