@@ -22,7 +22,7 @@ pub enum WsOutbound {
     /// UTF-8 text frame.
     Text(String),
     /// Close frame with status code and reason.
-    Close(u16, String),
+    Close(WebSocketCloseCode, String),
 }
 
 /// WebSocket close codes per RFC 6455.
@@ -95,8 +95,17 @@ mod tests {
 
     #[test]
     fn ws_outbound_close() {
-        let msg = WsOutbound::Close(1008, "policy violation".into());
-        assert_eq!(msg, WsOutbound::Close(1008, "policy violation".into()));
+        let msg = WsOutbound::Close(
+            WebSocketCloseCode::PolicyViolation,
+            "policy violation".into(),
+        );
+        assert_eq!(
+            msg,
+            WsOutbound::Close(
+                WebSocketCloseCode::PolicyViolation,
+                "policy violation".into()
+            )
+        );
     }
 
     #[test]

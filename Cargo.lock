@@ -287,7 +287,6 @@ name = "aionui-realtime"
 version = "0.1.0"
 dependencies = [
  "aionui-api-types",
- "aionui-common",
  "axum",
  "dashmap",
  "serde",
