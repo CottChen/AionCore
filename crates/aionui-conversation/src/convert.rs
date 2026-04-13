@@ -1,8 +1,11 @@
-use aionui_api_types::ConversationResponse;
+use aionui_api_types::{ConversationResponse, MessageResponse, MessageSearchItem};
 use aionui_common::{
-    AgentType, AppError, ConversationSource, ConversationStatus, ProviderWithModel,
+    AgentType, AppError, ConversationSource, ConversationStatus, MessagePosition, MessageStatus,
+    MessageType, ProviderWithModel,
 };
 use aionui_db::models::ConversationRow;
+use aionui_db::models::MessageRow;
+use aionui_db::MessageSearchRow;
 
 /// Convert a database row into an API response DTO.
 ///
@@ -51,6 +54,50 @@ pub fn row_to_response(row: ConversationRow) -> Result<ConversationResponse, App
 pub fn string_to_enum<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, AppError> {
     serde_json::from_value(serde_json::Value::String(s.to_owned()))
         .map_err(|e| AppError::Internal(format!("Invalid enum value '{s}': {e}")))
+}
+
+/// Convert a message database row into an API response DTO.
+pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, AppError> {
+    let msg_type: MessageType = string_to_enum(&row.r#type)?;
+
+    let position: Option<MessagePosition> = row
+        .position
+        .as_deref()
+        .map(string_to_enum)
+        .transpose()?;
+
+    let status: Option<MessageStatus> = row
+        .status
+        .as_deref()
+        .map(string_to_enum)
+        .transpose()?;
+
+    let content: serde_json::Value = serde_json::from_str(&row.content)
+        .map_err(|e| AppError::Internal(format!("Invalid message content JSON: {e}")))?;
+
+    Ok(MessageResponse {
+        id: row.id,
+        conversation_id: row.conversation_id,
+        msg_id: row.msg_id,
+        r#type: msg_type,
+        content,
+        position,
+        status,
+        hidden: row.hidden,
+        created_at: row.created_at,
+    })
+}
+
+/// Convert a search result row into an API search item DTO.
+pub fn search_row_to_item(row: MessageSearchRow) -> MessageSearchItem {
+    MessageSearchItem {
+        message_id: row.message_id,
+        conversation_id: row.conversation_id,
+        conversation_name: row.conversation_name,
+        r#type: row.r#type,
+        content: row.content,
+        created_at: row.created_at,
+    }
 }
 
 #[cfg(test)]

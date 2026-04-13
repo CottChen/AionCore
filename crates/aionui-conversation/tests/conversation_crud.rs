@@ -251,7 +251,7 @@ async fn t2_5_pinned_filter() {
     // Pin one
     let pin_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": true })).unwrap();
-    svc.update(&conv.id, pin_req).await.unwrap();
+    svc.update(USER_ID, &conv.id, pin_req).await.unwrap();
 
     let query = ListConversationsQuery {
         pinned: Some(true),
@@ -269,7 +269,7 @@ async fn t3_1_get_existing() {
     let (svc, _) = setup().await;
     let created = svc.create(USER_ID, make_create_req()).await.unwrap();
 
-    let fetched = svc.get(&created.id).await.unwrap();
+    let fetched = svc.get(USER_ID, &created.id).await.unwrap();
     assert_eq!(fetched.id, created.id);
     assert_eq!(fetched.r#type, created.r#type);
     assert_eq!(fetched.name, created.name);
@@ -279,7 +279,7 @@ async fn t3_1_get_existing() {
 #[tokio::test]
 async fn t3_2_get_not_found() {
     let (svc, _) = setup().await;
-    let err = svc.get("non-existent-uuid").await.unwrap_err();
+    let err = svc.get(USER_ID, "non-existent-uuid").await.unwrap_err();
     assert!(matches!(err, aionui_common::AppError::NotFound(_)));
 }
 
@@ -293,7 +293,7 @@ async fn t4_1_update_name() {
 
     let req: UpdateConversationRequest =
         serde_json::from_value(json!({ "name": "New Name" })).unwrap();
-    let updated = svc.update(&conv.id, req).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req).await.unwrap();
 
     assert_eq!(updated.name, "New Name");
     assert!(updated.modified_at >= conv.modified_at);
@@ -310,7 +310,7 @@ async fn t4_2_pin_conversation() {
 
     let req: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": true })).unwrap();
-    let updated = svc.update(&conv.id, req).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req).await.unwrap();
 
     assert!(updated.pinned);
     assert!(updated.pinned_at.is_some());
@@ -324,13 +324,13 @@ async fn t4_3_unpin_clears_pinned_at() {
     // Pin
     let pin: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": true })).unwrap();
-    let pinned = svc.update(&conv.id, pin).await.unwrap();
+    let pinned = svc.update(USER_ID, &conv.id, pin).await.unwrap();
     assert!(pinned.pinned_at.is_some());
 
     // Unpin
     let unpin: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": false })).unwrap();
-    let unpinned = svc.update(&conv.id, unpin).await.unwrap();
+    let unpinned = svc.update(USER_ID, &conv.id, unpin).await.unwrap();
     assert!(!unpinned.pinned);
     assert!(unpinned.pinned_at.is_none());
 }
@@ -350,7 +350,7 @@ async fn t4_4_extra_merge_preserves_existing_keys() {
     // Update only workspace
     let update_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "extra": { "workspace": "/new" } })).unwrap();
-    let updated = svc.update(&conv.id, update_req).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.id, update_req).await.unwrap();
 
     assert_eq!(updated.extra["workspace"], "/new");
     assert_eq!(updated.extra["contextFileName"], "ctx.md");
@@ -365,7 +365,7 @@ async fn t4_5_update_model() {
         "model": { "providerId": "p2", "model": "new-model" }
     }))
     .unwrap();
-    let updated = svc.update(&conv.id, req).await.unwrap();
+    let updated = svc.update(USER_ID, &conv.id, req).await.unwrap();
 
     let model = updated.model.unwrap();
     assert_eq!(model.provider_id, "p2");
@@ -377,7 +377,7 @@ async fn t4_6_update_not_found() {
     let (svc, _) = setup().await;
     let req: UpdateConversationRequest =
         serde_json::from_value(json!({ "name": "x" })).unwrap();
-    let err = svc.update("non-existent", req).await.unwrap_err();
+    let err = svc.update(USER_ID, "non-existent", req).await.unwrap_err();
     assert!(matches!(err, aionui_common::AppError::NotFound(_)));
 }
 
@@ -389,10 +389,10 @@ async fn t5_1_delete_conversation() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     broadcaster.take_events();
 
-    svc.delete(&conv.id).await.unwrap();
+    svc.delete(USER_ID, &conv.id).await.unwrap();
 
     // Verify gone
-    let err = svc.get(&conv.id).await.unwrap_err();
+    let err = svc.get(USER_ID, &conv.id).await.unwrap_err();
     assert!(matches!(err, aionui_common::AppError::NotFound(_)));
 
     // Verify broadcast
@@ -407,15 +407,15 @@ async fn t5_2_delete_then_get_returns_404() {
     let (svc, _) = setup().await;
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
 
-    svc.delete(&conv.id).await.unwrap();
-    let err = svc.get(&conv.id).await.unwrap_err();
+    svc.delete(USER_ID, &conv.id).await.unwrap();
+    let err = svc.get(USER_ID, &conv.id).await.unwrap_err();
     assert!(matches!(err, aionui_common::AppError::NotFound(_)));
 }
 
 #[tokio::test]
 async fn t5_3_delete_not_found() {
     let (svc, _) = setup().await;
-    let err = svc.delete("non-existent").await.unwrap_err();
+    let err = svc.delete(USER_ID, "non-existent").await.unwrap_err();
     assert!(matches!(err, aionui_common::AppError::NotFound(_)));
 }
 
@@ -441,7 +441,7 @@ async fn t11_2_update_broadcasts_updated() {
 
     let req: UpdateConversationRequest =
         serde_json::from_value(json!({ "name": "x" })).unwrap();
-    svc.update(&conv.id, req).await.unwrap();
+    svc.update(USER_ID, &conv.id, req).await.unwrap();
 
     let events = broadcaster.take_events();
     assert_eq!(events[0].data["action"], "updated");
@@ -453,7 +453,7 @@ async fn t11_3_delete_broadcasts_deleted() {
     let conv = svc.create(USER_ID, make_create_req()).await.unwrap();
     broadcaster.take_events();
 
-    svc.delete(&conv.id).await.unwrap();
+    svc.delete(USER_ID, &conv.id).await.unwrap();
 
     let events = broadcaster.take_events();
     assert_eq!(events[0].data["action"], "deleted");
@@ -538,7 +538,7 @@ async fn full_lifecycle_create_get_update_delete() {
     assert_eq!(created.status, ConversationStatus::Pending);
 
     // Get
-    let fetched = svc.get(&created.id).await.unwrap();
+    let fetched = svc.get(USER_ID, &created.id).await.unwrap();
     assert_eq!(fetched.id, created.id);
 
     // Update
@@ -548,14 +548,14 @@ async fn full_lifecycle_create_get_update_delete() {
         "extra": { "workspace": "/updated" }
     }))
     .unwrap();
-    let updated = svc.update(&created.id, update_req).await.unwrap();
+    let updated = svc.update(USER_ID, &created.id, update_req).await.unwrap();
     assert_eq!(updated.name, "Updated");
     assert!(updated.pinned);
     assert_eq!(updated.extra["workspace"], "/updated");
 
     // Delete
-    svc.delete(&created.id).await.unwrap();
-    assert!(svc.get(&created.id).await.is_err());
+    svc.delete(USER_ID, &created.id).await.unwrap();
+    assert!(svc.get(USER_ID, &created.id).await.is_err());
 
     // Verify all events: created + updated + deleted
     let events = broadcaster.take_events();

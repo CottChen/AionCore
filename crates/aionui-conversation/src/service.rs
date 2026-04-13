@@ -1,15 +1,21 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ConversationListResponse, ConversationResponse, CreateConversationRequest,
-    ListConversationsQuery, UpdateConversationRequest, WebSocketMessage,
+    CloneConversationRequest, ConversationListResponse, ConversationResponse,
+    CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse,
+    MessageResponse, MessageSearchResponse, SearchMessagesQuery, UpdateConversationRequest,
+    WebSocketMessage,
 };
 use aionui_common::{
     generate_id, now_ms, AppError, ConversationSource, ConversationStatus, PaginatedResult,
 };
-use aionui_db::{ConversationFilters, ConversationRowUpdate, IConversationRepository};
+use aionui_db::{
+    ConversationFilters, ConversationRowUpdate, IConversationRepository, SortOrder,
+};
 use aionui_realtime::EventBroadcaster;
-use crate::convert::{row_to_response, string_to_enum};
+use crate::convert::{
+    row_to_message_response, row_to_response, search_row_to_item, string_to_enum,
+};
 
 /// Business logic for conversation CRUD operations.
 ///
@@ -73,11 +79,15 @@ impl ConversationService {
     }
 
     /// Get a single conversation by ID.
-    pub async fn get(&self, id: &str) -> Result<ConversationResponse, AppError> {
+    ///
+    /// Returns `NotFound` if the conversation does not exist or does not
+    /// belong to the given user (avoids leaking existence to other users).
+    pub async fn get(&self, user_id: &str, id: &str) -> Result<ConversationResponse, AppError> {
         let row = self
             .repo
             .get(id)
             .await?
+            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
         row_to_response(row)
     }
@@ -118,6 +128,7 @@ impl ConversationService {
     /// Broadcasts `conversation.listChanged(updated)`.
     pub async fn update(
         &self,
+        user_id: &str,
         id: &str,
         req: UpdateConversationRequest,
     ) -> Result<ConversationResponse, AppError> {
@@ -125,6 +136,7 @@ impl ConversationService {
             .repo
             .get(id)
             .await?
+            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
 
         let now = now_ms();
@@ -185,12 +197,13 @@ impl ConversationService {
     /// Delete a conversation (messages cascade via FK).
     ///
     /// Broadcasts `conversation.listChanged(deleted)`.
-    pub async fn delete(&self, id: &str) -> Result<(), AppError> {
-        // Get existing to retrieve source for broadcast
+    pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), AppError> {
+        // Get existing to retrieve source for broadcast and verify ownership
         let existing = self
             .repo
             .get(id)
             .await?
+            .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
 
         let source: Option<ConversationSource> = existing
@@ -203,6 +216,160 @@ impl ConversationService {
         self.broadcast_list_changed(id, "deleted", source.as_ref());
 
         Ok(())
+    }
+
+    /// Clone a conversation from an optional source, creating a new one.
+    ///
+    /// If `source_conversation_id` is given, copies config (type, model,
+    /// extra) from the source and merges with provided overrides.
+    /// Optionally migrates `cronJobId` binding.
+    /// Messages are never copied.
+    pub async fn clone_create(
+        &self,
+        user_id: &str,
+        req: CloneConversationRequest,
+    ) -> Result<ConversationResponse, AppError> {
+        let mut create_req = req.conversation;
+
+        if let Some(source_id) = &req.source_conversation_id {
+            let source_row = self
+                .repo
+                .get(source_id)
+                .await?
+                .filter(|r| r.user_id == user_id)
+                .ok_or_else(|| {
+                    AppError::NotFound(format!("Source conversation {source_id} not found"))
+                })?;
+
+            // Inherit name from source if not provided
+            if create_req.name.is_none() {
+                create_req.name = Some(source_row.name.clone());
+            }
+
+            // Merge source extra with provided extra
+            let source_extra: serde_json::Value =
+                serde_json::from_str(&source_row.extra)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+            let mut merged = source_extra;
+            merge_json(&mut merged, &create_req.extra);
+
+            // Handle cronJobId migration
+            if req.migrate_cron != Some(true)
+                && let Some(obj) = merged.as_object_mut()
+            {
+                obj.remove("cronJobId");
+            }
+
+            create_req.extra = merged;
+        }
+
+        self.create(user_id, create_req).await
+    }
+
+    /// Reset a conversation: clear messages and set status back to pending.
+    pub async fn reset(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<(), AppError> {
+        // Verify existence and ownership
+        self.repo
+            .get(id)
+            .await?
+            .filter(|r| r.user_id == user_id)
+            .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
+
+        // Delete all messages
+        self.repo.delete_messages_by_conversation(id).await?;
+
+        // Reset status to pending
+        let now = now_ms();
+        let updates = ConversationRowUpdate {
+            status: Some(enum_to_db(&ConversationStatus::Pending)?),
+            updated_at: Some(now),
+            ..Default::default()
+        };
+        self.repo.update(id, &updates).await?;
+
+        Ok(())
+    }
+
+    /// List conversations associated by the same workspace.
+    pub async fn list_associated(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<Vec<ConversationResponse>, AppError> {
+        let rows = self.repo.list_associated(user_id, id).await?;
+        rows.into_iter().map(row_to_response).collect()
+    }
+
+    /// List messages for a conversation with page-based pagination.
+    pub async fn list_messages(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        query: ListMessagesQuery,
+    ) -> Result<MessageListResponse, AppError> {
+        // Verify conversation exists and belongs to user
+        self.repo
+            .get(conversation_id)
+            .await?
+            .filter(|r| r.user_id == user_id)
+            .ok_or_else(|| {
+                AppError::NotFound(format!("Conversation {conversation_id} not found"))
+            })?;
+
+        let page = query.page.unwrap_or(1);
+        let page_size = query.page_size.unwrap_or(50);
+        let order = match query.order.as_deref() {
+            Some("ASC" | "asc") => SortOrder::Asc,
+            _ => SortOrder::Desc,
+        };
+
+        let result = self
+            .repo
+            .get_messages(conversation_id, page, page_size, order)
+            .await?;
+
+        let items: Vec<MessageResponse> = result
+            .items
+            .into_iter()
+            .map(row_to_message_response)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(PaginatedResult {
+            items,
+            total: result.total,
+            has_more: result.has_more,
+        })
+    }
+
+    /// Search messages across all conversations for the user.
+    pub async fn search_messages(
+        &self,
+        user_id: &str,
+        query: SearchMessagesQuery,
+    ) -> Result<MessageSearchResponse, AppError> {
+        if query.keyword.trim().is_empty() {
+            return Err(AppError::BadRequest("keyword must not be empty".into()));
+        }
+
+        let page = query.page.unwrap_or(1);
+        let page_size = query.page_size.unwrap_or(20);
+
+        let result = self
+            .repo
+            .search_messages(user_id, &query.keyword, page, page_size)
+            .await?;
+
+        let items = result.items.into_iter().map(search_row_to_item).collect();
+
+        Ok(PaginatedResult {
+            items,
+            total: result.total,
+            has_more: result.has_more,
+        })
     }
 
     /// Broadcast a `conversation.listChanged` WebSocket event.

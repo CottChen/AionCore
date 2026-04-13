@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use aionui_api_types::{
-    CreateConversationRequest, ListConversationsQuery, UpdateConversationRequest, WebSocketMessage,
+    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery,
+    SearchMessagesQuery, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentType, AppError, ConversationSource, ConversationStatus, PaginatedResult,
@@ -314,7 +315,7 @@ async fn get_existing_conversation() {
     let (svc, _broadcaster, _repo) = make_service();
     let created = svc.create("user_1", make_create_req()).await.unwrap();
 
-    let fetched = svc.get(&created.id).await.unwrap();
+    let fetched = svc.get("user_1", &created.id).await.unwrap();
     assert_eq!(fetched.id, created.id);
     assert_eq!(fetched.name, created.name);
 }
@@ -322,7 +323,7 @@ async fn get_existing_conversation() {
 #[tokio::test]
 async fn get_not_found() {
     let (svc, _broadcaster, _repo) = make_service();
-    let err = svc.get("non-existent").await.unwrap_err();
+    let err = svc.get("user_1", "non-existent").await.unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
 }
 
@@ -402,7 +403,7 @@ async fn list_with_pinned_filter() {
     // Pin the first one
     let update_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": true })).unwrap();
-    svc.update(&conv.id, update_req).await.unwrap();
+    svc.update("user_1", &conv.id, update_req).await.unwrap();
 
     let query = ListConversationsQuery {
         pinned: Some(true),
@@ -423,7 +424,7 @@ async fn update_name() {
 
     let req: UpdateConversationRequest =
         serde_json::from_value(json!({ "name": "New Name" })).unwrap();
-    let updated = svc.update(&conv.id, req).await.unwrap();
+    let updated = svc.update("user_1", &conv.id, req).await.unwrap();
 
     assert_eq!(updated.name, "New Name");
     assert!(updated.modified_at >= conv.modified_at);
@@ -441,7 +442,7 @@ async fn update_pin() {
 
     let req: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": true })).unwrap();
-    let updated = svc.update(&conv.id, req).await.unwrap();
+    let updated = svc.update("user_1", &conv.id, req).await.unwrap();
     assert!(updated.pinned);
     assert!(updated.pinned_at.is_some());
 }
@@ -454,14 +455,14 @@ async fn update_unpin_clears_pinned_at() {
     // Pin first
     let pin_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": true })).unwrap();
-    let pinned = svc.update(&conv.id, pin_req).await.unwrap();
+    let pinned = svc.update("user_1", &conv.id, pin_req).await.unwrap();
     assert!(pinned.pinned);
     assert!(pinned.pinned_at.is_some());
 
     // Unpin
     let unpin_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "pinned": false })).unwrap();
-    let unpinned = svc.update(&conv.id, unpin_req).await.unwrap();
+    let unpinned = svc.update("user_1", &conv.id, unpin_req).await.unwrap();
     assert!(!unpinned.pinned);
     assert!(unpinned.pinned_at.is_none());
 }
@@ -481,7 +482,7 @@ async fn update_extra_merge() {
     // Update only workspace — contextFileName should be preserved
     let update_req: UpdateConversationRequest =
         serde_json::from_value(json!({ "extra": { "workspace": "/new" } })).unwrap();
-    let updated = svc.update(&conv.id, update_req).await.unwrap();
+    let updated = svc.update("user_1", &conv.id, update_req).await.unwrap();
 
     assert_eq!(updated.extra["workspace"], "/new");
     assert_eq!(updated.extra["contextFileName"], "ctx.md");
@@ -496,7 +497,7 @@ async fn update_model() {
         "model": { "providerId": "p2", "model": "new-model" }
     }))
     .unwrap();
-    let updated = svc.update(&conv.id, req).await.unwrap();
+    let updated = svc.update("user_1", &conv.id, req).await.unwrap();
 
     let model = updated.model.unwrap();
     assert_eq!(model.provider_id, "p2");
@@ -508,7 +509,7 @@ async fn update_not_found() {
     let (svc, _broadcaster, _repo) = make_service();
     let req: UpdateConversationRequest =
         serde_json::from_value(json!({ "name": "x" })).unwrap();
-    let err = svc.update("non-existent", req).await.unwrap_err();
+    let err = svc.update("user_1", "non-existent", req).await.unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
 }
 
@@ -520,10 +521,10 @@ async fn delete_conversation() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     broadcaster.take_events();
 
-    svc.delete(&conv.id).await.unwrap();
+    svc.delete("user_1", &conv.id).await.unwrap();
 
     // Should be gone
-    let err = svc.get(&conv.id).await.unwrap_err();
+    let err = svc.get("user_1", &conv.id).await.unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
 
     // Should broadcast deleted
@@ -536,7 +537,7 @@ async fn delete_conversation() {
 #[tokio::test]
 async fn delete_not_found() {
     let (svc, _broadcaster, _repo) = make_service();
-    let err = svc.delete("non-existent").await.unwrap_err();
+    let err = svc.delete("user_1", "non-existent").await.unwrap_err();
     assert!(matches!(err, AppError::NotFound(_)));
 }
 
@@ -556,7 +557,7 @@ async fn broadcast_includes_source_on_delete() {
     let conv = svc.create("user_1", req).await.unwrap();
     broadcaster.take_events();
 
-    svc.delete(&conv.id).await.unwrap();
+    svc.delete("user_1", &conv.id).await.unwrap();
     let events = broadcaster.take_events();
     assert_eq!(events[0].data["source"], "telegram");
 }
@@ -573,12 +574,260 @@ async fn all_crud_operations_broadcast() {
     // Update
     let req: UpdateConversationRequest =
         serde_json::from_value(json!({ "name": "x" })).unwrap();
-    svc.update(&conv.id, req).await.unwrap();
+    svc.update("user_1", &conv.id, req).await.unwrap();
     let events = broadcaster.take_events();
     assert_eq!(events[0].data["action"], "updated");
 
     // Delete
-    svc.delete(&conv.id).await.unwrap();
+    svc.delete("user_1", &conv.id).await.unwrap();
     let events = broadcaster.take_events();
     assert_eq!(events[0].data["action"], "deleted");
+}
+
+// ── Ownership tests (M-3) ─────────────────────────────────────────
+
+#[tokio::test]
+async fn get_wrong_user_returns_not_found() {
+    let (svc, _broadcaster, _repo) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let err = svc.get("user_2", &conv.id).await.unwrap_err();
+    assert!(matches!(err, AppError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn update_wrong_user_returns_not_found() {
+    let (svc, _broadcaster, _repo) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let req: UpdateConversationRequest =
+        serde_json::from_value(json!({ "name": "hacked" })).unwrap();
+    let err = svc.update("user_2", &conv.id, req).await.unwrap_err();
+    assert!(matches!(err, AppError::NotFound(_)));
+
+    // Original should be unchanged
+    let original = svc.get("user_1", &conv.id).await.unwrap();
+    assert_ne!(original.name, "hacked");
+}
+
+#[tokio::test]
+async fn delete_wrong_user_returns_not_found() {
+    let (svc, _broadcaster, _repo) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let err = svc.delete("user_2", &conv.id).await.unwrap_err();
+    assert!(matches!(err, AppError::NotFound(_)));
+
+    // Should still exist
+    let still_exists = svc.get("user_1", &conv.id).await.unwrap();
+    assert_eq!(still_exists.id, conv.id);
+}
+
+// ── Clone tests ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn clone_without_source_creates_new() {
+    let (svc, broadcaster, _repo) = make_service();
+
+    let req: CloneConversationRequest = serde_json::from_value(json!({
+        "conversation": {
+            "type": "gemini",
+            "name": "Cloned",
+            "model": { "providerId": "p1", "model": "m1" },
+            "extra": { "workspace": "/new" }
+        }
+    }))
+    .unwrap();
+
+    let resp = svc.clone_create("user_1", req).await.unwrap();
+    assert_eq!(resp.name, "Cloned");
+    assert_eq!(resp.extra["workspace"], "/new");
+
+    let events = broadcaster.take_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data["action"], "created");
+}
+
+#[tokio::test]
+async fn clone_from_source_inherits_config() {
+    let (svc, _broadcaster, _repo) = make_service();
+
+    // Create source with name and extra
+    let source_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "gemini",
+        "name": "Source Conv",
+        "model": { "providerId": "p1", "model": "m1" },
+        "extra": { "workspace": "/source", "contextFileName": "ctx.md" }
+    }))
+    .unwrap();
+    let source = svc.create("user_1", source_req).await.unwrap();
+
+    // Clone with override on workspace only
+    let clone_req: CloneConversationRequest = serde_json::from_value(json!({
+        "sourceConversationId": source.id,
+        "conversation": {
+            "type": "gemini",
+            "model": { "providerId": "p1", "model": "m1" },
+            "extra": { "workspace": "/cloned" }
+        }
+    }))
+    .unwrap();
+    let cloned = svc.clone_create("user_1", clone_req).await.unwrap();
+
+    // Name inherited from source (no name in clone request)
+    assert_eq!(cloned.name, "Source Conv");
+    // Workspace overridden, contextFileName inherited
+    assert_eq!(cloned.extra["workspace"], "/cloned");
+    assert_eq!(cloned.extra["contextFileName"], "ctx.md");
+    // New ID
+    assert_ne!(cloned.id, source.id);
+}
+
+#[tokio::test]
+async fn clone_source_not_found() {
+    let (svc, _broadcaster, _repo) = make_service();
+
+    let req: CloneConversationRequest = serde_json::from_value(json!({
+        "sourceConversationId": "no-such-id",
+        "conversation": {
+            "type": "gemini",
+            "model": { "providerId": "p1", "model": "m1" },
+            "extra": {}
+        }
+    }))
+    .unwrap();
+
+    let err = svc.clone_create("user_1", req).await.unwrap_err();
+    assert!(matches!(err, AppError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn clone_source_wrong_user() {
+    let (svc, _broadcaster, _repo) = make_service();
+
+    let source = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let req: CloneConversationRequest = serde_json::from_value(json!({
+        "sourceConversationId": source.id,
+        "conversation": {
+            "type": "gemini",
+            "model": { "providerId": "p1", "model": "m1" },
+            "extra": {}
+        }
+    }))
+    .unwrap();
+
+    let err = svc.clone_create("user_2", req).await.unwrap_err();
+    assert!(matches!(err, AppError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn clone_strips_cron_job_id_by_default() {
+    let (svc, _broadcaster, _repo) = make_service();
+
+    let source_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "gemini",
+        "model": { "providerId": "p1", "model": "m1" },
+        "extra": { "workspace": "/p", "cronJobId": "cron_1" }
+    }))
+    .unwrap();
+    let source = svc.create("user_1", source_req).await.unwrap();
+
+    let clone_req: CloneConversationRequest = serde_json::from_value(json!({
+        "sourceConversationId": source.id,
+        "conversation": {
+            "type": "gemini",
+            "model": { "providerId": "p1", "model": "m1" },
+            "extra": {}
+        }
+    }))
+    .unwrap();
+    let cloned = svc.clone_create("user_1", clone_req).await.unwrap();
+
+    // cronJobId should not be carried over
+    assert!(cloned.extra.get("cronJobId").is_none());
+}
+
+#[tokio::test]
+async fn clone_with_migrate_cron_preserves_cron_job_id() {
+    let (svc, _broadcaster, _repo) = make_service();
+
+    let source_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "gemini",
+        "model": { "providerId": "p1", "model": "m1" },
+        "extra": { "workspace": "/p", "cronJobId": "cron_1" }
+    }))
+    .unwrap();
+    let source = svc.create("user_1", source_req).await.unwrap();
+
+    let clone_req: CloneConversationRequest = serde_json::from_value(json!({
+        "sourceConversationId": source.id,
+        "conversation": {
+            "type": "gemini",
+            "model": { "providerId": "p1", "model": "m1" },
+            "extra": {}
+        },
+        "migrateCron": true
+    }))
+    .unwrap();
+    let cloned = svc.clone_create("user_1", clone_req).await.unwrap();
+
+    assert_eq!(cloned.extra["cronJobId"], "cron_1");
+}
+
+// ── Reset tests ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn reset_sets_status_to_pending() {
+    let (svc, _broadcaster, _repo) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    svc.reset("user_1", &conv.id).await.unwrap();
+
+    let fetched = svc.get("user_1", &conv.id).await.unwrap();
+    assert_eq!(fetched.status, ConversationStatus::Pending);
+}
+
+#[tokio::test]
+async fn reset_not_found() {
+    let (svc, _broadcaster, _repo) = make_service();
+    let err = svc.reset("user_1", "no-such-id").await.unwrap_err();
+    assert!(matches!(err, AppError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn reset_wrong_user() {
+    let (svc, _broadcaster, _repo) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let err = svc.reset("user_2", &conv.id).await.unwrap_err();
+    assert!(matches!(err, AppError::NotFound(_)));
+}
+
+// ── Search validation tests ───────────────────────────────────────
+
+#[tokio::test]
+async fn search_messages_empty_keyword_returns_bad_request() {
+    let (svc, _broadcaster, _repo) = make_service();
+
+    let query = SearchMessagesQuery {
+        keyword: "".into(),
+        page: None,
+        page_size: None,
+    };
+    let err = svc.search_messages("user_1", query).await.unwrap_err();
+    assert!(matches!(err, AppError::BadRequest(_)));
+}
+
+#[tokio::test]
+async fn search_messages_whitespace_keyword_returns_bad_request() {
+    let (svc, _broadcaster, _repo) = make_service();
+
+    let query = SearchMessagesQuery {
+        keyword: "   ".into(),
+        page: None,
+        page_size: None,
+    };
+    let err = svc.search_messages("user_1", query).await.unwrap_err();
+    assert!(matches!(err, AppError::BadRequest(_)));
 }
