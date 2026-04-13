@@ -182,8 +182,8 @@ fn anthropic_to_openai_response(anthropic: &Value) -> Value {
         .cloned()
         .unwrap_or_default();
 
-    // Concatenate all text blocks
-    let text: String = content_blocks
+    // Concatenate all text blocks (with newline separator to preserve paragraphs)
+    let text_parts: Vec<String> = content_blocks
         .iter()
         .filter_map(|block| {
             if block.get("type").and_then(|t| t.as_str()) == Some("text") {
@@ -192,8 +192,29 @@ fn anthropic_to_openai_response(anthropic: &Value) -> Value {
                 None
             }
         })
-        .collect::<Vec<_>>()
-        .join("");
+        .collect();
+    let text = text_parts.join("\n");
+
+    // Extract tool_use blocks → OpenAI tool_calls
+    let tool_calls: Vec<Value> = content_blocks
+        .iter()
+        .filter_map(|block| {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                return None;
+            }
+            let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("call_0");
+            let name = block.get("name").and_then(|v| v.as_str())?;
+            let input = block.get("input").cloned().unwrap_or(json!({}));
+            Some(json!({
+                "id": id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": input.to_string(),
+                }
+            }))
+        })
+        .collect();
 
     let stop_reason = anthropic
         .get("stop_reason")
@@ -201,16 +222,22 @@ fn anthropic_to_openai_response(anthropic: &Value) -> Value {
         .map(anthropic_stop_reason_to_openai)
         .unwrap_or("stop");
 
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { json!(text) },
+    });
+
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
+
     json!({
         "id": anthropic.get("id").cloned().unwrap_or(json!("anthropic-converted")),
         "object": "chat.completion",
         "model": anthropic.get("model").cloned().unwrap_or(json!("")),
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": text,
-            },
+            "message": message,
             "finish_reason": stop_reason,
         }],
         "usage": convert_anthropic_usage(anthropic.get("usage")),
@@ -346,14 +373,69 @@ mod tests {
         });
 
         let openai = anthropic_to_openai_response(&anthropic);
-        assert_eq!(openai["choices"][0]["message"]["content"], "Part 1Part 2");
+        assert_eq!(openai["choices"][0]["message"]["content"], "Part 1\nPart 2");
     }
 
     #[test]
     fn anthropic_to_openai_empty() {
         let anthropic = json!({});
         let openai = anthropic_to_openai_response(&anthropic);
-        assert_eq!(openai["choices"][0]["message"]["content"], "");
+        assert!(openai["choices"][0]["message"]["content"].is_null());
+    }
+
+    #[test]
+    fn anthropic_to_openai_tool_use() {
+        let anthropic = json!({
+            "id": "msg_tool",
+            "model": "claude-sonnet-4-20250514",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_abc123",
+                    "name": "get_weather",
+                    "input": { "location": "Tokyo" }
+                }
+            ],
+            "stop_reason": "tool_use",
+            "usage": { "input_tokens": 50, "output_tokens": 30 }
+        });
+
+        let openai = anthropic_to_openai_response(&anthropic);
+        let tool_calls = openai["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "toolu_abc123");
+        assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
+        assert_eq!(openai["choices"][0]["finish_reason"], "tool_calls");
+        assert!(openai["choices"][0]["message"]["content"].is_null());
+    }
+
+    #[test]
+    fn anthropic_to_openai_mixed_text_and_tool_use() {
+        let anthropic = json!({
+            "content": [
+                { "type": "text", "text": "I'll check the weather." },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_xyz",
+                    "name": "get_weather",
+                    "input": { "city": "Paris" }
+                }
+            ],
+            "stop_reason": "tool_use"
+        });
+
+        let openai = anthropic_to_openai_response(&anthropic);
+        assert_eq!(
+            openai["choices"][0]["message"]["content"],
+            "I'll check the weather."
+        );
+        let tool_calls = openai["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
     }
 
     #[test]

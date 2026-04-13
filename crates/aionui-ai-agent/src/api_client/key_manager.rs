@@ -29,6 +29,7 @@ pub struct ApiKeyStatus {
     pub env_key: Option<String>,
     pub current: usize,
     pub total: usize,
+    pub keys: Vec<String>,
     pub blacklisted: usize,
 }
 
@@ -144,11 +145,13 @@ impl ApiKeyManager {
         let entries = self.entries.read().await;
         let blacklisted = entries.iter().filter(|e| !e.is_available()).count();
         let total = entries.len();
+        let keys = entries.iter().map(|e| mask_key(&e.key)).collect();
         ApiKeyStatus {
             auth_type: auth_type.to_string(),
             env_key: self.env_key_name.clone(),
             current: self.current_index.load(Ordering::Relaxed) % total.max(1),
             total,
+            keys,
             blacklisted,
         }
     }
@@ -159,6 +162,17 @@ impl ApiKeyManager {
             unsafe { std::env::set_var(env_name, key) };
         }
     }
+}
+
+/// Mask an API key for diagnostic display (e.g. "sk-abc...xyz").
+fn mask_key(key: &str) -> String {
+    let len = key.len();
+    if len <= 8 {
+        return "*".repeat(len);
+    }
+    let prefix = &key[..4];
+    let suffix = &key[len - 4..];
+    format!("{prefix}...{suffix}")
 }
 
 /// Parse a key string into individual keys, splitting on comma or newline.
@@ -298,11 +312,34 @@ mod tests {
         assert_eq!(status.total, 3);
         assert_eq!(status.blacklisted, 0);
         assert_eq!(status.auth_type, "USE_OPENAI");
+        assert_eq!(status.keys.len(), 3);
 
         let _ = mgr.get_available_key().await;
         mgr.blacklist_current().await;
         let status = mgr.get_status("USE_OPENAI").await;
         assert_eq!(status.blacklisted, 1);
+    }
+
+    #[test]
+    fn mask_key_short() {
+        assert_eq!(mask_key("abcd"), "****");
+        assert_eq!(mask_key("abcdefgh"), "********");
+    }
+
+    #[test]
+    fn mask_key_long() {
+        assert_eq!(mask_key("sk-abc123xyz"), "sk-a...3xyz");
+    }
+
+    #[tokio::test]
+    async fn status_keys_are_masked() {
+        let mgr = ApiKeyManager::new("sk-test-key-alpha,sk-test-key-beta", None);
+        let status = mgr.get_status("USE_OPENAI").await;
+        assert_eq!(status.keys.len(), 2);
+        for key in &status.keys {
+            assert!(key.contains("..."), "key should be masked: {key}");
+            assert!(!key.contains("test"), "key should not contain raw value");
+        }
     }
 
     #[tokio::test]

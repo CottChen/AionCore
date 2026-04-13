@@ -97,11 +97,16 @@ fn openai_to_gemini_request(openai: &Value) -> Value {
                 .get("role")
                 .and_then(|v| v.as_str())
                 .unwrap_or("user");
+
+            // Skip system messages — handled via systemInstruction below
+            if role == "system" {
+                continue;
+            }
+
             let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
             let gemini_role = match role {
                 "assistant" => "model",
-                "system" => "user", // Gemini handles system via systemInstruction
                 _ => "user",
             };
 
@@ -200,14 +205,38 @@ fn gemini_to_openai_response(gemini: &Value) -> Value {
 
     let first = candidates.first();
 
-    let content = first
+    let parts = first
         .and_then(|c| c.get("content"))
         .and_then(|c| c.get("parts"))
         .and_then(|p| p.as_array())
-        .and_then(|parts| parts.first())
-        .and_then(|p| p.get("text"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+        .cloned()
+        .unwrap_or_default();
+
+    // Extract text parts
+    let text: String = parts
+        .iter()
+        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+        .collect::<Vec<_>>()
+        .join("");
+
+    // Extract functionCall parts → OpenAI tool_calls
+    let tool_calls: Vec<Value> = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let fc = p.get("functionCall")?;
+            let name = fc.get("name").and_then(|n| n.as_str())?;
+            let args = fc.get("args").cloned().unwrap_or(json!({}));
+            Some(json!({
+                "id": format!("call_gemini_{i}"),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": args.to_string(),
+                }
+            }))
+        })
+        .collect();
 
     let finish_reason = first
         .and_then(|c| c.get("finishReason"))
@@ -215,16 +244,22 @@ fn gemini_to_openai_response(gemini: &Value) -> Value {
         .map(gemini_finish_reason_to_openai)
         .unwrap_or("stop");
 
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { json!(text) },
+    });
+
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
+
     json!({
         "id": "gemini-converted",
         "object": "chat.completion",
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content
-            },
-            "finish_reason": finish_reason
+            "message": message,
+            "finish_reason": if !tool_calls.is_empty() { "tool_calls" } else { finish_reason },
         }],
         "usage": gemini.get("usageMetadata").cloned().unwrap_or(json!({}))
     })
@@ -344,6 +379,12 @@ mod tests {
 
         let gemini = openai_to_gemini_request(&openai);
         assert_eq!(gemini["systemInstruction"]["parts"][0]["text"], "You are helpful");
+
+        // System message must NOT appear in contents (only in systemInstruction)
+        let contents = gemini["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1, "system message should not be in contents");
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "Hi");
     }
 
     #[test]
@@ -387,7 +428,66 @@ mod tests {
     fn gemini_to_openai_empty_response() {
         let gemini = json!({});
         let openai = gemini_to_openai_response(&gemini);
-        assert_eq!(openai["choices"][0]["message"]["content"], "");
+        assert!(openai["choices"][0]["message"]["content"].is_null());
+    }
+
+    #[test]
+    fn gemini_to_openai_function_call() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "get_weather",
+                            "args": { "location": "Tokyo" }
+                        }
+                    }],
+                    "role": "model"
+                },
+                "finishReason": "STOP"
+            }]
+        });
+
+        let openai = gemini_to_openai_response(&gemini);
+        let tool_calls = openai["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
+        assert_eq!(openai["choices"][0]["finish_reason"], "tool_calls");
+        assert!(openai["choices"][0]["message"]["content"].is_null());
+    }
+
+    #[test]
+    fn gemini_to_openai_mixed_text_and_function_call() {
+        let gemini = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        { "text": "Let me check the weather." },
+                        {
+                            "functionCall": {
+                                "name": "get_weather",
+                                "args": { "city": "Paris" }
+                            }
+                        }
+                    ],
+                    "role": "model"
+                },
+                "finishReason": "STOP"
+            }]
+        });
+
+        let openai = gemini_to_openai_response(&gemini);
+        assert_eq!(
+            openai["choices"][0]["message"]["content"],
+            "Let me check the weather."
+        );
+        let tool_calls = openai["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
     }
 
     #[test]
