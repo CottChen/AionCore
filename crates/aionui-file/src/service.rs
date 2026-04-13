@@ -836,6 +836,22 @@ impl crate::traits::IFileService for FileService {
         &self,
         file_name: &str,
     ) -> Result<String, AppError> {
+        if has_traversal(file_name) {
+            return Err(AppError::BadRequest(format!(
+                "file name '{}' contains invalid traversal patterns",
+                file_name
+            )));
+        }
+
+        if file_name.contains('/')
+            || file_name.contains('\\')
+        {
+            return Err(AppError::BadRequest(format!(
+                "file name '{}' must not contain path separators",
+                file_name
+            )));
+        }
+
         let name = file_name.to_owned();
 
         tokio::task::spawn_blocking(move || {

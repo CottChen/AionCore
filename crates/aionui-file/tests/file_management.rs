@@ -496,3 +496,45 @@ async fn create_temp_file_path_in_aionui_dir() {
 
     assert!(path.contains("aionui"), "temp path should be under aionui dir");
 }
+
+#[tokio::test]
+async fn create_temp_file_rejects_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = make_service(dir.path());
+
+    let result = svc.create_temp_file("../../malicious.txt").await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("traversal"),
+        "expected traversal error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn create_temp_file_rejects_path_separator() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = make_service(dir.path());
+
+    let result = svc.create_temp_file("sub/file.txt").await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("path separator"),
+        "expected path separator error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn create_temp_file_rejects_null_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = make_service(dir.path());
+
+    let result = svc.create_temp_file("evil\0name.txt").await;
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("traversal"),
+        "expected traversal error, got: {err}"
+    );
+}
