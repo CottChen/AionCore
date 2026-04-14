@@ -3,12 +3,14 @@ mod auth;
 mod confirmation;
 mod connection_test;
 mod conversation;
+mod extension;
 mod file;
 mod lifecycle;
 mod mcp;
 mod provider;
 mod remote_agent;
 mod response;
+mod skill;
 mod system;
 mod websocket;
 
@@ -71,3 +73,16 @@ pub use file::{
     WriteFileRequest, ZipFileEntry, ZipRequest,
 };
 pub use websocket::WebSocketMessage;
+pub use extension::{
+    DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest,
+    GetPermissionsRequest, GetRiskLevelRequest, HubExtensionListItem, HubExtensionListResponse,
+    HubOperationResponse, HubUpdateInfo, InstallExtensionRequest, PermissionDetailResponse,
+    PermissionSummaryResponse,
+};
+pub use skill::{
+    AddExternalPathRequest, DeleteSkillRequest, ExportSkillRequest, ExternalSkillSourceResponse,
+    ImportSkillRequest, ImportSkillResponse, NamedPathResponse, ReadAssistantRuleRequest,
+    ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse,
+    RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse,
+    SkillListItemResponse, SkillPathsResponse, WriteAssistantRuleRequest,
+};
