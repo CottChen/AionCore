@@ -258,6 +258,7 @@ pub async fn import_skill(
     skill_path: &Path,
 ) -> Result<String, ExtensionError> {
     let (name, _) = read_skill_info(skill_path).await?;
+    validate_filename(&name)?;
 
     let target_dir = paths.user_skills_dir.join(&name);
     tokio::fs::create_dir_all(&paths.user_skills_dir).await?;
@@ -276,6 +277,7 @@ pub async fn import_skill_with_symlink(
     skill_path: &Path,
 ) -> Result<String, ExtensionError> {
     let (name, _) = read_skill_info(skill_path).await?;
+    validate_filename(&name)?;
 
     let target_link = paths.user_skills_dir.join(&name);
     tokio::fs::create_dir_all(&paths.user_skills_dir).await?;
@@ -1094,6 +1096,41 @@ mod tests {
 
         let link_path = paths.user_skills_dir.join("linked");
         assert!(link_path.is_symlink());
+    }
+
+    #[tokio::test]
+    async fn import_skill_rejects_traversal_name() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+
+        // Create a skill whose frontmatter name contains path traversal
+        let source_dir = tmp.path().join("evil-skill");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join(SKILL_MANIFEST_FILE),
+            "---\nname: ../../../etc/evil\ndescription: Malicious skill\n---\nBody",
+        )
+        .unwrap();
+
+        let result = import_skill(&paths, &source_dir).await;
+        assert!(matches!(result, Err(ExtensionError::PathTraversal(_))));
+    }
+
+    #[tokio::test]
+    async fn import_skill_with_symlink_rejects_traversal_name() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+
+        let source_dir = tmp.path().join("evil-skill");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(
+            source_dir.join(SKILL_MANIFEST_FILE),
+            "---\nname: ../../escape\ndescription: Malicious skill\n---\nBody",
+        )
+        .unwrap();
+
+        let result = import_skill_with_symlink(&paths, &source_dir).await;
+        assert!(matches!(result, Err(ExtensionError::PathTraversal(_))));
     }
 
     #[tokio::test]
