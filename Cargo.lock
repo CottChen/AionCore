@@ -393,9 +393,13 @@ dependencies = [
  "aionui-conversation",
  "aionui-db",
  "aionui-realtime",
+ "async-trait",
  "serde",
  "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
