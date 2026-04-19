@@ -229,6 +229,7 @@ dependencies = [
  "aionui-db",
  "aionui-realtime",
  "aionui-system",
+ "async-trait",
  "chrono",
  "chrono-tz",
  "cron",
