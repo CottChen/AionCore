@@ -147,6 +147,7 @@ fn compute_target_hash(target: &PreviewHistoryTargetDto) -> String {
             .unwrap_or_default()
             .as_bytes(),
     );
+    hasher.update(b"\0");
 
     let fields: [Option<&str>; 6] = [
         target.file_path.as_deref(),
@@ -157,8 +158,11 @@ fn compute_target_hash(target: &PreviewHistoryTargetDto) -> String {
         target.conversation_id.as_deref(),
     ];
 
-    for field in fields.into_iter().flatten() {
-        hasher.update(field.as_bytes());
+    for field in &fields {
+        if let Some(val) = field {
+            hasher.update(val.as_bytes());
+        }
+        hasher.update(b"\0");
     }
 
     let result = hasher.finalize();
@@ -189,17 +193,23 @@ fn format_label(timestamp_ms: i64) -> String {
     let secs = timestamp_ms / 1000;
     let minutes = (secs / 60) % 60;
     let hours = (secs / 3600) % 24;
-    let days = secs / 86400;
-    let years = (days * 400) / 146097;
-    let remaining_days = days - (years * 365 + years / 4 - years / 100 + years / 400);
+    let mut days = secs / 86400;
+
+    let mut year: i64 = 1970;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
 
     let month_days: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let is_leap = (years % 4 == 0 && years % 100 != 0) || years % 400 == 0;
-
     let mut month = 0;
-    let mut day = remaining_days;
+    let mut day = days;
     for (i, &md) in month_days.iter().enumerate() {
-        let md = if i == 1 && is_leap { md + 1 } else { md };
+        let md = if i == 1 && is_leap_year(year) { md + 1 } else { md };
         if day < md {
             month = i + 1;
             break;
@@ -212,13 +222,13 @@ fn format_label(timestamp_ms: i64) -> String {
     }
 
     format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
-        1970 + years,
-        month,
+        "{year:04}-{month:02}-{:02} {hours:02}:{minutes:02}",
         day + 1,
-        hours,
-        minutes
     )
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 #[cfg(test)]
@@ -303,10 +313,65 @@ mod tests {
     }
 
     #[test]
-    fn format_label_produces_reasonable_output() {
-        let label = format_label(1700000000000);
-        assert!(label.contains("-"));
-        assert!(label.contains(":"));
+    fn format_label_known_timestamps() {
+        // 2023-11-14 22:13 UTC
+        assert_eq!(format_label(1700000000000), "2023-11-14 22:13");
+        // 1970-01-01 00:00 UTC (epoch)
+        assert_eq!(format_label(0), "1970-01-01 00:00");
+        // 2000-02-29 00:00 UTC (leap year)
+        assert_eq!(format_label(951782400000), "2000-02-29 00:00");
+        // 2000-03-01 00:00 UTC (day after leap)
+        assert_eq!(format_label(951868800000), "2000-03-01 00:00");
+        // 2024-12-31 23:59 UTC
+        assert_eq!(format_label(1735689540000), "2024-12-31 23:59");
+    }
+
+    #[test]
+    fn compute_hash_field_boundary_collision() {
+        // file_path="/foobar" vs file_path="/foo" + workspace="bar"
+        let t1 = PreviewHistoryTargetDto {
+            content_type: PreviewContentType::Markdown,
+            file_path: Some("/foobar".into()),
+            workspace: None,
+            file_name: None,
+            title: None,
+            language: None,
+            conversation_id: None,
+        };
+        let t2 = PreviewHistoryTargetDto {
+            content_type: PreviewContentType::Markdown,
+            file_path: Some("/foo".into()),
+            workspace: Some("bar".into()),
+            file_name: None,
+            title: None,
+            language: None,
+            conversation_id: None,
+        };
+        assert_ne!(compute_target_hash(&t1), compute_target_hash(&t2));
+    }
+
+    #[test]
+    fn compute_hash_field_position_collision() {
+        // file_name="x" vs title="x"
+        let t1 = PreviewHistoryTargetDto {
+            content_type: PreviewContentType::Code,
+            file_path: None,
+            workspace: None,
+            file_name: Some("x".into()),
+            title: None,
+            language: None,
+            conversation_id: None,
+        };
+        let t2 = PreviewHistoryTargetDto {
+            content_type: PreviewContentType::Code,
+            file_path: None,
+            workspace: None,
+            file_name: None,
+            title: Some("x".into()),
+            language: None,
+            conversation_id: None,
+        };
+        assert_ne!(compute_target_hash(&t1), compute_target_hash(&t2));
     }
 
     #[tokio::test]
