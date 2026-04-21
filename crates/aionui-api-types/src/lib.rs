@@ -11,6 +11,7 @@ mod lifecycle;
 mod mcp;
 mod office;
 mod provider;
+mod shell;
 mod remote_agent;
 mod response;
 mod skill;
@@ -108,6 +109,11 @@ pub use cron::{
     CronJobPayloadDto, CronJobRemovedPayload, CronJobResponse, CronJobStateDto,
     CronJobTargetDto, CronScheduleDto, HasSkillResponse, ListCronJobsQuery, RunNowResponse,
     SaveCronSkillRequest, UpdateCronJobRequest,
+};
+pub use shell::{
+    CheckToolInstalledRequest, CheckToolInstalledResponse, DeepgramSpeechToTextConfig,
+    OpenAISpeechToTextConfig, OpenExternalRequest, OpenFileRequest, OpenFolderWithRequest,
+    ShowItemInFolderRequest, SpeechToTextConfig, SpeechToTextProvider, SpeechToTextResult, ToolType,
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DetectStarOfficeRequest,
