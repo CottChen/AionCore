@@ -114,6 +114,25 @@ fn get_anonymous(uri: &str) -> Request<Body> {
     Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
 }
 
+fn get_internal(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("x-aionui-internal", "1")
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn json_post_internal(uri: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("x-aionui-internal", "1")
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
 /// Helper: perform a DELETE request with auth token.
 fn delete_with_token(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
@@ -293,6 +312,32 @@ async fn webui_admin_can_create_and_list_secondary_users() {
         .oneshot(get_with_token("/api/webui/users", &admin_token))
         .await
         .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_json = body_json(list_resp).await;
+    let users = list_json["data"].as_array().unwrap();
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0]["is_admin"], true);
+    assert_eq!(users[1]["username"], "alice");
+}
+
+#[tokio::test]
+async fn webui_local_desktop_internal_can_create_and_list_secondary_users() {
+    let (app, _ctx) = test_app_with_local(true).await;
+
+    let create_resp = app
+        .clone()
+        .oneshot(json_post_internal(
+            "/api/webui/users",
+            r#"{"username":"alice","password":"StrongP@ss2"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let create_json = body_json(create_resp).await;
+    assert_eq!(create_json["data"]["user"]["username"], "alice");
+    assert_eq!(create_json["data"]["user"]["is_admin"], false);
+
+    let list_resp = app.clone().oneshot(get_internal("/api/webui/users")).await.unwrap();
     assert_eq!(list_resp.status(), StatusCode::OK);
     let list_json = body_json(list_resp).await;
     let users = list_json["data"].as_array().unwrap();

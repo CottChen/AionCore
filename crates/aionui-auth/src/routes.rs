@@ -154,7 +154,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let auth_state = AuthState {
         jwt_service: state.jwt_service.clone(),
         user_repo: state.user_repo.clone(),
-        local: false,
+        local: state.local,
     };
 
     // Auth rate limited routes (login, qr-login)

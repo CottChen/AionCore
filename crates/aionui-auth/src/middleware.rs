@@ -51,10 +51,17 @@ pub async fn auth_middleware(
 ) -> Result<Response, ApiError> {
     let token = extract_token_from_headers(request.headers());
 
+    let internal_desktop_request = request
+        .headers()
+        .get("x-aionui-internal")
+        .and_then(|value| value.to_str().ok())
+        == Some("1");
+
     // In local mode, desktop renderer requests do not carry a WebUI token.
-    // Keep those on the fixed default user, but honor authenticated WebUI
-    // browser sessions when a token is present.
-    if state.local && token.is_none() {
+    // Keep those on the fixed default user only for trusted desktop/internal
+    // requests, but honor authenticated WebUI browser sessions when a token is
+    // present. Browser requests without a token must still be rejected.
+    if state.local && token.is_none() && internal_desktop_request {
         request.extensions_mut().insert(CurrentUser {
             id: "system_default_user".to_string(),
             username: "system_default_user".to_string(),
