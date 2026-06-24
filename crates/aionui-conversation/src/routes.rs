@@ -12,13 +12,15 @@ use aionui_api_types::{
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
     CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
     MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebuiTransferOwnerRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
 use crate::ConversationError;
 use crate::state::ConversationRouterState;
+
+const SYSTEM_USER_ID: &str = "system_default_user";
 
 impl From<ConversationError> for ApiError {
     fn from(error: ConversationError) -> Self {
@@ -97,6 +99,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/conversations", post(create).get(list))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
+        .route("/api/conversations/{id}/owner", post(transfer_owner))
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
@@ -157,6 +160,30 @@ async fn get_one(
 ) -> Result<Json<ApiResponse<ConversationResponse>>, ApiError> {
     let conversation = state.service.get(&user.id, &id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(conversation)))
+}
+
+async fn transfer_owner(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<WebuiTransferOwnerRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    if user.id != SYSTEM_USER_ID {
+        return Err(ApiError::Forbidden("WebUI administrator access required".into()));
+    }
+    let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .user_repo
+        .find_by_id(&req.target_user_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("User '{}' not found", req.target_user_id)))?;
+    state
+        .service
+        .transfer_owner(&id, &req.target_user_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::success()))
 }
 
 async fn update(

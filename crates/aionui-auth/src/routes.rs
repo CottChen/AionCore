@@ -5,17 +5,18 @@ use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
-use axum::http::{HeaderMap, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::from_fn_with_state;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Router};
 use serde::Deserialize;
 
 use aionui_api_types::{
     ApiResponse, AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
     RefreshResponse, RefreshTokenRequest, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
-    WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
+    WebuiChangeUsernameResponse, WebuiCreateUserRequest, WebuiCreateUserResponse, WebuiGenerateQrTokenResponse,
+    WebuiResetPasswordResponse, WebuiResetUserPasswordResponse, WebuiUserResponse, WsTokenResponse,
 };
 use aionui_common::ApiError;
 use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
@@ -31,6 +32,8 @@ use crate::rate_limit::{
 };
 use crate::validation::{validate_password, validate_username};
 use crate::{CookieConfig, JwtService};
+
+const SYSTEM_USER_ID: &str = "system_default_user";
 
 impl From<AuthError> for ApiError {
     fn from(err: AuthError) -> Self {
@@ -101,6 +104,24 @@ fn ensure_local_mode(local: bool) -> Result<(), ApiError> {
     Err(ApiError::Forbidden(
         "This endpoint is only available in local mode".into(),
     ))
+}
+
+fn ensure_webui_admin(user: &CurrentUser) -> Result<(), ApiError> {
+    if user.id == SYSTEM_USER_ID {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden("WebUI administrator access required".into()))
+}
+
+fn to_webui_user_response(user: User) -> WebuiUserResponse {
+    WebuiUserResponse {
+        is_admin: user.id == SYSTEM_USER_ID,
+        id: user.id,
+        username: user.username,
+        created_at: user.created_at,
+        updated_at: user.updated_at,
+        last_login: user.last_login,
+    }
 }
 
 /// Build the auth router with all endpoints and middleware layers.
@@ -191,6 +212,15 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .route("/api/auth/user", get(user_handler))
         .route("/api/auth/change-password", post(change_password_handler))
         .route("/api/ws-token", get(ws_token_handler))
+        .route(
+            "/api/webui/users",
+            get(webui_list_users_handler).post(webui_create_user_handler),
+        )
+        .route("/api/webui/users/{id}", delete(webui_delete_user_handler))
+        .route(
+            "/api/webui/users/{id}/reset-password",
+            post(webui_reset_user_password_handler),
+        )
         .route_layer(from_fn_with_state(
             action_limiter.clone(),
             authenticated_action_rate_limit_middleware,
@@ -280,11 +310,13 @@ async fn login_handler(
         tracing::warn!("Failed to update last login for {}: {e}", user.id);
     }
 
+    let is_admin = user.id == SYSTEM_USER_ID;
     let cookie = state.cookie_config.build_session_cookie(&token);
     let resp = LoginResponse::new(
         PublicUser {
             id: user.id,
             username: user.username,
+            is_admin,
         },
         token,
     );
@@ -476,6 +508,7 @@ async fn user_handler(Extension(user): Extension<CurrentUser>) -> Json<UserInfoR
     Json(UserInfoResponse {
         success: true,
         user: PublicUser {
+            is_admin: user.id == SYSTEM_USER_ID,
             id: user.id,
             username: user.username,
         },
@@ -596,6 +629,109 @@ async fn ws_token_handler(
 }
 
 // ---------------------------------------------------------------------------
+// WebUI user management
+// ---------------------------------------------------------------------------
+
+async fn webui_list_users_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<WebuiUserResponse>>>, ApiError> {
+    ensure_local_mode(state.local)?;
+    ensure_webui_admin(&user)?;
+    let mut users = state.user_repo.list_users().await.map_err(db_error_to_api_error)?;
+    users.sort_by(|a, b| {
+        let a_admin = a.id == SYSTEM_USER_ID;
+        let b_admin = b.id == SYSTEM_USER_ID;
+        b_admin
+            .cmp(&a_admin)
+            .then_with(|| a.username.to_lowercase().cmp(&b.username.to_lowercase()))
+    });
+    let users = users.into_iter().map(to_webui_user_response).collect();
+    Ok(Json(ApiResponse::ok(users)))
+}
+
+async fn webui_create_user_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<WebuiCreateUserRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<WebuiCreateUserResponse>>), ApiError> {
+    ensure_local_mode(state.local)?;
+    ensure_webui_admin(&user)?;
+    let Json(req) = body.map_err(ApiError::from)?;
+
+    let username = req.username.trim().to_owned();
+    validate_username(&username)?;
+    validate_password(&req.password)?;
+
+    let password = req.password;
+    let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
+
+    let user = state
+        .user_repo
+        .create_user(&username, &password_hash)
+        .await
+        .map_err(db_error_to_api_error)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::ok(WebuiCreateUserResponse {
+            user: to_webui_user_response(user),
+        })),
+    ))
+}
+
+async fn webui_delete_user_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    ensure_local_mode(state.local)?;
+    ensure_webui_admin(&user)?;
+    if id == SYSTEM_USER_ID {
+        return Err(ApiError::BadRequest("The WebUI administrator cannot be deleted".into()));
+    }
+    state.user_repo.delete_user(&id).await.map_err(db_error_to_api_error)?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn webui_reset_user_password_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<WebuiResetUserPasswordResponse>>, ApiError> {
+    ensure_local_mode(state.local)?;
+    ensure_webui_admin(&user)?;
+    if id == SYSTEM_USER_ID {
+        return Err(ApiError::BadRequest(
+            "Use the administrator password reset endpoint for the WebUI administrator".into(),
+        ));
+    }
+
+    state
+        .user_repo
+        .find_by_id(&id)
+        .await
+        .map_err(db_error_to_api_error)?
+        .ok_or_else(|| ApiError::NotFound(format!("User '{id}' not found")))?;
+
+    let new_password = generate_password(RESET_PASSWORD_LEN);
+    let password_for_hash = new_password.clone();
+    let password_hash = tokio::task::spawn_blocking(move || hash_password(&password_for_hash))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
+
+    state
+        .user_repo
+        .update_password(&id, &password_hash)
+        .await
+        .map_err(db_error_to_api_error)?;
+
+    Ok(Json(ApiResponse::ok(WebuiResetUserPasswordResponse { new_password })))
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/auth/qr-login
 // ---------------------------------------------------------------------------
 
@@ -626,11 +762,13 @@ async fn qr_login_handler(
         tracing::warn!("Failed to update last login for {}: {e}", user.id);
     }
 
+    let is_admin = user.id == SYSTEM_USER_ID;
     let cookie = state.cookie_config.build_session_cookie(&token);
     let resp = LoginResponse::new(
         PublicUser {
             id: user.id,
             username: user.username,
+            is_admin,
         },
         token,
     );

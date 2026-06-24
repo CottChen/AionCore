@@ -134,6 +134,38 @@ impl IUserRepository for SqliteUserRepository {
         Ok(users)
     }
 
+    async fn delete_user(&self, user_id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM mailbox WHERE team_id IN (SELECT id FROM teams WHERE user_id = ?)")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM team_tasks WHERE team_id IN (SELECT id FROM teams WHERE user_id = ?)")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM teams WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let result = sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("User '{user_id}' not found")));
+        }
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
     async fn count_users(&self) -> Result<i64, DbError> {
         let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
             .fetch_one(&self.pool)
@@ -381,6 +413,96 @@ mod tests {
         let users = repo.list_users().await.unwrap();
         // system_default_user + eve + frank
         assert_eq!(users.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn delete_user_removes_user() {
+        let (repo, _db) = setup().await;
+        let user = repo.create_user("mallory", "h").await.unwrap();
+
+        repo.delete_user(&user.id).await.unwrap();
+
+        assert!(repo.find_by_id(&user.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_user_removes_owned_teams_and_team_data() {
+        let (repo, db) = setup().await;
+        let user = repo.create_user("nancy", "h").await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO teams \
+             (id, user_id, name, workspace, workspace_mode, agents, created_at, updated_at) \
+             VALUES ('team_1', ?, 'Team', '', 'shared', '[]', 1000, 1000)",
+        )
+        .bind(&user.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO mailbox \
+             (id, team_id, to_agent_id, from_agent_id, type, content, read, created_at) \
+             VALUES ('mail_1', 'team_1', 'agent_1', 'agent_2', 'message', 'hello', 0, 1000)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO team_tasks \
+             (id, team_id, subject, status, created_at, updated_at) \
+             VALUES ('task_1', 'team_1', 'Task', 'pending', 1000, 1000)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations \
+             (id, user_id, name, type, extra, status, created_at, updated_at) \
+             VALUES ('conv_1', ?, 'Chat', 'gemini', '{}', 'pending', 1000, 1000)",
+        )
+        .bind(&user.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO messages \
+             (id, conversation_id, type, content, created_at) \
+             VALUES ('msg_1', 'conv_1', 'text', '{}', 1000)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        repo.delete_user(&user.id).await.unwrap();
+
+        let teams: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM teams WHERE user_id = ?")
+            .bind(&user.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let mail: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mailbox WHERE team_id = 'team_1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let tasks: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM team_tasks WHERE team_id = 'team_1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let conversations: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM conversations WHERE user_id = ?")
+            .bind(&user.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let messages: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages WHERE conversation_id = 'conv_1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(teams.0, 0);
+        assert_eq!(mail.0, 0);
+        assert_eq!(tasks.0, 0);
+        assert_eq!(conversations.0, 0);
+        assert_eq!(messages.0, 0);
     }
 
     #[tokio::test]

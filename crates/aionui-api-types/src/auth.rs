@@ -7,6 +7,18 @@ use serde::{Deserialize, Serialize};
 pub struct PublicUser {
     pub id: String,
     pub username: String,
+    pub is_admin: bool,
+}
+
+/// WebUI user item returned to the desktop admin UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebuiUserResponse {
+    pub id: String,
+    pub username: String,
+    pub is_admin: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_login: Option<i64>,
 }
 
 /// Login request body for `POST /login`.
@@ -111,6 +123,31 @@ pub struct WebuiChangeUsernameResponse {
     pub username: String,
 }
 
+/// Create a secondary WebUI login user.
+#[derive(Debug, Deserialize)]
+pub struct WebuiCreateUserRequest {
+    pub username: String,
+    pub password: String,
+}
+
+/// Response for `POST /api/webui/users`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WebuiCreateUserResponse {
+    pub user: WebuiUserResponse,
+}
+
+/// Response for `POST /api/webui/users/{id}/reset-password`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WebuiResetUserPasswordResponse {
+    pub new_password: String,
+}
+
+/// Transfer ownership of a WebUI-owned record to another user.
+#[derive(Debug, Deserialize)]
+pub struct WebuiTransferOwnerRequest {
+    pub target_user_id: String,
+}
+
 /// Response for `POST /api/webui/reset-password`.
 ///
 /// Returns the freshly generated plaintext password. This is the only time
@@ -141,10 +178,12 @@ mod tests {
         let user = PublicUser {
             id: "auth_1712345678_abc".into(),
             username: "admin".into(),
+            is_admin: true,
         };
         let json = serde_json::to_value(&user).unwrap();
         assert_eq!(json["id"], "auth_1712345678_abc");
         assert_eq!(json["username"], "admin");
+        assert_eq!(json["is_admin"], true);
     }
 
     #[test]
@@ -167,6 +206,7 @@ mod tests {
         let user = PublicUser {
             id: "user_1".into(),
             username: "admin".into(),
+            is_admin: false,
         };
         let resp = LoginResponse::new(user.clone(), "jwt_token".into());
         assert!(resp.success);
@@ -181,6 +221,7 @@ mod tests {
             PublicUser {
                 id: "auth_123".into(),
                 username: "admin".into(),
+                is_admin: true,
             },
             "eyJhbGciOi".into(),
         );
@@ -189,6 +230,7 @@ mod tests {
         assert_eq!(json["message"], "Login successful");
         assert_eq!(json["user"]["id"], "auth_123");
         assert_eq!(json["user"]["username"], "admin");
+        assert_eq!(json["user"]["is_admin"], true);
         assert_eq!(json["token"], "eyJhbGciOi");
     }
 

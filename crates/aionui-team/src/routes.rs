@@ -11,11 +11,11 @@ use axum::routing::{get, post};
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest,
-    SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse,
+    SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse, WebuiTransferOwnerRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
-use aionui_db::DbError;
+use aionui_db::{DbError, IUserRepository};
 
 use crate::error::TeamError;
 use crate::service::TeamSessionService;
@@ -23,7 +23,10 @@ use crate::service::TeamSessionService;
 #[derive(Clone)]
 pub struct TeamRouterState {
     pub service: Arc<TeamSessionService>,
+    pub user_repo: Arc<dyn IUserRepository>,
 }
+
+const SYSTEM_USER_ID: &str = "system_default_user";
 
 fn db_error_to_api_error(err: DbError) -> ApiError {
     match err {
@@ -61,6 +64,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
     Router::new()
         .route("/api/teams", post(create_team).get(list_teams))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
+        .route("/api/teams/{id}/owner", post(transfer_owner))
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
@@ -109,6 +113,26 @@ async fn get_team(
 ) -> Result<Json<ApiResponse<TeamResponse>>, ApiError> {
     let team = state.service.get_team(&user.id, &id).await?;
     Ok(Json(ApiResponse::ok(team)))
+}
+
+async fn transfer_owner(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<WebuiTransferOwnerRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    if user.id != SYSTEM_USER_ID {
+        return Err(ApiError::Forbidden("WebUI administrator access required".into()));
+    }
+    let Json(req) = body.map_err(ApiError::from)?;
+    state
+        .user_repo
+        .find_by_id(&req.target_user_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("User '{}' not found", req.target_user_id)))?;
+    state.service.transfer_owner(&id, &req.target_user_id).await?;
+    Ok(Json(ApiResponse::success()))
 }
 
 async fn remove_team(

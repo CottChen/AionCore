@@ -1475,6 +1475,35 @@ impl ConversationService {
         })
     }
 
+    #[tracing::instrument(skip_all, fields(conversation_id = %id, target_user_id = %target_user_id))]
+    pub async fn transfer_owner(&self, id: &str, target_user_id: &str) -> Result<(), ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+
+        if row.status.as_deref() == Some("running") {
+            return Err(ConversationError::Busy {
+                reason: "Cannot transfer a running conversation".into(),
+            });
+        }
+
+        if let Some(team_id) = team_binding_from_extra(&row.extra) {
+            return Err(ConversationError::BadRequest {
+                reason: format!("Conversation {id} belongs to team {team_id}; transfer the team instead"),
+            });
+        }
+
+        if row.user_id == target_user_id {
+            return Ok(());
+        }
+
+        self.conversation_repo.transfer_owner(id, target_user_id).await?;
+        self.broadcast_list_changed(id, "updated", None);
+        Ok(())
+    }
+
     /// Update a conversation (partial update with extra-merge semantics).
     ///
     /// If `extra` is provided, it is merged into the existing extra JSON
@@ -1808,6 +1837,40 @@ impl ConversationService {
         rows.into_iter()
             .map(|row| row_to_response(row, &self.workspace_root))
             .collect::<Result<Vec<_>, _>>()
+    }
+}
+
+fn team_binding_from_extra(extra: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(extra).ok()?;
+    ["teamId", "team_id"]
+        .into_iter()
+        .find_map(|key| value.get(key)?.as_str())
+        .map(str::trim)
+        .filter(|team_id| !team_id.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod transfer_owner_tests {
+    use super::team_binding_from_extra;
+
+    #[test]
+    fn team_binding_from_extra_reads_team_id_aliases() {
+        assert_eq!(
+            team_binding_from_extra(r#"{"teamId":"team_1"}"#).as_deref(),
+            Some("team_1")
+        );
+        assert_eq!(
+            team_binding_from_extra(r#"{"team_id":"team_2"}"#).as_deref(),
+            Some("team_2")
+        );
+    }
+
+    #[test]
+    fn team_binding_from_extra_ignores_missing_or_blank_values() {
+        assert_eq!(team_binding_from_extra(r#"{"teamId":""}"#), None);
+        assert_eq!(team_binding_from_extra(r#"{"workspace":"/tmp"}"#), None);
+        assert_eq!(team_binding_from_extra("not json"), None);
     }
 }
 

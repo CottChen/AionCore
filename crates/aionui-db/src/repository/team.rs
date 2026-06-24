@@ -45,6 +45,17 @@ pub trait ITeamRepository: Send + Sync {
     /// Returns `DbError::NotFound` if absent.
     async fn update_team(&self, team_id: &str, params: &UpdateTeamParams) -> Result<(), DbError>;
 
+    /// Transfers a team and its agent conversations to another user.
+    async fn transfer_team_owner(
+        &self,
+        team_id: &str,
+        target_user_id: &str,
+        conversation_ids: &[String],
+    ) -> Result<(), DbError> {
+        let _ = (team_id, target_user_id, conversation_ids);
+        Err(DbError::Init("team owner transfer is not supported".into()))
+    }
+
     /// Deletes a team by id. Returns `DbError::NotFound` if absent.
     async fn delete_team(&self, team_id: &str) -> Result<(), DbError>;
 

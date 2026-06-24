@@ -58,7 +58,9 @@ pub use assistant::{
 pub use auth::{
     AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
     RefreshResponse, RefreshTokenRequest, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
-    WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
+    WebuiChangeUsernameResponse, WebuiCreateUserRequest, WebuiCreateUserResponse, WebuiGenerateQrTokenResponse,
+    WebuiResetPasswordResponse, WebuiResetUserPasswordResponse, WebuiTransferOwnerRequest, WebuiUserResponse,
+    WsTokenResponse,
 };
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelSessionResponse, ChannelUserResponse, DisablePluginRequest,

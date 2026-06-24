@@ -41,6 +41,9 @@ pub trait IUserRepository: Send + Sync {
     /// Lists all users.
     async fn list_users(&self) -> Result<Vec<User>, DbError>;
 
+    /// Deletes a user by ID.
+    async fn delete_user(&self, user_id: &str) -> Result<(), DbError>;
+
     /// Returns the total number of users.
     async fn count_users(&self) -> Result<i64, DbError>;
 

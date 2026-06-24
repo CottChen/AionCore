@@ -360,6 +360,7 @@ pub fn build_conversation_state(
     ConversationRouterState {
         service: conversation_service,
         task_manager: services.worker_task_manager.clone(),
+        user_repo: services.user_repo.clone(),
     }
 }
 
@@ -589,7 +590,10 @@ pub fn build_team_state(
         backend_binary_path,
         guide_mcp_config,
     );
-    TeamRouterState { service }
+    TeamRouterState {
+        service,
+        user_repo: services.user_repo.clone(),
+    }
 }
 
 /// Build the default `CronRouterState` from application services.

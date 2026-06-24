@@ -11,6 +11,137 @@ pub struct SqliteTeamRepository {
     pool: SqlitePool,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::init_database_memory;
+
+    async fn setup() -> (SqliteTeamRepository, crate::Database) {
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteTeamRepository::new(db.pool().clone());
+        (repo, db)
+    }
+
+    async fn insert_user(db: &crate::Database, user_id: &str, username: &str) {
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+             VALUES (?, ?, 'hash', 1000, 1000)",
+        )
+        .bind(user_id)
+        .bind(username)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn insert_conversation(db: &crate::Database, conversation_id: &str, user_id: &str) {
+        sqlx::query(
+            "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at) \
+             VALUES (?, ?, 'Agent', 'codex', '{}', 'pending', 1000, 1000)",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn insert_team(db: &crate::Database, user_id: &str) {
+        let agents = serde_json::json!([
+            {
+                "slot_id": "lead",
+                "name": "Lead",
+                "role": "lead",
+                "conversation_id": "conv_lead",
+                "backend": "codex",
+                "model": "gpt-5",
+            },
+            {
+                "slot_id": "dev",
+                "name": "Developer",
+                "role": "teammate",
+                "conversation_id": "conv_dev",
+                "backend": "codex",
+                "model": "gpt-5",
+            },
+        ]);
+        sqlx::query(
+            "INSERT INTO teams \
+             (id, user_id, name, workspace, workspace_mode, agents, created_at, updated_at) \
+             VALUES ('team_1', ?, 'Team', '', 'shared', ?, 1000, 1000)",
+        )
+        .bind(user_id)
+        .bind(agents.to_string())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn transfer_team_owner_updates_agent_conversations() {
+        let (repo, db) = setup().await;
+        insert_user(&db, "user_target", "target").await;
+        insert_conversation(&db, "conv_lead", "system_default_user").await;
+        insert_conversation(&db, "conv_dev", "system_default_user").await;
+        insert_team(&db, "system_default_user").await;
+
+        repo.transfer_team_owner(
+            "team_1",
+            "user_target",
+            &["conv_lead".to_string(), "conv_dev".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let team_owner: (String,) = sqlx::query_as("SELECT user_id FROM teams WHERE id = 'team_1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let conversation_owners: Vec<(String,)> =
+            sqlx::query_as("SELECT user_id FROM conversations WHERE id IN ('conv_lead', 'conv_dev') ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+
+        assert_eq!(team_owner.0, "user_target");
+        assert_eq!(
+            conversation_owners,
+            vec![("user_target".to_string(),), ("user_target".to_string(),)]
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_team_owner_rolls_back_when_agent_conversation_missing() {
+        let (repo, db) = setup().await;
+        insert_user(&db, "user_target", "target").await;
+        insert_conversation(&db, "conv_lead", "system_default_user").await;
+        insert_team(&db, "system_default_user").await;
+
+        let err = repo
+            .transfer_team_owner(
+                "team_1",
+                "user_target",
+                &["conv_lead".to_string(), "conv_missing".to_string()],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, DbError::NotFound(_)));
+
+        let team_owner: (String,) = sqlx::query_as("SELECT user_id FROM teams WHERE id = 'team_1'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let conversation_owner: (String,) = sqlx::query_as("SELECT user_id FROM conversations WHERE id = 'conv_lead'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(team_owner.0, "system_default_user");
+        assert_eq!(conversation_owner.0, "system_default_user");
+    }
+}
+
 impl SqliteTeamRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -107,6 +238,40 @@ impl ITeamRepository for SqliteTeamRepository {
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("team {team_id}")));
         }
+        Ok(())
+    }
+
+    async fn transfer_team_owner(
+        &self,
+        team_id: &str,
+        target_user_id: &str,
+        conversation_ids: &[String],
+    ) -> Result<(), DbError> {
+        let now = now_ms();
+        let mut tx = self.pool.begin().await?;
+
+        for conversation_id in conversation_ids {
+            let result = sqlx::query("UPDATE conversations SET user_id = ?, updated_at = ? WHERE id = ?")
+                .bind(target_user_id)
+                .bind(now)
+                .bind(conversation_id)
+                .execute(&mut *tx)
+                .await?;
+            if result.rows_affected() == 0 {
+                return Err(DbError::NotFound(format!("conversation {conversation_id}")));
+            }
+        }
+
+        let result = sqlx::query("UPDATE teams SET user_id = ?, updated_at = ? WHERE id = ?")
+            .bind(target_user_id)
+            .bind(now)
+            .bind(team_id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("team {team_id}")));
+        }
+        tx.commit().await?;
         Ok(())
     }
 

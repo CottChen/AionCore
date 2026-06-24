@@ -142,6 +142,22 @@ fn protected_auth_app(jwt_service: Arc<JwtService>, user_repo: Arc<dyn IUserRepo
         .route_layer(middleware::from_fn_with_state(state, auth_middleware))
 }
 
+fn protected_local_auth_app(jwt_service: Arc<JwtService>, user_repo: Arc<dyn IUserRepository>) -> Router {
+    let state = AuthState {
+        jwt_service,
+        user_repo,
+        local: true,
+    };
+
+    async fn echo_user(axum::Extension(user): axum::Extension<CurrentUser>) -> String {
+        format!("{}:{}", user.id, user.username)
+    }
+
+    Router::new()
+        .route("/protected", get(echo_user))
+        .route_layer(middleware::from_fn_with_state(state, auth_middleware))
+}
+
 fn expired_token(jwt_service: &JwtService, secret: &str, user_id: &str, username: &str) -> String {
     let token = jwt_service.sign(user_id, username).unwrap();
     let mut validation = Validation::default();
@@ -267,6 +283,51 @@ async fn auth_middleware_database_error_returns_internal_error_code() {
     assert!(!error.contains("Authentication service unavailable"));
     assert!(!error.to_ascii_lowercase().contains("closed"));
     assert!(!error.to_ascii_lowercase().contains("sqlx"));
+}
+
+#[tokio::test]
+async fn auth_middleware_local_mode_uses_token_user_when_present() {
+    let db = init_database_memory().await.unwrap();
+    let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let hash = aionui_auth::hash_password("StrongP@ss1").unwrap();
+    let user = user_repo.create_user("alice", &hash).await.unwrap();
+    let token = jwt_service.sign(&user.id, &user.username).unwrap();
+    let app = protected_local_auth_app(jwt_service, user_repo);
+
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(std::str::from_utf8(&body).unwrap(), format!("{}:alice", user.id));
+}
+
+#[tokio::test]
+async fn auth_middleware_local_mode_falls_back_without_token() {
+    let db = init_database_memory().await.unwrap();
+    let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let app = protected_local_auth_app(jwt_service, user_repo);
+
+    let resp = app
+        .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        std::str::from_utf8(&body).unwrap(),
+        "system_default_user:system_default_user"
+    );
 }
 
 #[tokio::test]

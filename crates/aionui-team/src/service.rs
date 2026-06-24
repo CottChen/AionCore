@@ -1,6 +1,7 @@
 mod response_builder;
 pub(crate) mod spawn_support;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
@@ -285,6 +286,45 @@ impl TeamSessionService {
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
         self.build_team_response(&team).await
+    }
+
+    pub async fn transfer_owner(&self, team_id: &str, target_user_id: &str) -> Result<(), TeamError> {
+        let lock = self
+            .ensure_session_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        if self.sessions.contains_key(team_id) {
+            return Err(TeamError::InvalidRequest(format!(
+                "Cannot transfer team {team_id} while its session is active"
+            )));
+        }
+
+        let row = self
+            .repo
+            .get_team(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
+
+        let team = Team::from_row(&row)?;
+        let conversation_ids = team
+            .agents
+            .iter()
+            .map(|agent| agent.conversation_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        self.repo
+            .transfer_team_owner(team_id, target_user_id, &conversation_ids)
+            .await?;
+        self.broadcast_team_list_changed(team_id, "updated");
+        for conversation_id in conversation_ids {
+            self.broadcast_conversation_list_changed(&conversation_id, "updated");
+        }
+        Ok(())
     }
 
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
@@ -644,6 +684,14 @@ impl TeamSessionService {
         self.broadcaster.broadcast(WebSocketMessage::new(
             crate::events::TEAM_LIST_CHANGED_EVENT,
             serde_json::json!({ "team_id": team_id, "action": action }),
+        ));
+    }
+
+    fn broadcast_conversation_list_changed(&self, conversation_id: &str, action: &str) {
+        info!(conversation_id = %conversation_id, event_name = "conversation.listChanged", action, "conversation event broadcast");
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "conversation.listChanged",
+            serde_json::json!({ "conversation_id": conversation_id, "action": action }),
         ));
     }
 

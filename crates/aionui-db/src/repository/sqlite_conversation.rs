@@ -117,6 +117,21 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
+    async fn transfer_owner(&self, id: &str, target_user_id: &str) -> Result<(), DbError> {
+        let result = sqlx::query("UPDATE conversations SET user_id = ?, updated_at = ? WHERE id = ?")
+            .bind(target_user_id)
+            .bind(aionui_common::now_ms())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("Conversation '{id}' not found")));
+        }
+
+        Ok(())
+    }
+
     async fn delete(&self, id: &str) -> Result<(), DbError> {
         let result = sqlx::query("DELETE FROM conversations WHERE id = ?")
             .bind(id)
@@ -961,6 +976,26 @@ mod tests {
 
         let found = repo.get(&conv.id).await.unwrap().unwrap();
         assert_eq!(found.name, "Updated Name");
+        assert!(found.updated_at >= conv.updated_at);
+    }
+
+    #[tokio::test]
+    async fn transfer_owner_updates_user_id() {
+        let (repo, db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+             VALUES ('user_target', 'target', 'hash', 1000, 1000)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        repo.transfer_owner(&conv.id, "user_target").await.unwrap();
+
+        let found = repo.get(&conv.id).await.unwrap().unwrap();
+        assert_eq!(found.user_id, "user_target");
         assert!(found.updated_at >= conv.updated_at);
     }
 

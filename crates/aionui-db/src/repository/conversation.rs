@@ -27,6 +27,12 @@ pub trait IConversationRepository: Send + Sync {
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing.
     async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 
+    /// Transfers a conversation to another user.
+    async fn transfer_owner(&self, id: &str, target_user_id: &str) -> Result<(), DbError> {
+        let _ = (id, target_user_id);
+        Err(DbError::Init("conversation owner transfer is not supported".into()))
+    }
+
     /// Deletes a conversation (messages cascade via FK).
     /// Returns `DbError::NotFound` if ID is missing.
     async fn delete(&self, id: &str) -> Result<(), DbError>;

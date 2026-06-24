@@ -49,8 +49,12 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    // In local mode, skip JWT verification and inject a fixed default user.
-    if state.local {
+    let token = extract_token_from_headers(request.headers());
+
+    // In local mode, desktop renderer requests do not carry a WebUI token.
+    // Keep those on the fixed default user, but honor authenticated WebUI
+    // browser sessions when a token is present.
+    if state.local && token.is_none() {
         request.extensions_mut().insert(CurrentUser {
             id: "system_default_user".to_string(),
             username: "system_default_user".to_string(),
@@ -58,8 +62,7 @@ pub async fn auth_middleware(
         return Ok(next.run(request).await);
     }
 
-    let token = extract_token_from_headers(request.headers())
-        .ok_or_else(|| ApiError::Unauthorized("Authentication required".into()))?;
+    let token = token.ok_or_else(|| ApiError::Unauthorized("Authentication required".into()))?;
 
     let payload = state.jwt_service.verify(&token).map_err(|e| {
         tracing::debug!("Token verification failed: {e}");

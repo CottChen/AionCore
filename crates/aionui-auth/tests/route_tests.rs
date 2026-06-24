@@ -114,6 +114,16 @@ fn get_anonymous(uri: &str) -> Request<Body> {
     Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
 }
 
+/// Helper: perform a DELETE request with auth token.
+fn delete_with_token(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
 /// Helper: extract response body as JSON.
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -228,6 +238,95 @@ async fn t4_5_login_empty_password_hash_returns_401() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], false);
     assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
+async fn webui_user_management_requires_authentication() {
+    let (app, ctx) = test_app_with_local(true).await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+
+    let resp = app.oneshot(get_anonymous("/api/webui/users")).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn webui_user_management_forbids_secondary_user() {
+    let (mut app, ctx) = test_app_with_local(true).await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    create_test_user(&ctx, "bob", "StrongP@ss2").await;
+    let (token, _) = login(&mut app, "bob", "StrongP@ss2").await;
+
+    let resp = app.oneshot(get_with_token("/api/webui/users", &token)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn webui_admin_can_create_and_list_secondary_users() {
+    let (mut app, ctx) = test_app_with_local(true).await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let (admin_token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+
+    let create_resp = app
+        .clone()
+        .oneshot(json_post_with_token(
+            "/api/webui/users",
+            r#"{"username":"alice","password":"StrongP@ss2"}"#,
+            &admin_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let create_json = body_json(create_resp).await;
+    assert_eq!(create_json["data"]["user"]["username"], "alice");
+    assert_eq!(create_json["data"]["user"]["is_admin"], false);
+    assert!(
+        !create_json["data"]["user"]
+            .as_object()
+            .unwrap()
+            .contains_key("password_hash")
+    );
+
+    let list_resp = app
+        .clone()
+        .oneshot(get_with_token("/api/webui/users", &admin_token))
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_json = body_json(list_resp).await;
+    let users = list_json["data"].as_array().unwrap();
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[0]["is_admin"], true);
+    assert_eq!(users[1]["username"], "alice");
+}
+
+#[tokio::test]
+async fn webui_user_management_requires_local_mode() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let (admin_token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+
+    let resp = app
+        .oneshot(get_with_token("/api/webui/users", &admin_token))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn webui_local_mode_cannot_delete_system_user() {
+    let (mut app, ctx) = test_app_with_local(true).await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let (admin_token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+
+    let resp = app
+        .oneshot(delete_with_token("/api/webui/users/system_default_user", &admin_token))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -385,6 +484,7 @@ async fn t7_1_get_user_success() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     assert_eq!(json["user"]["username"], "admin");
+    assert_eq!(json["user"]["is_admin"], true);
     assert!(json["user"]["id"].is_string());
 }
 
