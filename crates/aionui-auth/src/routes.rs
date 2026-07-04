@@ -556,19 +556,6 @@ async fn change_password_handler(
         .await
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
-    // Rotate JWT secret to invalidate all sessions
-    let new_secret = state
-        .jwt_service
-        .rotate_secret()
-        .map_err(|e| ApiError::Internal(format!("Secret rotation error: {e}")))?;
-
-    // Persist new secret to database
-    state
-        .user_repo
-        .update_jwt_secret(&current_user.id, &new_secret)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
-
     Ok(Json(ApiResponse::message("Password changed successfully")))
 }
 

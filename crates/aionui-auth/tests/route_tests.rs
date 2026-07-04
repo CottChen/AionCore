@@ -581,26 +581,33 @@ async fn t8_1_change_password_success() {
 }
 
 #[tokio::test]
-async fn t8_2_change_password_old_token_invalidated() {
+async fn t8_2_change_password_does_not_invalidate_other_users() {
     let (mut app, ctx) = test_app().await;
-    create_test_user(&ctx, "admin", "OldP@ssword1").await;
-    let (token, _) = login(&mut app, "admin", "OldP@ssword1").await;
+    create_test_user(&ctx, "alice", "OldP@ssword1").await;
+    create_test_user(&ctx, "bob", "BobP@ssword1").await;
+    let (alice_token, _) = login(&mut app, "alice", "OldP@ssword1").await;
+    let (bob_token, bob_user_id) = login(&mut app, "bob", "BobP@ssword1").await;
 
-    // Change password
     let req = json_post_with_token(
         "/api/auth/change-password",
         r#"{"current_password":"OldP@ssword1","new_password":"NewP@ssword2"}"#,
-        &token,
+        &alice_token,
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // Old token should be invalid (JWT secret rotated)
-    let req = get_with_token("/api/auth/user", &token);
+    let req = get_with_token("/api/auth/user", &bob_token);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["user"]["id"], bob_user_id);
+
+    let (new_alice_token, _) = login(&mut app, "alice", "NewP@ssword2").await;
+    assert!(ctx.jwt_service.verify(&new_alice_token).is_ok());
+
+    let req = json_post("/login", r#"{"username":"alice","password":"OldP@ssword1"}"#);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let json = body_json(resp).await;
-    assert_eq!(json["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
