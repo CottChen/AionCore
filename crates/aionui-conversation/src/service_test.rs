@@ -18,7 +18,8 @@ use crate::response_middleware::{CronCommandResult, CronCreateParams, CronUpdate
 use aionui_api_types::{
     AcpConfigOptionDto, AgentErrorCode, AgentModeResponse, ConfigOptionConfirmation, ConversationArtifactKind,
     ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload,
-    SetConfigOptionRequest, SetConfigOptionResponse, WorkspaceBrowseQuery,
+    SetConfigOptionRequest, SetConfigOptionResponse, WorkspaceBrowseQuery, WorkspaceSearchMatchKind,
+    WorkspaceSearchMode,
 };
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
@@ -1869,6 +1870,7 @@ async fn browse_workspace_search_matches_nested_file_names() {
             WorkspaceBrowseQuery {
                 path: ".".into(),
                 search: Some("searchpanel".into()),
+                search_mode: None,
             },
         )
         .await
@@ -1877,6 +1879,7 @@ async fn browse_workspace_search_matches_nested_file_names() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "src/components/SearchPanel.tsx");
     assert_eq!(entries[0].entry_type, "file");
+    assert_eq!(entries[0].match_kind, Some(WorkspaceSearchMatchKind::Name));
 }
 
 #[tokio::test]
@@ -1908,6 +1911,7 @@ async fn browse_workspace_search_matches_nested_file_contents() {
             WorkspaceBrowseQuery {
                 path: ".".into(),
                 search: Some("projectdelta".into()),
+                search_mode: None,
             },
         )
         .await
@@ -1916,6 +1920,7 @@ async fn browse_workspace_search_matches_nested_file_contents() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "docs/notes.md");
     assert_eq!(entries[0].entry_type, "file");
+    assert_eq!(entries[0].match_kind, Some(WorkspaceSearchMatchKind::Content));
 }
 
 #[tokio::test]
@@ -1946,6 +1951,7 @@ async fn browse_workspace_search_skips_dependency_dirs_by_default() {
             WorkspaceBrowseQuery {
                 path: ".".into(),
                 search: Some("dependencyonlyneedle".into()),
+                search_mode: None,
             },
         )
         .await
@@ -1982,6 +1988,7 @@ async fn browse_workspace_search_allows_explicit_dependency_dir_root() {
             WorkspaceBrowseQuery {
                 path: "node_modules".into(),
                 search: Some("dependencyonlyneedle".into()),
+                search_mode: None,
             },
         )
         .await
@@ -2017,6 +2024,7 @@ async fn browse_workspace_search_respects_gitignore_from_workspace_root() {
             WorkspaceBrowseQuery {
                 path: ".".into(),
                 search: Some("ignoredneedle".into()),
+                search_mode: None,
             },
         )
         .await
@@ -2050,6 +2058,7 @@ async fn browse_workspace_search_allows_explicit_gitignored_root() {
             WorkspaceBrowseQuery {
                 path: "ignored".into(),
                 search: Some("ignoredneedle".into()),
+                search_mode: None,
             },
         )
         .await
@@ -2058,6 +2067,94 @@ async fn browse_workspace_search_allows_explicit_gitignored_root() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "ignored/notes.md");
     assert_eq!(entries[0].entry_type, "file");
+}
+
+#[tokio::test]
+async fn browse_workspace_search_prioritizes_name_matches_before_content_matches() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let user_workspace = temp.path().join("user-project");
+    std::fs::create_dir_all(&user_workspace).unwrap();
+    std::fs::write(user_workspace.join("a-keyword-name.txt"), "ordinary content").unwrap();
+    std::fs::write(user_workspace.join("b-content.txt"), "keyword").unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": user_workspace,
+            "custom_workspace": true
+        }
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let entries = svc
+        .browse_workspace(
+            &conv.id,
+            WorkspaceBrowseQuery {
+                path: ".".into(),
+                search: Some("keyword".into()),
+                search_mode: Some(WorkspaceSearchMode::All),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].name, "a-keyword-name.txt");
+    assert_eq!(entries[0].match_kind, Some(WorkspaceSearchMatchKind::Name));
+    assert_eq!(entries[1].name, "b-content.txt");
+    assert_eq!(entries[1].match_kind, Some(WorkspaceSearchMatchKind::Content));
+}
+
+#[tokio::test]
+async fn browse_workspace_search_mode_limits_match_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let user_workspace = temp.path().join("user-project");
+    std::fs::create_dir_all(&user_workspace).unwrap();
+    std::fs::write(user_workspace.join("name-only-needle.txt"), "plain").unwrap();
+    std::fs::write(user_workspace.join("content-only.txt"), "needle").unwrap();
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root);
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": user_workspace,
+            "custom_workspace": true
+        }
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let name_entries = svc
+        .browse_workspace(
+            &conv.id,
+            WorkspaceBrowseQuery {
+                path: ".".into(),
+                search: Some("needle".into()),
+                search_mode: Some(WorkspaceSearchMode::Name),
+            },
+        )
+        .await
+        .unwrap();
+    let content_entries = svc
+        .browse_workspace(
+            &conv.id,
+            WorkspaceBrowseQuery {
+                path: ".".into(),
+                search: Some("needle".into()),
+                search_mode: Some(WorkspaceSearchMode::Content),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(name_entries.len(), 1);
+    assert_eq!(name_entries[0].name, "name-only-needle.txt");
+    assert_eq!(name_entries[0].match_kind, Some(WorkspaceSearchMatchKind::Name));
+    assert_eq!(content_entries.len(), 1);
+    assert_eq!(content_entries[0].name, "content-only.txt");
+    assert_eq!(content_entries[0].match_kind, Some(WorkspaceSearchMatchKind::Content));
 }
 
 #[tokio::test]
@@ -2085,6 +2182,7 @@ async fn browse_workspace_without_search_keeps_shallow_directory_listing() {
             WorkspaceBrowseQuery {
                 path: ".".into(),
                 search: None,
+                search_mode: None,
             },
         )
         .await
