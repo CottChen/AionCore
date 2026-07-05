@@ -311,7 +311,7 @@ async fn auth_middleware_local_mode_uses_token_user_when_present() {
 }
 
 #[tokio::test]
-async fn auth_middleware_local_mode_falls_back_without_token() {
+async fn auth_middleware_local_mode_rejects_browser_without_token() {
     let db = init_database_memory().await.unwrap();
     let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
     let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
@@ -319,6 +319,26 @@ async fn auth_middleware_local_mode_falls_back_without_token() {
 
     let resp = app
         .oneshot(Request::get("/protected").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn auth_middleware_local_mode_falls_back_for_internal_desktop_request_without_token() {
+    let db = init_database_memory().await.unwrap();
+    let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let app = protected_local_auth_app(jwt_service, user_repo);
+
+    let resp = app
+        .oneshot(
+            Request::get("/protected")
+                .header("x-aionui-internal", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
