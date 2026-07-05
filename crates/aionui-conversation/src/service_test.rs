@@ -967,6 +967,30 @@ fn make_service() -> (
     make_service_with_resolver(Arc::new(FixedSkillResolver { names: vec![] }))
 }
 
+fn make_service_with_workspace_root(
+    workspace_root: PathBuf,
+) -> (
+    ConversationService,
+    Arc<MockBroadcaster>,
+    Arc<MockRepo>,
+    Arc<dyn IWorkerTaskManager>,
+) {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let svc = ConversationService::new(
+        workspace_root,
+        broadcaster.clone(),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr.clone(),
+        repo.clone(),
+        agent_metadata_repo,
+        Arc::new(StubAcpSessionRepo::default()),
+    );
+    (svc, broadcaster, repo, task_mgr)
+}
+
 fn make_service_with_resolver(
     skill_resolver: Arc<dyn crate::skill_resolver::SkillResolver>,
 ) -> (
