@@ -6,10 +6,10 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
-use aionui_ai_agent::{AgentError, AgentInstance, IWorkerTaskManager};
+use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, TeamAgentResponse, TeamMcpPhase, TeamMcpStatusPayload, TeamResponse,
-    TeamRunAckResponse, TeamRunTargetRole, WebSocketMessage,
+    TeamRunAckResponse, TeamRunStateResponse, TeamRunTargetRole, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -19,13 +19,13 @@ use aionui_db::{
 };
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::TeamError;
 use crate::event_loop::AgentLoopContext;
 use crate::events::{TEAM_CREATED_EVENT, TEAM_MCP_STATUS_EVENT, TEAM_REMOVED_EVENT, TEAM_RENAMED_EVENT};
 use crate::message_projection::TeamProjectionMessageStore;
-use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort};
+use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogPort};
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
 use crate::session::{AgentMessageQueueResult, TeamSession};
 use crate::types::{Team, TeamAgent};
@@ -46,6 +46,7 @@ struct SessionEntry {
 pub struct TeamSessionService {
     repo: Arc<dyn ITeamRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+    assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
     assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
     provider_repo: Arc<dyn IProviderRepository>,
@@ -78,6 +79,7 @@ impl TeamSessionService {
     pub fn new(
         repo: Arc<dyn ITeamRepository>,
         agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
+        assistant_catalog: Arc<dyn TeamAssistantCatalogPort>,
         assistant_definition_repo: Arc<dyn IAssistantDefinitionRepository>,
         assistant_overlay_repo: Arc<dyn IAssistantOverlayRepository>,
         provider_repo: Arc<dyn IProviderRepository>,
@@ -92,6 +94,7 @@ impl TeamSessionService {
         Arc::new_cyclic(|weak| Self {
             repo,
             agent_metadata_repo,
+            assistant_catalog,
             assistant_definition_repo,
             assistant_overlay_repo,
             provider_repo,
@@ -132,6 +135,50 @@ impl TeamSessionService {
             )));
         }
         Ok(Team::from_row(&row)?)
+    }
+
+    pub async fn renew_active_lease(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        active_leases: &ActiveLeaseRegistry,
+    ) -> Result<(), TeamError> {
+        let team = match self.load_owned_team(user_id, team_id).await {
+            Ok(team) => team,
+            Err(error @ (TeamError::TeamNotFound(_) | TeamError::Forbidden(_))) => {
+                debug!(
+                    kind = "team",
+                    team_id,
+                    user_id,
+                    error = %error,
+                    "Team active lease renew rejected"
+                );
+                return Err(error);
+            }
+            Err(error) => {
+                warn!(
+                    kind = "team",
+                    team_id,
+                    user_id,
+                    error = %error,
+                    "Team active lease renew failed"
+                );
+                return Err(error);
+            }
+        };
+
+        let conversation_ids = team
+            .agents
+            .iter()
+            .map(|agent| agent.conversation_id.as_str())
+            .filter(|conversation_id| !conversation_id.trim().is_empty());
+        let (covered_count, expires_at) = active_leases.renew_many(conversation_ids);
+
+        debug!(
+            kind = "team",
+            team_id, covered_count, expires_at, "Team active lease renewed"
+        );
+        Ok(())
     }
 
     /// Restore sessions for all existing teams. Called once at app startup
@@ -470,7 +517,7 @@ impl TeamSessionService {
     /// Flow (mcp.md §4.3):
     /// 1. Start `TeamSession` (opens the MCP TCP server).
     /// 2. For each agent: persist `team_mcp_stdio_config` into
-    ///    `conversation.extra` → `task_manager.kill(conv_id, TeamMcpRebuild)`
+    ///    `conversation.extra` → `task_manager.kill_and_wait(conv_id, TeamMcpRebuild)`
     ///    → `TeamConversationProvisioningPort::warmup_agent_process(...)`
     ///    rebuilds the ACP process with
     ///    the new extra.
@@ -745,6 +792,17 @@ impl TeamSessionService {
         self.sessions.get(team_id).map(|e| e.session.user_id().to_owned())
     }
 
+    pub async fn get_run_state(&self, user_id: &str, team_id: &str) -> Result<TeamRunStateResponse, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
+        let active_run = match session {
+            Some(session) => session.team_run_manager().current_payload().await,
+            None => None,
+        };
+
+        Ok(TeamRunStateResponse { active_run })
+    }
+
     pub fn get_session_scheduler(&self, team_id: &str) -> Option<Arc<crate::scheduler::TeammateManager>> {
         self.sessions.get(team_id).map(|e| e.session.scheduler().clone())
     }
@@ -755,6 +813,11 @@ impl TeamSessionService {
             .get(team_id)
             .map(|entry| !entry.slow_monitor_handle.is_finished())
             .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn session_count_for_test(&self) -> usize {
+        self.sessions.len()
     }
 
     pub async fn stop_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
@@ -1049,5 +1112,44 @@ mod tests {
 
         assert!(svc.session_has_slow_monitor(&created.id));
         svc.stop_session("user-test", &created.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_state_returns_none_without_session_and_does_not_create_session() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Run State"))
+            .await
+            .unwrap();
+        svc.stop_session("user-test", &created.id).await.unwrap();
+
+        assert_eq!(svc.session_count_for_test(), 0);
+
+        let state = svc.get_run_state("user-test", &created.id).await.unwrap();
+
+        assert!(state.active_run.is_none());
+        assert_eq!(svc.session_count_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_state_returns_current_active_payload() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let created = svc
+            .create_team("user-test", single_agent_team_request("Active Run State"))
+            .await
+            .unwrap();
+
+        let ack = svc.send_message("user-test", &created.id, "hello", None).await.unwrap();
+        let state = svc.get_run_state("user-test", &created.id).await.unwrap();
+        let active_run = state.active_run.expect("active run state");
+
+        assert_eq!(active_run.team_id, created.id);
+        assert_eq!(active_run.team_run_id, ack.team_run_id);
+        assert_eq!(active_run.status, ack.status);
+        assert_eq!(active_run.target_slot_id, ack.target_slot_id);
+        assert_eq!(active_run.target_role, ack.target_role);
+        assert_eq!(active_run.pending_wake_count, 1);
+        assert_eq!(active_run.slot_work.len(), 1);
+        assert_eq!(active_run.slot_work[0].slot_id, ack.accepted_slot_id);
     }
 }

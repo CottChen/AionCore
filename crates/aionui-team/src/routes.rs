@@ -8,10 +8,12 @@ use axum::extract::{Extension, Json, Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 
+use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
     AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
     PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest,
-    SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse, WebuiTransferOwnerRequest,
+    SetModeRequest, TeamAgentResponse, TeamListResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse,
+    WebuiTransferOwnerRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -24,6 +26,7 @@ use crate::service::TeamSessionService;
 pub struct TeamRouterState {
     pub service: Arc<TeamSessionService>,
     pub user_repo: Arc<dyn IUserRepository>,
+    pub active_leases: Arc<ActiveLeaseRegistry>,
 }
 
 const SYSTEM_USER_ID: &str = "system_default_user";
@@ -71,6 +74,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams", post(create_team).get(list_teams))
         .route("/api/teams/{id}", get(get_team).delete(remove_team))
         .route("/api/teams/{id}/owner", post(transfer_owner))
+        .route("/api/teams/{id}/run-state", get(get_run_state))
         .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
         .route("/api/teams/{id}/agents", post(add_agent))
         .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
@@ -90,6 +94,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
             post(pause_slot_work),
         )
         .route("/api/teams/{id}/session", post(ensure_session).delete(stop_session))
+        .route("/api/teams/{id}/active-lease", post(active_lease))
         .route("/api/teams/{id}/session-mode", post(set_session_mode))
         .with_state(state)
 }
@@ -139,6 +144,15 @@ async fn transfer_owner(
         .ok_or_else(|| ApiError::NotFound(format!("User '{}' not found", req.target_user_id)))?;
     state.service.transfer_owner(&id, &req.target_user_id).await?;
     Ok(Json(ApiResponse::success()))
+}
+
+async fn get_run_state(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<TeamRunStateResponse>>, ApiError> {
+    let run_state = state.service.get_run_state(&user.id, &id).await?;
+    Ok(Json(ApiResponse::ok(run_state)))
 }
 
 async fn remove_team(
@@ -301,6 +315,18 @@ async fn set_session_mode(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     state.service.set_session_mode(&user.id, &id, &req.mode).await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn active_lease(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .renew_active_lease(&user.id, &id, &state.active_leases)
+        .await?;
     Ok(Json(ApiResponse::success()))
 }
 

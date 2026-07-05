@@ -89,6 +89,7 @@ impl ProviderHealthCheckService {
             session_mode: None,
             extra_mcp_servers: HashMap::new(),
             bedrock_config,
+            runtime_env: Vec::new(),
         })
     }
 }
@@ -211,10 +212,10 @@ async fn build_probe_engine(config_extra: AionrsResolvedConfig) -> Result<AgentE
     config.mcp.servers.clear();
     config.file_cache.enabled = false;
     if let Some(field) = config_extra.compat_overrides.max_tokens_field {
-        config.compat.max_tokens_field = Some(field);
+        config.compat.transport.max_tokens_field = Some(field);
     }
     if let Some(path) = config_extra.compat_overrides.api_path {
-        config.compat.api_path = Some(path);
+        config.compat.transport.api_path = Some(path);
     }
 
     AgentBootstrap::new(config, workspace, sink)

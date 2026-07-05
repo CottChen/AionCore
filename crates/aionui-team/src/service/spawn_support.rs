@@ -2,48 +2,17 @@ use super::*;
 use aionui_api_types::BehaviorPolicy;
 use aionui_common::AgentType;
 use aionui_common::constants::{TEAM_CAPABLE_BACKENDS, has_mcp_capability};
-use aionui_db::models::AssistantOverlayRow;
+use aionui_db::models::AgentMetadataRow;
 use aionui_db::{IAgentMetadataRepository, resolve_agent_binding_from_rows};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::prompts::AvailableAssistant;
 
 use crate::provisioning::PersistSpawnedAgentRequest;
 
-/// Known ACP vendor labels. Kept in lockstep with the `agent_metadata`
-/// seed in `005_agent_metadata.sql` — a caller hitting an unknown
-/// vendor should trigger a schema drift discussion, not silently fall
-/// through.
-const ACP_VENDOR_LABELS: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "qwen",
-    "codebuddy",
-    "droid",
-    "goose",
-    "auggie",
-    "kimi",
-    "opencode",
-    "copilot",
-    "qoder",
-    "vibe",
-    "cursor",
-    "kiro",
-    "hermes",
-    "snow",
-];
-
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
 
 pub(crate) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
-    // Any registered ACP vendor label collapses to `AgentType::Acp`.
-    if ACP_VENDOR_LABELS.contains(&backend) {
-        return Ok(AgentType::Acp);
-    }
-    // Otherwise interpret as a top-level `AgentType` (e.g. "acp",
-    // "nanobot", "aionrs", "remote", "openclaw-gateway").
     let quoted = format!("\"{backend}\"");
     if let Ok(agent_type) = serde_json::from_str::<AgentType>(&quoted) {
         if agent_type.is_deprecated_runtime() {
@@ -54,16 +23,31 @@ pub(crate) fn parse_agent_type(backend: &str) -> Result<AgentType, TeamError> {
     Err(TeamError::InvalidRequest(format!("unsupported backend: {backend}")))
 }
 
-/// Resolve the most permissive session mode for a given backend string.
-/// Reuses `AgentType::full_auto_mode_id` from aionui-common.
-pub(crate) fn resolve_full_auto_mode(backend: &str) -> &'static str {
-    let agent_type = if ACP_VENDOR_LABELS.contains(&backend) {
-        AgentType::Acp
-    } else {
-        let quoted = format!("\"{backend}\"");
-        serde_json::from_str::<AgentType>(&quoted).unwrap_or(AgentType::Acp)
-    };
-    agent_type.full_auto_mode_id(Some(backend))
+fn find_acp_backend_metadata(rows: &[AgentMetadataRow], backend: &str) -> Option<AgentMetadataRow> {
+    rows.iter()
+        .find(|row| row.agent_type == AgentType::Acp.serde_name() && row.backend.as_deref() == Some(backend))
+        .cloned()
+}
+
+pub(crate) async fn acp_backend_metadata(
+    agent_metadata_repo: &Arc<dyn IAgentMetadataRepository>,
+    backend: &str,
+) -> Result<Option<AgentMetadataRow>, TeamError> {
+    let rows = agent_metadata_repo.list_all().await?;
+    Ok(find_acp_backend_metadata(&rows, backend))
+}
+
+pub(crate) fn session_mode_for_backend(
+    backend: &str,
+    agent_type: AgentType,
+    acp_metadata: Option<&AgentMetadataRow>,
+) -> String {
+    if let Some(row) = acp_metadata
+        && let Some(yolo_id) = row.yolo_id.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    {
+        return yolo_id.to_owned();
+    }
+    agent_type.full_auto_mode_id(Some(backend)).to_owned()
 }
 
 pub(crate) async fn resolve_runtime_backend(
@@ -152,93 +136,23 @@ impl TeamSessionService {
     }
 
     /// Return all enabled assistants that can currently participate in team mode.
-    /// This is the assistant-first candidate source for the leader prompt.
+    /// This consumes the same assistant projection as the Team creation UI, so
+    /// `team_selectable` has a single source of truth.
     pub(crate) async fn list_team_selectable_assistants(&self) -> Vec<AvailableAssistant> {
-        let Ok(definitions) = self.assistant_definition_repo.list().await else {
-            return Vec::new();
-        };
-        let Ok(overlays) = self.assistant_overlay_repo.list().await else {
-            return Vec::new();
-        };
-        let Ok(agent_rows) = self.agent_metadata_repo.list_all().await else {
+        let Ok(assistants) = self.assistant_catalog.list_team_selectable_assistants().await else {
             return Vec::new();
         };
 
-        let overlay_by_definition: HashMap<&str, &AssistantOverlayRow> = overlays
-            .iter()
-            .map(|row| (row.assistant_definition_id.as_str(), row))
-            .collect();
-
-        let mut assistants: Vec<(i32, AvailableAssistant)> = Vec::new();
-
-        for definition in &definitions {
-            let Some(source) = (match definition.source.as_str() {
-                "builtin" | "generated" | "user" => Some(definition.source.as_str()),
-                _ => None,
-            }) else {
-                continue;
-            };
-            let overlay = overlay_by_definition.get(definition.id.as_str()).copied();
-            let enabled = overlay.is_none_or(|row| row.enabled);
-            if !enabled {
-                continue;
-            }
-
-            let effective_agent_id = overlay
-                .and_then(|row| row.agent_id_override.as_deref())
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(definition.agent_id.as_str());
-            let effective_backend = resolve_runtime_backend(&self.agent_metadata_repo, effective_agent_id)
-                .await
-                .unwrap_or_else(|_| effective_agent_id.to_owned());
-
-            let agent_row = if source == "generated" {
-                definition
-                    .source_ref
-                    .as_deref()
-                    .and_then(|source_ref| agent_rows.iter().find(|row| row.id == source_ref))
-            } else {
-                agent_rows
-                    .iter()
-                    .find(|row| {
-                        row.backend.as_deref() == Some(effective_backend.as_str()) && row.agent_source != "custom"
-                    })
-                    .or_else(|| {
-                        agent_rows
-                            .iter()
-                            .find(|row| row.backend.as_deref() == Some(effective_backend.as_str()))
-                    })
-            };
-
-            let is_available = agent_row.is_some_and(|row| row.last_check_status.as_deref() != Some("unavailable"));
-            let is_team_capable = self.is_backend_team_capable(&effective_backend).await;
-            if !(is_available && is_team_capable) {
-                continue;
-            }
-
-            let mut skills = decode_string_list(&definition.default_skill_ids);
-            skills.extend(decode_string_list(&definition.custom_skill_names));
-
-            assistants.push((
-                overlay.map(|row| row.sort_order).unwrap_or(i32::MAX),
-                AvailableAssistant {
-                    assistant_id: definition.assistant_id.clone(),
-                    name: definition.name.clone(),
-                    backend: effective_backend.to_owned(),
-                    description: definition.description.clone().unwrap_or_default(),
-                    skills,
-                },
-            ));
-        }
-
-        assistants.sort_by(|(left_order, left), (right_order, right)| {
-            left_order
-                .cmp(right_order)
-                .then_with(|| left.name.cmp(&right.name))
-                .then_with(|| left.assistant_id.cmp(&right.assistant_id))
-        });
-
-        assistants.into_iter().map(|(_, assistant)| assistant).collect()
+        assistants
+            .into_iter()
+            .map(|assistant| AvailableAssistant {
+                assistant_id: assistant.assistant_id,
+                name: assistant.name,
+                backend: assistant.backend,
+                description: assistant.description,
+                skills: assistant.skills,
+            })
+            .collect()
     }
 
     /// Return the `team_list_models` response built from DB rows.
@@ -357,20 +271,17 @@ impl TeamSessionService {
     }
 }
 
-fn decode_string_list(raw: &str) -> Vec<String> {
-    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::workspace_harness::{
         force_team_workspace, setup_with_factory_metadata_team_repo_and_conversation_repo, single_agent_team_request,
     };
-    use aionui_db::models::{AssistantDefinitionRow, AssistantOverlayRow, Provider};
+    use aionui_db::models::{AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, Provider};
     use aionui_db::{
-        DbError, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
-        UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+        DbError, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+        IProviderRepository, UpdateAgentHandshakeParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
+        UpsertAssistantOverlayParams,
     };
     use std::sync::Arc;
 
@@ -414,6 +325,45 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct MultiAssistantDefinitionRepo {
+        rows: Vec<AssistantDefinitionRow>,
+    }
+
+    #[async_trait::async_trait]
+    impl IAssistantDefinitionRepository for MultiAssistantDefinitionRepo {
+        async fn list(&self) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(self.rows.iter().find(|row| row.assistant_id == assistant_id).cloned())
+        }
+
+        async fn get_by_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(self.rows.iter().find(|row| row.id == definition_id).cloned())
+        }
+
+        async fn get_by_source_ref(
+            &self,
+            _source: &str,
+            _source_ref: &str,
+        ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn upsert(
+            &self,
+            _params: &UpsertAssistantDefinitionParams<'_>,
+        ) -> Result<AssistantDefinitionRow, DbError> {
+            Err(DbError::Init("not implemented".into()))
+        }
+
+        async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    #[derive(Clone)]
     struct SingleAssistantOverlayRepo {
         row: AssistantOverlayRow,
     }
@@ -426,6 +376,34 @@ mod tests {
 
         async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
             Ok(vec![self.row.clone()])
+        }
+
+        async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
+            Err(DbError::Init("not implemented".into()))
+        }
+
+        async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    #[derive(Clone)]
+    struct MultiAssistantOverlayRepo {
+        rows: Vec<AssistantOverlayRow>,
+    }
+
+    #[async_trait::async_trait]
+    impl IAssistantOverlayRepository for MultiAssistantOverlayRepo {
+        async fn get(&self, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.assistant_definition_id == definition_id)
+                .cloned())
+        }
+
+        async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
+            Ok(self.rows.clone())
         }
 
         async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
@@ -485,16 +463,110 @@ mod tests {
         }
     }
 
+    struct RowsAgentMetadataRepo {
+        rows: Vec<AgentMetadataRow>,
+    }
+
+    #[async_trait::async_trait]
+    impl IAgentMetadataRepository for RowsAgentMetadataRepo {
+        async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(self.rows.iter().find(|row| row.id == id).cloned())
+        }
+
+        async fn find_by_source_and_name(
+            &self,
+            agent_source: &str,
+            name: &str,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.agent_source == agent_source && row.name == name)
+                .cloned())
+        }
+
+        async fn find_builtin_by_backend(&self, backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.agent_source == "builtin" && row.backend.as_deref() == Some(backend))
+                .cloned())
+        }
+
+        async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
+            Err(DbError::Init("not implemented".into()))
+        }
+
+        async fn apply_handshake(
+            &self,
+            _id: &str,
+            _params: &UpdateAgentHandshakeParams<'_>,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn update_availability_snapshot(
+            &self,
+            _id: &str,
+            _params: &aionui_db::models::UpdateAgentAvailabilitySnapshotParams<'_>,
+        ) -> Result<Option<AgentMetadataRow>, DbError> {
+            Ok(None)
+        }
+
+        async fn update_agent_overrides(
+            &self,
+            _id: &str,
+            _command_override: Option<&str>,
+            _env_override: Option<&str>,
+        ) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
+            Ok(false)
+        }
+
+        async fn delete(&self, _id: &str) -> Result<bool, DbError> {
+            Ok(false)
+        }
+    }
+
+    struct RowsTeamAssistantCatalog {
+        rows: Vec<crate::ports::TeamAssistantCatalogEntry>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::TeamAssistantCatalogPort for RowsTeamAssistantCatalog {
+        async fn list_team_selectable_assistants(
+            &self,
+        ) -> Result<Vec<crate::ports::TeamAssistantCatalogEntry>, TeamError> {
+            Ok(self.rows.clone())
+        }
+    }
+
+    fn team_assistant_entry(assistant_id: &str, name: &str, backend: &str) -> crate::ports::TeamAssistantCatalogEntry {
+        crate::ports::TeamAssistantCatalogEntry {
+            assistant_id: assistant_id.into(),
+            name: name.into(),
+            backend: backend.into(),
+            description: String::new(),
+            skills: Vec::new(),
+        }
+    }
+
     #[test]
-    fn parse_agent_type_known_backends() {
+    fn parse_agent_type_accepts_top_level_supported_runtimes() {
         assert_eq!(parse_agent_type("acp").unwrap(), AgentType::Acp);
-        assert_eq!(parse_agent_type("gemini").unwrap(), AgentType::Acp);
         assert_eq!(parse_agent_type("aionrs").unwrap(), AgentType::Aionrs);
     }
 
     #[test]
     fn parse_agent_type_rejects_deprecated_runtime_types() {
-        for backend in ["nanobot", "remote", "openclaw-gateway"] {
+        for backend in ["codex", "gemini", "nanobot", "remote", "openclaw-gateway"] {
             let err = parse_agent_type(backend).unwrap_err();
             assert!(matches!(err, TeamError::InvalidRequest(_)));
             assert!(
@@ -511,9 +583,38 @@ mod tests {
         assert!(matches!(err, TeamError::InvalidRequest(_)));
     }
 
-    #[test]
-    fn resolve_full_auto_mode_keeps_hermes_on_default() {
-        assert_eq!(resolve_full_auto_mode("hermes"), "default");
+    #[tokio::test]
+    async fn list_team_selectable_assistants_uses_assistant_projection_catalog() {
+        let (base, _, _, _) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let svc = TeamSessionService::new(
+            base.repo.clone(),
+            Arc::new(RowsAgentMetadataRepo { rows: vec![] }),
+            Arc::new(RowsTeamAssistantCatalog {
+                rows: vec![team_assistant_entry(
+                    "assistant-unchecked",
+                    "Unchecked Assistant",
+                    "cursor",
+                )],
+            }),
+            Arc::new(MultiAssistantDefinitionRepo { rows: vec![] }),
+            Arc::new(MultiAssistantOverlayRepo { rows: vec![] }),
+            Arc::new(SingleProviderRepo { rows: vec![] }),
+            base.conversation_port.clone(),
+            base.projection_store.clone(),
+            base.broadcaster.clone(),
+            base.task_manager.clone(),
+            base.turn_port.clone(),
+            base.cancellation_port.clone(),
+            base.backend_binary_path.clone(),
+        );
+
+        let assistants = svc.list_team_selectable_assistants().await;
+        let ids: Vec<&str> = assistants
+            .iter()
+            .map(|assistant| assistant.assistant_id.as_str())
+            .collect();
+
+        assert_eq!(ids, vec!["assistant-unchecked"]);
     }
 
     #[tokio::test]
@@ -558,6 +659,7 @@ mod tests {
         let svc = TeamSessionService::new(
             svc.repo.clone(),
             svc.agent_metadata_repo.clone(),
+            Arc::new(RowsTeamAssistantCatalog { rows: vec![] }),
             Arc::new(SingleAssistantDefinitionRepo {
                 row: AssistantDefinitionRow {
                     id: "def-1".into(),
