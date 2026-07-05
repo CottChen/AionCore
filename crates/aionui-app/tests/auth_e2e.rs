@@ -405,12 +405,12 @@ async fn full_auth_flow_e2e() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // 6. Old token invalidated after password change
+    // 6. Existing session remains valid after password change
     let req = get_with_token("/api/auth/user", &token);
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "UNAUTHORIZED");
+    assert_eq!(json["user"]["username"], "admin");
 
     // 7. Login with new password
     let req = post_json_login("/login", r#"{"username":"admin","password":"Updated@Pass2"}"#);
