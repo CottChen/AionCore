@@ -119,18 +119,27 @@ mod tests {
         // We cannot reliably set env in parallel tests, so just verify
         // the default path contains "aionui".
         let dir = resolve_cache_dir();
-        assert!(dir.contains("aionui"), "cache_dir should contain 'aionui': {dir}");
+        assert!(
+            dir.to_lowercase().contains("aionui"),
+            "cache_dir should contain 'aionui': {dir}"
+        );
     }
 
     #[test]
     fn test_env_override_work_dir() {
         let dir = resolve_work_dir();
-        assert!(dir.contains("aionui"), "work_dir should contain 'aionui': {dir}");
+        assert!(
+            dir.to_lowercase().contains("aionui"),
+            "work_dir should contain 'aionui': {dir}"
+        );
     }
 
     #[test]
     fn test_env_override_log_dir() {
         let dir = resolve_log_dir();
-        assert!(dir.contains("aionui"), "log_dir should contain 'aionui': {dir}");
+        assert!(
+            dir.to_lowercase().contains("aionui"),
+            "log_dir should contain 'aionui': {dir}"
+        );
     }
 }
