@@ -99,6 +99,8 @@ struct AssistantSnapshotResolvedDefaults {
     #[serde(default)]
     thought_level: Option<String>,
     #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
     skill_ids: Vec<String>,
     #[serde(default)]
     disabled_builtin_skill_ids: Vec<String>,
@@ -114,6 +116,8 @@ struct AssistantSnapshotDefaultModes {
     permission: String,
     #[serde(default)]
     thought_level: String,
+    #[serde(default)]
+    workspace: String,
     #[serde(default)]
     skills: String,
     #[serde(default)]
@@ -751,6 +755,19 @@ impl ConversationService {
             warn!("aionrs create: stripped legacy `extra.model`; top-level `model` is canonical");
         }
 
+        if extra
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .is_none_or(|value| value.trim().is_empty())
+            && let Some(workspace) = assistant_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.resolved_defaults.workspace.as_deref())
+                .filter(|value| !value.trim().is_empty())
+            && let Some(obj) = extra.as_object_mut()
+        {
+            obj.insert("workspace".to_owned(), serde_json::Value::String(workspace.to_owned()));
+        }
+
         // Determine whether the user chose this workspace ("custom") or we
         // auto-provision one under
         // `{data_dir}/conversations/YYYY/MM/DD/{label}-temp-{id}/`.
@@ -1379,6 +1396,10 @@ impl ConversationService {
                     "auto" => preference.as_ref().and_then(|row| row.last_thought_level_value.clone()),
                     _ => None,
                 });
+        let workspace = match definition.default_workspace_mode.as_str() {
+            "fixed" => definition.default_workspace_value.clone(),
+            _ => None,
+        };
 
         let rules_content = if let Some(dispatcher) = self.assistant_dispatcher() {
             dispatcher
@@ -1427,6 +1448,7 @@ impl ConversationService {
                 model: definition.default_model_mode.clone(),
                 permission: definition.default_permission_mode.clone(),
                 thought_level: definition.default_thought_level_mode.clone(),
+                workspace: definition.default_workspace_mode.clone(),
                 skills: definition.default_skills_mode.clone(),
                 mcps: definition.default_mcps_mode.clone(),
             },
@@ -1434,6 +1456,7 @@ impl ConversationService {
                 model,
                 permission,
                 thought_level,
+                workspace,
                 skill_ids,
                 disabled_builtin_skill_ids,
                 mcp_ids,

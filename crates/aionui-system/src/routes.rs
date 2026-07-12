@@ -26,6 +26,8 @@ use crate::runtime_prepare::RuntimePrepareService;
 use crate::settings::SettingsService;
 use crate::version::VersionCheckService;
 
+const SYSTEM_USER_ID: &str = "system_default_user";
+
 /// Shared state for system route handlers.
 #[derive(Clone)]
 pub struct SystemRouterState {
@@ -128,8 +130,10 @@ async fn get_feedback_diagnostics(
 
 async fn update_settings(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<UpdateSettingsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SystemSettingsResponse>>, ApiError> {
+    ensure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let settings = state
         .settings_service
@@ -150,6 +154,7 @@ struct ClientPrefQuery {
 
 async fn get_client_preferences(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Query(query): Query<ClientPrefQuery>,
 ) -> Result<Json<ApiResponse<ClientPreferencesResponse>>, ApiError> {
     let keys_filter: Option<Vec<String>> = query.keys.map(|k| {
@@ -163,7 +168,7 @@ async fn get_client_preferences(
 
     let prefs = state
         .client_pref_service
-        .get_preferences(key_refs.as_deref())
+        .get_preferences_for_user(&user.id, is_admin(&user), key_refs.as_deref())
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(prefs)))
@@ -171,15 +176,28 @@ async fn get_client_preferences(
 
 async fn update_client_preferences(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<UpdateClientPreferencesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     state
         .client_pref_service
-        .update_preferences(req)
+        .update_preferences_for_user(&user.id, is_admin(&user), req)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
+}
+
+fn is_admin(user: &CurrentUser) -> bool {
+    user.id == SYSTEM_USER_ID
+}
+
+fn ensure_admin(user: &CurrentUser) -> Result<(), ApiError> {
+    if is_admin(user) {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden("Administrator access required".into()))
+    }
 }
 
 // ===========================================================================
@@ -195,8 +213,10 @@ async fn list_providers(
 
 async fn create_provider(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateProviderRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ProviderResponse>>), ApiError> {
+    ensure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let provider = state.provider_service.create(req).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(provider))))
@@ -204,9 +224,11 @@ async fn create_provider(
 
 async fn update_provider(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<UpdateProviderRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderResponse>>, ApiError> {
+    ensure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let provider = state.provider_service.update(&id, req).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(provider)))
@@ -214,8 +236,10 @@ async fn update_provider(
 
 async fn delete_provider(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    ensure_admin(&user)?;
     state.provider_service.delete(&id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }

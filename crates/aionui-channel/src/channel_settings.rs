@@ -551,6 +551,14 @@ mod tests {
                 .collect())
         }
 
+        async fn get_all_for_user(&self, _user_id: &str) -> Result<Vec<ClientPreference>, DbError> {
+            self.get_all().await
+        }
+
+        async fn get_by_keys_for_user(&self, _user_id: &str, keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+            self.get_by_keys(keys).await
+        }
+
         async fn upsert_batch(&self, entries: &[(&str, &str)]) -> Result<(), DbError> {
             let mut data = self.data.lock().unwrap();
             for (key, value) in entries {
@@ -563,10 +571,18 @@ mod tests {
             Ok(())
         }
 
+        async fn upsert_batch_for_user(&self, _user_id: &str, entries: &[(&str, &str)]) -> Result<(), DbError> {
+            self.upsert_batch(entries).await
+        }
+
         async fn delete_keys(&self, keys: &[&str]) -> Result<(), DbError> {
             let mut data = self.data.lock().unwrap();
             data.retain(|(k, _)| !keys.contains(&k.as_str()));
             Ok(())
+        }
+
+        async fn delete_keys_for_user(&self, _user_id: &str, keys: &[&str]) -> Result<(), DbError> {
+            self.delete_keys(keys).await
         }
     }
 
@@ -666,6 +682,8 @@ mod tests {
             default_permission_value: None,
             default_thought_level_mode: "auto".to_owned(),
             default_thought_level_value: None,
+            default_workspace_mode: "auto".to_owned(),
+            default_workspace_value: None,
             default_skills_mode: "auto".to_owned(),
             default_skill_ids: "[]".to_owned(),
             custom_skill_names: "[]".to_owned(),

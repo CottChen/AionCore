@@ -179,6 +179,8 @@ async fn t1_3b_create_persists_assistant_snapshot_and_updates_preferences() {
             default_permission_value: None,
             default_thought_level_mode: "auto",
             default_thought_level_value: None,
+            default_workspace_mode: "auto",
+            default_workspace_value: None,
             default_skills_mode: "auto",
             default_skill_ids: r#"[]"#,
             custom_skill_names: &definition.custom_skill_names,

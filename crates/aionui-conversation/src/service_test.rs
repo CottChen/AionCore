@@ -1285,6 +1285,8 @@ async fn upsert_test_assistant_definition_with_thought_level(
         default_permission_value: None,
         default_thought_level_mode,
         default_thought_level_value: None,
+        default_workspace_mode: "auto",
+        default_workspace_value: None,
         default_skills_mode: "auto",
         default_skill_ids: "[]",
         custom_skill_names: "[]",
@@ -6498,6 +6500,8 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             default_permission_value: None,
             default_thought_level_mode: "auto",
             default_thought_level_value: None,
+            default_workspace_mode: "auto",
+            default_workspace_value: None,
             default_skills_mode: "auto",
             default_skill_ids: "[]",
             custom_skill_names: "[]",
@@ -6625,6 +6629,68 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
 }
 
 #[tokio::test]
+async fn create_uses_assistant_default_workspace_when_request_has_none() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let dispatcher = Arc::new(StaticAssistantDispatcher {
+        rules: std::collections::HashMap::new(),
+    });
+    let (svc, _broadcaster, _repo, definition_repo, _state_repo, _preference_repo) =
+        make_service_with_assistant_support(resolver, dispatcher).await;
+    let workspace = unique_test_workspace_path("assistant-default-workspace");
+    let workspace_str = workspace.to_string_lossy().to_string();
+
+    definition_repo
+        .upsert(&UpsertAssistantDefinitionParams {
+            id: "asstdef_workspace",
+            assistant_id: "workspace-assistant",
+            source: "builtin",
+            owner_type: "system",
+            source_ref: Some("workspace-assistant"),
+            source_version: None,
+            source_hash: None,
+            name: "Workspace Assistant",
+            name_i18n: "{}",
+            description: Some("desc"),
+            description_i18n: "{}",
+            avatar_type: "emoji",
+            avatar_value: Some("🤖"),
+            agent_id: "claude",
+            rule_resource_type: "builtin_asset",
+            rule_resource_ref: Some("workspace-assistant"),
+            rule_inline_content: None,
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
+            default_workspace_mode: "fixed",
+            default_workspace_value: Some(&workspace_str),
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        })
+        .await
+        .unwrap();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "name": "assistant workspace",
+        "assistant": { "id": "workspace-assistant" },
+        "extra": {},
+    }))
+    .unwrap();
+    let resp = svc.create("user-1", req).await.unwrap();
+
+    assert_eq!(resp.extra["workspace"], json!(workspace_str));
+}
+
+#[tokio::test]
 async fn existing_conversation_reads_current_assistant_identity() {
     let resolver = Arc::new(FixedSkillResolver { names: vec![] });
     let dispatcher = Arc::new(StaticAssistantDispatcher {
@@ -6661,6 +6727,8 @@ async fn existing_conversation_reads_current_assistant_identity() {
             default_permission_value: None,
             default_thought_level_mode: "auto",
             default_thought_level_value: None,
+            default_workspace_mode: "auto",
+            default_workspace_value: None,
             default_skills_mode: "auto",
             default_skill_ids: "[]",
             custom_skill_names: "[]",
@@ -6720,6 +6788,8 @@ async fn existing_conversation_reads_current_assistant_identity() {
             default_permission_value: None,
             default_thought_level_mode: "auto",
             default_thought_level_value: None,
+            default_workspace_mode: "auto",
+            default_workspace_value: None,
             default_skills_mode: "auto",
             default_skill_ids: "[]",
             custom_skill_names: "[]",
@@ -6794,6 +6864,8 @@ async fn create_routes_asset_avatar_in_assistant_identity_through_backend() {
             default_permission_value: None,
             default_thought_level_mode: "auto",
             default_thought_level_value: None,
+            default_workspace_mode: "auto",
+            default_workspace_value: None,
             default_skills_mode: "auto",
             default_skill_ids: "[]",
             custom_skill_names: "[]",
@@ -6955,6 +7027,8 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
             default_permission_value: None,
             default_thought_level_mode: "auto",
             default_thought_level_value: None,
+            default_workspace_mode: "auto",
+            default_workspace_value: None,
             default_skills_mode: "auto",
             default_skill_ids: "[]",
             custom_skill_names: "[]",
@@ -7119,6 +7193,8 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
             default_permission_value: None,
             default_thought_level_mode: "auto",
             default_thought_level_value: None,
+            default_workspace_mode: "auto",
+            default_workspace_value: None,
             default_skills_mode: "fixed",
             default_skill_ids: r#"["pdf"]"#,
             custom_skill_names: "[]",
@@ -7220,6 +7296,8 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
             default_permission_value: None,
             default_thought_level_mode: "auto",
             default_thought_level_value: None,
+            default_workspace_mode: "auto",
+            default_workspace_value: None,
             default_skills_mode: "fixed",
             default_skill_ids: r#"["pdf"]"#,
             custom_skill_names: "[]",

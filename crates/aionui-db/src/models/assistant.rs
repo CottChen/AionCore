@@ -65,6 +65,8 @@ pub struct AssistantDefinitionRow {
     pub default_permission_value: Option<String>,
     pub default_thought_level_mode: String,
     pub default_thought_level_value: Option<String>,
+    pub default_workspace_mode: String,
+    pub default_workspace_value: Option<String>,
     pub default_skills_mode: String,
     pub default_skill_ids: String,
     pub custom_skill_names: String,
@@ -82,6 +84,19 @@ pub struct AssistantOverlayRow {
     pub assistant_definition_id: String,
     pub enabled: bool,
     pub sort_order: i32,
+    pub agent_id_override: Option<String>,
+    pub last_used_at: Option<TimestampMs>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
+/// Row mapping for the `assistant_user_overlays` table.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AssistantUserOverlayRow {
+    pub user_id: String,
+    pub assistant_definition_id: String,
+    pub enabled: Option<bool>,
+    pub sort_order: Option<i32>,
     pub agent_id_override: Option<String>,
     pub last_used_at: Option<TimestampMs>,
     pub created_at: TimestampMs,
@@ -178,6 +193,8 @@ pub struct UpsertAssistantDefinitionParams<'a> {
     pub default_permission_value: Option<&'a str>,
     pub default_thought_level_mode: &'a str,
     pub default_thought_level_value: Option<&'a str>,
+    pub default_workspace_mode: &'a str,
+    pub default_workspace_value: Option<&'a str>,
     pub default_skills_mode: &'a str,
     pub default_skill_ids: &'a str,
     pub custom_skill_names: &'a str,
@@ -192,6 +209,17 @@ pub struct UpsertAssistantOverlayParams<'a> {
     pub assistant_definition_id: &'a str,
     pub enabled: bool,
     pub sort_order: i32,
+    pub agent_id_override: Option<&'a str>,
+    pub last_used_at: Option<TimestampMs>,
+}
+
+/// Insert-or-update parameters for `assistant_user_overlays`.
+#[derive(Debug, Clone)]
+pub struct UpsertAssistantUserOverlayParams<'a> {
+    pub user_id: &'a str,
+    pub assistant_definition_id: &'a str,
+    pub enabled: Option<bool>,
+    pub sort_order: Option<i32>,
     pub agent_id_override: Option<&'a str>,
     pub last_used_at: Option<TimestampMs>,
 }

@@ -21,9 +21,10 @@ use aionui_assistant::{AssistantAgentCatalogPort, AssistantRouterState, Assistan
 use aionui_common::AgentType;
 use aionui_db::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
-    IAssistantPreferenceRepository, IAssistantRepository, IProviderRepository, SqliteAssistantDefinitionRepository,
-    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
-    SqliteAssistantRepository, SqliteProviderRepository, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    IAssistantPreferenceRepository, IAssistantRepository, IAssistantUserOverlayRepository, IProviderRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
+    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteAssistantUserOverlayRepository,
+    SqliteProviderRepository, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, init_database_memory,
 };
 use aionui_extension::{
@@ -278,6 +279,8 @@ async fn fixture() -> Fixture {
         Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone()));
     let state_repo: Arc<dyn IAssistantOverlayRepository> =
         Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()));
+    let user_state_repo: Arc<dyn IAssistantUserOverlayRepository> =
+        Arc::new(SqliteAssistantUserOverlayRepository::new(pool.clone()));
     let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
         Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone()));
     let repo: Arc<dyn IAssistantRepository> = Arc::new(SqliteAssistantRepository::new(pool.clone()));
@@ -312,6 +315,7 @@ async fn fixture() -> Fixture {
         aionui_assistant::service::AssistantServiceDeps {
             definition_repo,
             state_repo,
+            user_state_repo,
             preference_repo,
             repo,
             override_repo,
@@ -523,6 +527,8 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
             default_permission_value: None,
             default_thought_level_mode: "auto",
             default_thought_level_value: None,
+            default_workspace_mode: "auto",
+            default_workspace_value: None,
             default_skills_mode: "fixed",
             default_skill_ids: r#"["preset-pdf"]"#,
             custom_skill_names: &definition.custom_skill_names,
@@ -1021,10 +1027,9 @@ async fn delete_extension_registry_id_without_user_row_returns_404() {
 
 #[tokio::test]
 async fn set_state_inserts_override_for_builtin() {
-    // Builtin sort_order is manifest-owned (users can't reorder official
-    // assistants), so a set_state sort_order is ignored for builtins and the
-    // response keeps the manifest value (0 for this fixture). Only `enabled`
-    // is honoured.
+    // Builtin definitions remain manifest-owned, but state changes are
+    // user-scoped overlays. Users can hide and reorder their own builtin
+    // assistant list without changing global defaults.
     let fx = fixture().await;
     let req = json_with_token(
         "PATCH",
@@ -1037,7 +1042,7 @@ async fn set_state_inserts_override_for_builtin() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["data"]["enabled"], false);
-    assert_eq!(json["data"]["sort_order"], 0);
+    assert_eq!(json["data"]["sort_order"], 9);
     assert_eq!(json["data"]["source"], "builtin");
 }
 

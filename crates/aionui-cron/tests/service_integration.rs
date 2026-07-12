@@ -999,6 +999,8 @@ async fn seed_assistant_definition(
         default_permission_value: None,
         default_thought_level_mode: "auto",
         default_thought_level_value: None,
+        default_workspace_mode: "auto",
+        default_workspace_value: None,
         default_skills_mode: "auto",
         default_skill_ids: "[]",
         custom_skill_names: "[]",

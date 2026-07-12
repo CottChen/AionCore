@@ -13,6 +13,7 @@ use http_body_util::BodyExt;
 use serde_json::json;
 use tower::ServiceExt;
 
+use aionui_auth::CurrentUser;
 use aionui_db::{
     SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
     SqliteSettingsRepository, init_database_memory,
@@ -60,21 +61,32 @@ fn get_request(uri: &str) -> Request<Body> {
     Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
 }
 
+fn admin_user() -> CurrentUser {
+    CurrentUser {
+        id: "system_default_user".to_string(),
+        username: "admin".to_string(),
+    }
+}
+
 fn json_request(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
-    Request::builder()
+    let mut req = Request::builder()
         .method(method)
         .uri(uri)
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap()
+        .unwrap();
+    req.extensions_mut().insert(admin_user());
+    req
 }
 
 fn delete_request(uri: &str) -> Request<Body> {
-    Request::builder()
+    let mut req = Request::builder()
         .method("DELETE")
         .uri(uri)
         .body(Body::empty())
-        .unwrap()
+        .unwrap();
+    req.extensions_mut().insert(admin_user());
+    req
 }
 
 fn sample_create_body() -> serde_json::Value {

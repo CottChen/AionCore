@@ -16,10 +16,11 @@ use aionui_api_types::{
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
-    AssistantDefinitionRow, AssistantOverlayRow, AssistantRow, CreateAssistantParams, IAssistantDefinitionRepository,
-    IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
-    IProviderRepository, SqlitePool, UpdateAssistantParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, resolve_agent_binding,
+    AssistantDefinitionRow, AssistantOverlayRow, AssistantRow, AssistantUserOverlayRow, CreateAssistantParams,
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
+    IAssistantPreferenceRepository, IAssistantRepository, IAssistantUserOverlayRepository, IProviderRepository,
+    SqlitePool, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    UpsertAssistantPreferenceParams, UpsertAssistantUserOverlayParams, resolve_agent_binding,
 };
 use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionError};
 use serde_json;
@@ -36,6 +37,7 @@ pub struct AssistantService {
     pool: SqlitePool,
     definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     state_repo: Arc<dyn IAssistantOverlayRepository>,
+    user_state_repo: Arc<dyn IAssistantUserOverlayRepository>,
     preference_repo: Arc<dyn IAssistantPreferenceRepository>,
     repo: Arc<dyn IAssistantRepository>,
     override_repo: Arc<dyn IAssistantOverrideRepository>,
@@ -54,6 +56,7 @@ pub struct AssistantService {
 pub struct AssistantServiceDeps {
     pub definition_repo: Arc<dyn IAssistantDefinitionRepository>,
     pub state_repo: Arc<dyn IAssistantOverlayRepository>,
+    pub user_state_repo: Arc<dyn IAssistantUserOverlayRepository>,
     pub preference_repo: Arc<dyn IAssistantPreferenceRepository>,
     pub repo: Arc<dyn IAssistantRepository>,
     pub override_repo: Arc<dyn IAssistantOverrideRepository>,
@@ -82,6 +85,7 @@ impl AssistantService {
         let AssistantServiceDeps {
             definition_repo,
             state_repo,
+            user_state_repo,
             preference_repo,
             repo,
             override_repo,
@@ -93,6 +97,7 @@ impl AssistantService {
             pool,
             definition_repo,
             state_repo,
+            user_state_repo,
             preference_repo,
             repo,
             override_repo,
@@ -169,6 +174,15 @@ impl AssistantService {
                 .as_ref()
                 .filter(|definition| definition.source == "builtin")
                 .and_then(|definition| definition.default_thought_level_value.as_deref());
+            let default_workspace_mode = existing_definition
+                .as_ref()
+                .filter(|definition| definition.source == "builtin")
+                .map(|definition| definition.default_workspace_mode.as_str())
+                .unwrap_or("auto");
+            let default_workspace_value = existing_definition
+                .as_ref()
+                .filter(|definition| definition.source == "builtin")
+                .and_then(|definition| definition.default_workspace_value.as_deref());
 
             self.definition_repo
                 .upsert(&UpsertAssistantDefinitionParams {
@@ -201,6 +215,8 @@ impl AssistantService {
                     default_permission_value,
                     default_thought_level_mode,
                     default_thought_level_value,
+                    default_workspace_mode,
+                    default_workspace_value,
                     default_skills_mode: "fixed",
                     default_skill_ids: &default_skill_ids,
                     custom_skill_names: &custom_skill_names,
@@ -453,6 +469,8 @@ impl AssistantService {
                         default_permission_value: None,
                         default_thought_level_mode: "auto".into(),
                         default_thought_level_value: None,
+                        default_workspace_mode: "auto".into(),
+                        default_workspace_value: None,
                         default_skills_mode: "fixed".into(),
                         default_skill_ids: "[]".into(),
                         custom_skill_names: "[]".into(),
@@ -564,6 +582,8 @@ impl AssistantService {
                 default_permission_value: None,
                 default_thought_level_mode: "auto",
                 default_thought_level_value: None,
+                default_workspace_mode: "auto",
+                default_workspace_value: None,
                 default_skills_mode: "fixed",
                 default_skill_ids: &default_skill_ids,
                 custom_skill_names: &custom_skill_names,
@@ -634,6 +654,14 @@ impl AssistantService {
     /// application. Also performs opportunistic orphan cleanup on the
     /// overrides table.
     pub async fn list(&self) -> Result<Vec<AssistantResponse>, AssistantError> {
+        self.list_with_user_overlay(None).await
+    }
+
+    pub async fn list_for_user(&self, user_id: &str) -> Result<Vec<AssistantResponse>, AssistantError> {
+        self.list_with_user_overlay(Some(user_id)).await
+    }
+
+    async fn list_with_user_overlay(&self, user_id: Option<&str>) -> Result<Vec<AssistantResponse>, AssistantError> {
         let projections = self.reconcile_generated_assistants().await?;
         let definitions = self
             .definition_repo
@@ -649,6 +677,17 @@ impl AssistantService {
             .into_iter()
             .map(|state| (state.assistant_definition_id.clone(), state))
             .collect();
+        let user_state_map: HashMap<String, AssistantUserOverlayRow> = match user_id {
+            Some(user_id) => self
+                .user_state_repo
+                .list_by_user(user_id)
+                .await
+                .map_err(|e| AssistantError::Internal(format!("list user assistant overlays: {e}")))?
+                .into_iter()
+                .map(|state| (state.assistant_definition_id.clone(), state))
+                .collect(),
+            None => HashMap::new(),
+        };
 
         let mut result = Vec::new();
 
@@ -656,10 +695,15 @@ impl AssistantService {
             if generated_definition_is_uninstalled(definition, &projections) {
                 continue;
             }
+            let effective_state = self.effective_state(
+                definition,
+                state_map.get(&definition.id),
+                user_state_map.get(&definition.id),
+            );
             let projection = self
-                .project_definition(definition, state_map.get(&definition.id), &projections)
+                .project_definition(definition, effective_state.as_ref(), &projections)
                 .await?;
-            result.push(self.definition_to_response(definition, state_map.get(&definition.id), &projection)?);
+            result.push(self.definition_to_response(definition, effective_state.as_ref(), &projection)?);
         }
 
         // Sort by sort_order asc, then last_used_at desc (newer first).
@@ -680,36 +724,76 @@ impl AssistantService {
     }
 
     pub async fn get(&self, id: &str) -> Result<AssistantResponse, AssistantError> {
+        self.get_with_user_overlay(id, None).await
+    }
+
+    pub async fn get_for_user(&self, id: &str, user_id: &str) -> Result<AssistantResponse, AssistantError> {
+        self.get_with_user_overlay(id, Some(user_id)).await
+    }
+
+    async fn get_with_user_overlay(
+        &self,
+        id: &str,
+        user_id: Option<&str>,
+    ) -> Result<AssistantResponse, AssistantError> {
         let projections = self.reconcile_generated_assistants().await?;
         if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
             if generated_definition_is_uninstalled(&definition, &projections) {
                 return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
             }
             let state = self.state_repo.get(&definition.id).await?;
+            let user_state = match user_id {
+                Some(user_id) => self.user_state_repo.get(user_id, &definition.id).await?,
+                None => None,
+            };
+            let effective_state = self.effective_state(&definition, state.as_ref(), user_state.as_ref());
             let projection = self
-                .project_definition(&definition, state.as_ref(), &projections)
+                .project_definition(&definition, effective_state.as_ref(), &projections)
                 .await?;
-            return self.definition_to_response(&definition, state.as_ref(), &projection);
+            return self.definition_to_response(&definition, effective_state.as_ref(), &projection);
         }
 
         Err(AssistantError::NotFound(format!("assistant '{id}' not found")))
     }
 
     pub async fn get_detail(&self, id: &str, locale: Option<&str>) -> Result<AssistantDetailResponse, AssistantError> {
+        self.get_detail_with_user_overlay(id, locale, None).await
+    }
+
+    pub async fn get_detail_for_user(
+        &self,
+        id: &str,
+        locale: Option<&str>,
+        user_id: &str,
+    ) -> Result<AssistantDetailResponse, AssistantError> {
+        self.get_detail_with_user_overlay(id, locale, Some(user_id)).await
+    }
+
+    async fn get_detail_with_user_overlay(
+        &self,
+        id: &str,
+        locale: Option<&str>,
+        user_id: Option<&str>,
+    ) -> Result<AssistantDetailResponse, AssistantError> {
         let projections = self.reconcile_generated_assistants().await?;
         if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
             if generated_definition_is_uninstalled(&definition, &projections) {
                 return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
             }
             let state = self.state_repo.get(&definition.id).await?;
+            let user_state = match user_id {
+                Some(user_id) => self.user_state_repo.get(user_id, &definition.id).await?,
+                None => None,
+            };
+            let effective_state = self.effective_state(&definition, state.as_ref(), user_state.as_ref());
             let preference = self.preference_repo.get(&definition.id).await?;
             let rules_content = self.read_rule(id, locale).await?;
             let projection = self
-                .project_definition(&definition, state.as_ref(), &projections)
+                .project_definition(&definition, effective_state.as_ref(), &projections)
                 .await?;
             return self.definition_to_detail_response(
                 &definition,
-                state.as_ref(),
+                effective_state.as_ref(),
                 preference.as_ref(),
                 &rules_content,
                 &projection,
@@ -1309,6 +1393,55 @@ impl AssistantService {
             .map_err(|e| AssistantError::Internal(format!("upsert assistant overlay: {e}")))?;
 
         self.get(id).await
+    }
+
+    pub async fn set_state_for_user(
+        &self,
+        id: &str,
+        user_id: &str,
+        req: SetAssistantStateRequest,
+    ) -> Result<AssistantResponse, AssistantError> {
+        match self.classify_source(id).await {
+            AssistantSource::Builtin | AssistantSource::Generated => {}
+            AssistantSource::User => {
+                if self.repo.get(id).await?.is_none() {
+                    return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
+                }
+            }
+        }
+
+        let definition = self
+            .definition_repo
+            .get_by_assistant_id(id)
+            .await?
+            .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
+        let existing_user_state = self.user_state_repo.get(user_id, &definition.id).await?;
+        let enabled = req
+            .enabled
+            .or_else(|| existing_user_state.as_ref().and_then(|state| state.enabled));
+        let sort_order = req
+            .sort_order
+            .or_else(|| existing_user_state.as_ref().and_then(|state| state.sort_order));
+        let last_used_at = req
+            .last_used_at
+            .or_else(|| existing_user_state.as_ref().and_then(|state| state.last_used_at));
+        let agent_id_override = existing_user_state
+            .as_ref()
+            .and_then(|state| state.agent_id_override.clone());
+
+        self.user_state_repo
+            .upsert(&UpsertAssistantUserOverlayParams {
+                user_id,
+                assistant_definition_id: &definition.id,
+                enabled,
+                sort_order,
+                agent_id_override: agent_id_override.as_deref(),
+                last_used_at,
+            })
+            .await
+            .map_err(|e| AssistantError::Internal(format!("upsert user assistant overlay: {e}")))?;
+
+        self.get_for_user(id, user_id).await
     }
 
     // -----------------------------------------------------------------------
@@ -2004,6 +2137,44 @@ impl AssistantService {
             .map(|builtin| (builtin.sort_order, builtin.default_enabled))
     }
 
+    fn effective_state(
+        &self,
+        definition: &AssistantDefinitionRow,
+        global_state: Option<&AssistantOverlayRow>,
+        user_state: Option<&AssistantUserOverlayRow>,
+    ) -> Option<AssistantOverlayRow> {
+        if global_state.is_none() && user_state.is_none() {
+            return None;
+        }
+
+        let builtin_default = self.builtin_listing_default(definition);
+        Some(AssistantOverlayRow {
+            assistant_definition_id: definition.id.clone(),
+            enabled: user_state
+                .and_then(|row| row.enabled)
+                .or_else(|| global_state.map(|row| row.enabled))
+                .unwrap_or_else(|| builtin_default.map(|(_, enabled)| enabled).unwrap_or(true)),
+            sort_order: user_state
+                .and_then(|row| row.sort_order)
+                .or_else(|| global_state.map(|row| row.sort_order))
+                .unwrap_or_else(|| builtin_default.map(|(sort_order, _)| sort_order).unwrap_or_default()),
+            agent_id_override: user_state
+                .and_then(|row| row.agent_id_override.clone())
+                .or_else(|| global_state.and_then(|row| row.agent_id_override.clone())),
+            last_used_at: user_state
+                .and_then(|row| row.last_used_at)
+                .or_else(|| global_state.and_then(|row| row.last_used_at)),
+            created_at: user_state
+                .map(|row| row.created_at)
+                .or_else(|| global_state.map(|row| row.created_at))
+                .unwrap_or_default(),
+            updated_at: user_state
+                .map(|row| row.updated_at)
+                .or_else(|| global_state.map(|row| row.updated_at))
+                .unwrap_or_default(),
+        })
+    }
+
     fn definition_to_response(
         &self,
         definition: &AssistantDefinitionRow,
@@ -2032,16 +2203,16 @@ impl AssistantService {
             description: definition.description.clone(),
             description_i18n: decode_str_map(Some(definition.description_i18n.as_str()))?,
             avatar: self.avatar_display_value(definition),
-            // For builtins: enabled = overlay if the user has one, else the
-            // manifest default (butler on, others off). sort_order = always the
-            // manifest value (users can't reorder official assistants).
+            // For builtins: manifest defaults are used only when neither a
+            // global nor user overlay exists.
             enabled: match state {
                 Some(row) => row.enabled,
                 None => builtin_default.map(|(_, en)| en).unwrap_or(true),
             },
-            sort_order: builtin_default
-                .map(|(so, _)| so)
-                .unwrap_or_else(|| state.map(|row| row.sort_order).unwrap_or(0)),
+            sort_order: state
+                .map(|row| row.sort_order)
+                .or_else(|| builtin_default.map(|(so, _)| so))
+                .unwrap_or(0),
             agent_id: projection.agent_id.clone(),
             agent: projection.agent.clone(),
             enabled_skills: decode_str_list(Some(definition.default_skill_ids.as_str()))?,
@@ -2112,9 +2283,10 @@ impl AssistantService {
                     Some(row) => row.enabled,
                     None => builtin_default.map(|(_, en)| en).unwrap_or(true),
                 },
-                sort_order: builtin_default
-                    .map(|(so, _)| so)
-                    .unwrap_or_else(|| state.map(|row| row.sort_order).unwrap_or_default()),
+                sort_order: state
+                    .map(|row| row.sort_order)
+                    .or_else(|| builtin_default.map(|(so, _)| so))
+                    .unwrap_or_default(),
                 last_used_at: state.and_then(|row| row.last_used_at),
             },
             engine: AssistantEngineResponse {
@@ -2145,6 +2317,10 @@ impl AssistantService {
                 thought_level: AssistantDefaultScalarResponse {
                     mode: definition.default_thought_level_mode.clone(),
                     value: definition.default_thought_level_value.clone(),
+                },
+                workspace: AssistantDefaultScalarResponse {
+                    mode: definition.default_workspace_mode.clone(),
+                    value: definition.default_workspace_value.clone(),
                 },
                 skills: AssistantDefaultListResponse {
                     mode: definition.default_skills_mode.clone(),
@@ -2434,6 +2610,8 @@ struct SerializedDetailOverrides {
     default_permission_value: Option<Option<String>>,
     default_thought_level_mode: Option<String>,
     default_thought_level_value: Option<Option<String>>,
+    default_workspace_mode: Option<String>,
+    default_workspace_value: Option<Option<String>>,
     default_skills_mode: Option<String>,
     default_skill_ids: Option<String>,
     default_mcps_mode: Option<String>,
@@ -2486,6 +2664,11 @@ impl SerializedDetailOverrides {
                 result.default_thought_level_mode = Some(mode);
                 result.default_thought_level_value = Some(value);
             }
+            if let Some(workspace) = defaults.workspace.as_ref() {
+                let (mode, value) = validate_scalar_default(workspace, "defaults.workspace")?;
+                result.default_workspace_mode = Some(mode);
+                result.default_workspace_value = Some(value);
+            }
             if let Some(skills) = defaults.skills.as_ref() {
                 let (mode, value) = validate_list_default(skills, "defaults.skills")?;
                 result.default_skills_mode = Some(mode);
@@ -2510,6 +2693,8 @@ impl SerializedDetailOverrides {
             || self.default_permission_value.is_some()
             || self.default_thought_level_mode.is_some()
             || self.default_thought_level_value.is_some()
+            || self.default_workspace_mode.is_some()
+            || self.default_workspace_value.is_some()
             || self.default_skills_mode.is_some()
             || self.default_skill_ids.is_some()
             || self.default_mcps_mode.is_some()
@@ -2554,6 +2739,12 @@ fn apply_detail_patch_to_definition(
     if let Some(value) = overrides.default_thought_level_value.as_ref() {
         definition.default_thought_level_value = value.clone();
     }
+    if let Some(value) = overrides.default_workspace_mode.as_deref() {
+        definition.default_workspace_mode = value.to_string();
+    }
+    if let Some(value) = overrides.default_workspace_value.as_ref() {
+        definition.default_workspace_value = value.clone();
+    }
     if let Some(value) = overrides.default_skills_mode.as_deref() {
         definition.default_skills_mode = value.to_string();
     }
@@ -2595,6 +2786,8 @@ fn upsert_params_from_definition(definition: &AssistantDefinitionRow) -> UpsertA
         default_permission_value: definition.default_permission_value.as_deref(),
         default_thought_level_mode: &definition.default_thought_level_mode,
         default_thought_level_value: definition.default_thought_level_value.as_deref(),
+        default_workspace_mode: &definition.default_workspace_mode,
+        default_workspace_value: definition.default_workspace_value.as_deref(),
         default_skills_mode: &definition.default_skills_mode,
         default_skill_ids: &definition.default_skill_ids,
         custom_skill_names: &definition.custom_skill_names,
@@ -2805,9 +2998,9 @@ pub fn generate_user_id() -> String {
 mod tests {
     use super::*;
     use aionui_db::{
-        CreateProviderParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+        CreateProviderParams, IUserRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
         SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-        SqliteProviderRepository, init_database_memory,
+        SqliteAssistantUserOverlayRepository, SqliteProviderRepository, SqliteUserRepository, init_database_memory,
     };
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -2872,6 +3065,8 @@ mod tests {
             Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
         let state_repo: Arc<dyn IAssistantOverlayRepository> =
             Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
+        let user_state_repo: Arc<dyn IAssistantUserOverlayRepository> =
+            Arc::new(SqliteAssistantUserOverlayRepository::new(db.pool().clone()));
         let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
             Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone()));
         let repo: Arc<dyn IAssistantRepository> = Arc::new(SqliteAssistantRepository::new(db.pool().clone()));
@@ -2928,6 +3123,7 @@ mod tests {
             AssistantServiceDeps {
                 definition_repo: definition_repo.clone(),
                 state_repo: state_repo.clone(),
+                user_state_repo,
                 preference_repo: preference_repo.clone(),
                 repo: repo.clone(),
                 override_repo: orepo,
@@ -3091,6 +3287,8 @@ mod tests {
                 default_permission_value: None,
                 default_thought_level_mode: "auto",
                 default_thought_level_value: None,
+                default_workspace_mode: "auto",
+                default_workspace_value: None,
                 default_skills_mode: "fixed",
                 default_skill_ids: "[]",
                 custom_skill_names: "[]",
@@ -3149,6 +3347,8 @@ mod tests {
                 default_permission_value: None,
                 default_thought_level_mode: "auto",
                 default_thought_level_value: None,
+                default_workspace_mode: "auto",
+                default_workspace_value: None,
                 default_skills_mode: "fixed",
                 default_skill_ids: "[]",
                 custom_skill_names: "[]",
@@ -3248,6 +3448,8 @@ mod tests {
                 default_permission_value: None,
                 default_thought_level_mode: "auto",
                 default_thought_level_value: None,
+                default_workspace_mode: "auto",
+                default_workspace_value: None,
                 default_skills_mode: "auto",
                 default_skill_ids: "[]",
                 custom_skill_names: "[]",
@@ -4615,6 +4817,7 @@ mod tests {
                             value: Some("strict".into()),
                         }),
                         thought_level: None,
+                        workspace: None,
                         skills: Some(AssistantDefaultListRequest {
                             mode: "fixed".into(),
                             value: vec!["skill-a".into()],
@@ -4919,6 +5122,10 @@ mod tests {
                         value: Some("default".into()),
                     }),
                     thought_level: None,
+                    workspace: Some(AssistantDefaultScalarRequest {
+                        mode: "fixed".into(),
+                        value: Some("/tmp/aionui-project".into()),
+                    }),
                     skills: Some(AssistantDefaultListRequest {
                         mode: "fixed".into(),
                         value: vec!["skill-a".into(), "skill-b".into()],
@@ -4939,6 +5146,8 @@ mod tests {
         assert_eq!(detail.defaults.model.value.as_deref(), Some("openai/gpt-5"));
         assert_eq!(detail.defaults.permission.mode, "fixed");
         assert_eq!(detail.defaults.permission.value.as_deref(), Some("default"));
+        assert_eq!(detail.defaults.workspace.mode, "fixed");
+        assert_eq!(detail.defaults.workspace.value.as_deref(), Some("/tmp/aionui-project"));
         assert_eq!(detail.defaults.skills.mode, "fixed");
         assert_eq!(detail.defaults.skills.value, vec!["skill-a", "skill-b"]);
         assert_eq!(detail.defaults.mcps.mode, "fixed");
@@ -4972,6 +5181,7 @@ mod tests {
                             value: Some("strict".into()),
                         }),
                         thought_level: None,
+                        workspace: None,
                         skills: Some(AssistantDefaultListRequest {
                             mode: "fixed".into(),
                             value: vec!["skill-z".into()],
@@ -5000,6 +5210,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_state_overlay_changes_order_only_for_that_user() {
+        let mut first = mk_builtin("builtin-first", "First");
+        first.sort_order = 10;
+        let mut second = mk_builtin("builtin-second", "Second");
+        second.sort_order = 20;
+        let fx = fixture_with_builtins(vec![first, second]).await;
+
+        let user_repo = SqliteUserRepository::new(fx._db.pool().clone());
+        let user_a = user_repo.create_user("user-a", "hash").await.unwrap();
+        let user_b = user_repo.create_user("user-b", "hash").await.unwrap();
+
+        fx.service
+            .set_state_for_user(
+                "builtin-second",
+                &user_a.id,
+                SetAssistantStateRequest {
+                    sort_order: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let user_a_list = fx.service.list_for_user(&user_a.id).await.unwrap();
+        let user_b_list = fx.service.list_for_user(&user_b.id).await.unwrap();
+
+        assert_eq!(
+            user_a_list.first().map(|assistant| assistant.id.as_str()),
+            Some("builtin-second")
+        );
+        assert_eq!(
+            user_b_list.first().map(|assistant| assistant.id.as_str()),
+            Some("builtin-first")
+        );
+    }
+
+    #[tokio::test]
     async fn update_switching_defaults_to_fixed_seeds_preferences() {
         let fx = fixture().await;
         fx.service
@@ -5025,6 +5272,7 @@ mod tests {
                             value: Some("strict".into()),
                         }),
                         thought_level: None,
+                        workspace: None,
                         skills: Some(AssistantDefaultListRequest {
                             mode: "fixed".into(),
                             value: vec!["skill-z".into()],
@@ -5065,6 +5313,7 @@ mod tests {
                         value: Some("strict".into()),
                     }),
                     thought_level: None,
+                    workspace: None,
                     skills: Some(AssistantDefaultListRequest {
                         mode: "fixed".into(),
                         value: vec!["skill-z".into()],
@@ -5093,6 +5342,7 @@ mod tests {
                             value: None,
                         }),
                         thought_level: None,
+                        workspace: None,
                         skills: Some(AssistantDefaultListRequest {
                             mode: "auto".into(),
                             value: vec![],
@@ -5147,10 +5397,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_state_builtin_writes_enabled_but_sort_order_stays_manifest() {
-        // Builtin sort_order is manifest-owned (users can't reorder official
-        // assistants), so set_state's sort_order must NOT affect the response —
-        // it stays the manifest value. Only enabled is honoured.
+    async fn set_state_builtin_writes_user_overlay_for_enabled_and_sort_order() {
+        // Builtin definitions stay manifest-owned, while per-user state such as
+        // visibility and ordering is stored as an overlay.
         let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
         let resp = fx
             .service
@@ -5165,8 +5414,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!resp.enabled);
-        // mk_builtin ships sort_order = 0; the overlay's 7 is ignored for builtins.
-        assert_eq!(resp.sort_order, 0);
+        assert_eq!(resp.sort_order, 7);
         assert_eq!(resp.source, AssistantSource::Builtin);
     }
 
@@ -5453,6 +5701,8 @@ mod tests {
             Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
         let state_repo: Arc<dyn IAssistantOverlayRepository> =
             Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
+        let user_state_repo: Arc<dyn IAssistantUserOverlayRepository> =
+            Arc::new(SqliteAssistantUserOverlayRepository::new(db.pool().clone()));
         let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
             Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone()));
         let repo: Arc<dyn IAssistantRepository> = Arc::new(SqliteAssistantRepository::new(db.pool().clone()));
@@ -5464,6 +5714,7 @@ mod tests {
             AssistantServiceDeps {
                 definition_repo,
                 state_repo,
+                user_state_repo,
                 preference_repo,
                 repo,
                 override_repo: orepo,

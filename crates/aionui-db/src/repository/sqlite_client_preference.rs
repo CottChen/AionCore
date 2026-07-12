@@ -47,6 +47,38 @@ impl IClientPreferenceRepository for SqliteClientPreferenceRepository {
         Ok(rows)
     }
 
+    async fn get_all_for_user(&self, user_id: &str) -> Result<Vec<ClientPreference>, DbError> {
+        let rows = sqlx::query_as::<_, ClientPreference>(
+            "SELECT key, value, updated_at FROM user_client_preferences WHERE user_id = ? ORDER BY key",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    async fn get_by_keys_for_user(&self, user_id: &str, keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let placeholders: Vec<&str> = keys.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT key, value, updated_at FROM user_client_preferences \
+             WHERE user_id = ? AND key IN ({}) ORDER BY key",
+            placeholders.join(", ")
+        );
+
+        let mut query = sqlx::query_as::<_, ClientPreference>(&sql).bind(user_id);
+        for key in keys {
+            query = query.bind(*key);
+        }
+
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(rows)
+    }
+
     async fn upsert_batch(&self, entries: &[(&str, &str)]) -> Result<(), DbError> {
         if entries.is_empty() {
             return Ok(());
@@ -76,6 +108,34 @@ impl IClientPreferenceRepository for SqliteClientPreferenceRepository {
         Ok(())
     }
 
+    async fn upsert_batch_for_user(&self, user_id: &str, entries: &[(&str, &str)]) -> Result<(), DbError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let now = aionui_common::now_ms();
+        let mut tx = self.pool.begin().await?;
+
+        for (key, value) in entries {
+            sqlx::query(
+                "INSERT INTO user_client_preferences (user_id, key, value, updated_at) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(user_id, key) DO UPDATE SET \
+                    value = excluded.value, \
+                    updated_at = excluded.updated_at",
+            )
+            .bind(user_id)
+            .bind(*key)
+            .bind(*value)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn delete_keys(&self, keys: &[&str]) -> Result<(), DbError> {
         if keys.is_empty() {
             return Ok(());
@@ -88,6 +148,26 @@ impl IClientPreferenceRepository for SqliteClientPreferenceRepository {
         );
 
         let mut query = sqlx::query(&sql);
+        for key in keys {
+            query = query.bind(*key);
+        }
+
+        query.execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn delete_keys_for_user(&self, user_id: &str, keys: &[&str]) -> Result<(), DbError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let placeholders: Vec<&str> = keys.iter().map(|_| "?").collect();
+        let sql = format!(
+            "DELETE FROM user_client_preferences WHERE user_id = ? AND key IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut query = sqlx::query(&sql).bind(user_id);
         for key in keys {
             query = query.bind(*key);
         }

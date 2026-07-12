@@ -36,7 +36,7 @@ pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSe
 pub use agent_metadata::IAgentMetadataRepository;
 pub use assistant::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
-    IAssistantPreferenceRepository, IAssistantRepository,
+    IAssistantPreferenceRepository, IAssistantRepository, IAssistantUserOverlayRepository,
 };
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;
@@ -56,7 +56,7 @@ pub use sqlite_acp_session::SqliteAcpSessionRepository;
 pub use sqlite_agent_metadata::SqliteAgentMetadataRepository;
 pub use sqlite_assistant::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
-    SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
+    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteAssistantUserOverlayRepository,
 };
 pub use sqlite_channel::SqliteChannelRepository;
 pub use sqlite_client_preference::SqliteClientPreferenceRepository;

@@ -6,12 +6,13 @@ use sqlx::SqlitePool;
 use crate::error::DbError;
 use crate::models::{
     AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow,
-    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertAssistantPreferenceParams, UpsertOverrideParams,
+    AssistantUserOverlayRow, CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertAssistantUserOverlayParams,
+    UpsertOverrideParams,
 };
 use crate::repository::assistant::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
-    IAssistantPreferenceRepository, IAssistantRepository,
+    IAssistantPreferenceRepository, IAssistantRepository, IAssistantUserOverlayRepository,
 };
 
 /// SQLite-backed implementation of [`IAssistantRepository`].
@@ -248,6 +249,18 @@ impl SqliteAssistantOverlayRepository {
     }
 }
 
+/// SQLite-backed implementation of [`IAssistantUserOverlayRepository`].
+#[derive(Clone, Debug)]
+pub struct SqliteAssistantUserOverlayRepository {
+    pool: SqlitePool,
+}
+
+impl SqliteAssistantUserOverlayRepository {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
 /// SQLite-backed implementation of [`IAssistantPreferenceRepository`].
 #[derive(Clone, Debug)]
 pub struct SqliteAssistantPreferenceRepository {
@@ -434,10 +447,11 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
                 default_model_mode, default_model_value,
                 default_permission_mode, default_permission_value,
                 default_thought_level_mode, default_thought_level_value,
+                default_workspace_mode, default_workspace_value,
                 default_skills_mode, default_skill_ids, custom_skill_names, default_disabled_builtin_skill_ids,
                 default_mcps_mode, default_mcp_ids,
                 created_at, updated_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             ON CONFLICT(id) DO UPDATE SET
                 assistant_id = excluded.assistant_id,
                 source = excluded.source,
@@ -463,6 +477,8 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
                 default_permission_value = excluded.default_permission_value,
                 default_thought_level_mode = excluded.default_thought_level_mode,
                 default_thought_level_value = excluded.default_thought_level_value,
+                default_workspace_mode = excluded.default_workspace_mode,
+                default_workspace_value = excluded.default_workspace_value,
                 default_skills_mode = excluded.default_skills_mode,
                 default_skill_ids = excluded.default_skill_ids,
                 custom_skill_names = excluded.custom_skill_names,
@@ -497,6 +513,8 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
         .bind(params.default_permission_value)
         .bind(params.default_thought_level_mode)
         .bind(params.default_thought_level_value)
+        .bind(params.default_workspace_mode)
+        .bind(params.default_workspace_value)
         .bind(params.default_skills_mode)
         .bind(params.default_skill_ids)
         .bind(params.custom_skill_names)
@@ -609,6 +627,78 @@ impl IAssistantOverlayRepository for SqliteAssistantOverlayRepository {
             .bind(assistant_definition_id)
             .execute(&self.pool)
             .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+#[async_trait::async_trait]
+impl IAssistantUserOverlayRepository for SqliteAssistantUserOverlayRepository {
+    async fn get(
+        &self,
+        user_id: &str,
+        assistant_definition_id: &str,
+    ) -> Result<Option<AssistantUserOverlayRow>, DbError> {
+        let row = sqlx::query_as::<_, AssistantUserOverlayRow>(
+            "SELECT * FROM assistant_user_overlays WHERE user_id = ? AND assistant_definition_id = ?",
+        )
+        .bind(user_id)
+        .bind(assistant_definition_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn list_by_user(&self, user_id: &str) -> Result<Vec<AssistantUserOverlayRow>, DbError> {
+        let rows = sqlx::query_as::<_, AssistantUserOverlayRow>(
+            "SELECT * FROM assistant_user_overlays WHERE user_id = ? ORDER BY sort_order, updated_at",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn upsert(&self, params: &UpsertAssistantUserOverlayParams<'_>) -> Result<AssistantUserOverlayRow, DbError> {
+        let now = now_ms();
+        sqlx::query(
+            "INSERT INTO assistant_user_overlays (
+                user_id, assistant_definition_id, enabled, sort_order, agent_id_override, last_used_at, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, assistant_definition_id) DO UPDATE SET
+                enabled = excluded.enabled,
+                sort_order = excluded.sort_order,
+                agent_id_override = excluded.agent_id_override,
+                last_used_at = excluded.last_used_at,
+                updated_at = excluded.updated_at",
+        )
+        .bind(params.user_id)
+        .bind(params.assistant_definition_id)
+        .bind(params.enabled)
+        .bind(params.sort_order)
+        .bind(params.agent_id_override)
+        .bind(params.last_used_at)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        self.get(params.user_id, params.assistant_definition_id)
+            .await?
+            .ok_or_else(|| {
+                DbError::Init(format!(
+                    "upsert did not produce user overlay row for user '{}' and assistant_definition_id '{}'",
+                    params.user_id, params.assistant_definition_id
+                ))
+            })
+    }
+
+    async fn delete(&self, user_id: &str, assistant_definition_id: &str) -> Result<bool, DbError> {
+        let result =
+            sqlx::query("DELETE FROM assistant_user_overlays WHERE user_id = ? AND assistant_definition_id = ?")
+                .bind(user_id)
+                .bind(assistant_definition_id)
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -747,6 +837,8 @@ mod tests {
             default_permission_value: Some("workspace-write"),
             default_thought_level_mode: "auto",
             default_thought_level_value: None,
+            default_workspace_mode: "auto",
+            default_workspace_value: None,
             default_skills_mode: "fixed",
             default_skill_ids: r#"["pdf","cron"]"#,
             custom_skill_names: r#"["my-custom-skill"]"#,

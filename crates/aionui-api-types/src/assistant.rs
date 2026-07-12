@@ -159,6 +159,8 @@ pub struct AssistantDefaultsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought_level: Option<AssistantDefaultScalarRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<AssistantDefaultScalarRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<AssistantDefaultListRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcps: Option<AssistantDefaultListRequest>,
@@ -169,6 +171,7 @@ pub struct AssistantDefaultsResponse {
     pub model: AssistantDefaultScalarResponse,
     pub permission: AssistantDefaultScalarResponse,
     pub thought_level: AssistantDefaultScalarResponse,
+    pub workspace: AssistantDefaultScalarResponse,
     pub skills: AssistantDefaultListResponse,
     pub mcps: AssistantDefaultListResponse,
 }

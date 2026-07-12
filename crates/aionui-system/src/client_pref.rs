@@ -7,6 +7,7 @@ use crate::error::SystemError;
 
 /// Maximum allowed key length for client preferences.
 const MAX_KEY_LENGTH: usize = 255;
+const USER_OVERRIDABLE_KEYS: &[&str] = &["theme.activeId", "theme.userThemes"];
 
 /// Business logic for client preferences (generic key-value store).
 #[derive(Clone)]
@@ -36,8 +37,72 @@ impl ClientPrefService {
         Ok(map)
     }
 
+    /// Get preferences for a WebUI user.
+    ///
+    /// Administrators read the global preference set. Non-admin users read
+    /// global preferences with their own user-scoped values overlaid.
+    pub async fn get_preferences_for_user(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        keys: Option<&[&str]>,
+    ) -> Result<ClientPreferencesResponse, SystemError> {
+        let global_rows = match keys {
+            Some(k) if !k.is_empty() => self.repo.get_by_keys(k).await,
+            _ => self.repo.get_all().await,
+        }
+        .map_err(|e| SystemError::Internal(format!("Failed to get preferences: {e}")))?;
+
+        let mut map = rows_to_map(global_rows);
+        if is_admin {
+            return Ok(map);
+        }
+
+        let user_rows = match keys {
+            Some(k) if !k.is_empty() => self.repo.get_by_keys_for_user(user_id, k).await,
+            _ => self.repo.get_all_for_user(user_id).await,
+        }
+        .map_err(|e| SystemError::Internal(format!("Failed to get user preferences: {e}")))?;
+
+        map.extend(rows_to_map(user_rows));
+        Ok(map)
+    }
+
     /// Batch update client preferences. Null values delete the key.
     pub async fn update_preferences(&self, req: UpdateClientPreferencesRequest) -> Result<(), SystemError> {
+        self.update_preferences_inner(req, PreferenceScope::Global).await
+    }
+
+    /// Batch update client preferences for a WebUI user.
+    ///
+    /// Administrators update global preferences. Non-admin users can only
+    /// override explicitly allowed keys and those writes are user-scoped.
+    pub async fn update_preferences_for_user(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        req: UpdateClientPreferencesRequest,
+    ) -> Result<(), SystemError> {
+        if is_admin {
+            return self.update_preferences(req).await;
+        }
+
+        for key in req.keys() {
+            if !USER_OVERRIDABLE_KEYS.contains(&key.as_str()) {
+                return Err(SystemError::BadRequest(format!(
+                    "Preference key '{key}' cannot be changed by this user"
+                )));
+            }
+        }
+
+        self.update_preferences_inner(req, PreferenceScope::User(user_id)).await
+    }
+
+    async fn update_preferences_inner(
+        &self,
+        req: UpdateClientPreferencesRequest,
+        scope: PreferenceScope<'_>,
+    ) -> Result<(), SystemError> {
         let mut upserts: Vec<(String, String)> = Vec::new();
         let mut deletes: Vec<String> = Vec::new();
 
@@ -57,22 +122,52 @@ impl ClientPrefService {
 
         if !upserts.is_empty() {
             let entries: Vec<(&str, &str)> = upserts.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            self.repo
-                .upsert_batch(&entries)
-                .await
-                .map_err(|e| SystemError::Internal(format!("Failed to upsert preferences: {e}")))?;
+            match scope {
+                PreferenceScope::Global => self
+                    .repo
+                    .upsert_batch(&entries)
+                    .await
+                    .map_err(|e| SystemError::Internal(format!("Failed to upsert preferences: {e}")))?,
+                PreferenceScope::User(user_id) => self
+                    .repo
+                    .upsert_batch_for_user(user_id, &entries)
+                    .await
+                    .map_err(|e| SystemError::Internal(format!("Failed to upsert user preferences: {e}")))?,
+            }
         }
 
         if !deletes.is_empty() {
             let keys: Vec<&str> = deletes.iter().map(|k| k.as_str()).collect();
-            self.repo
-                .delete_keys(&keys)
-                .await
-                .map_err(|e| SystemError::Internal(format!("Failed to delete preferences: {e}")))?;
+            match scope {
+                PreferenceScope::Global => self
+                    .repo
+                    .delete_keys(&keys)
+                    .await
+                    .map_err(|e| SystemError::Internal(format!("Failed to delete preferences: {e}")))?,
+                PreferenceScope::User(user_id) => self
+                    .repo
+                    .delete_keys_for_user(user_id, &keys)
+                    .await
+                    .map_err(|e| SystemError::Internal(format!("Failed to delete user preferences: {e}")))?,
+            }
         }
 
         Ok(())
     }
+}
+
+enum PreferenceScope<'a> {
+    Global,
+    User(&'a str),
+}
+
+fn rows_to_map(rows: Vec<aionui_db::ClientPreference>) -> ClientPreferencesResponse {
+    let mut map = ClientPreferencesResponse::new();
+    for row in rows {
+        let value: serde_json::Value = serde_json::from_str(&row.value).unwrap_or(serde_json::Value::String(row.value));
+        map.insert(row.key, value);
+    }
+    map
 }
 
 fn validate_key(key: &str) -> Result<(), SystemError> {
@@ -242,5 +337,48 @@ mod tests {
         assert_eq!(prefs.len(), 2);
         assert_eq!(prefs["keep"], json!(1));
         assert_eq!(prefs["new"], json!(3));
+    }
+
+    #[tokio::test]
+    async fn non_admin_theme_preference_overlays_global_value() {
+        let svc = setup().await;
+
+        let mut global_req = UpdateClientPreferencesRequest::new();
+        global_req.insert("theme.activeId".into(), json!("light"));
+        svc.update_preferences_for_user("system_default_user", true, global_req)
+            .await
+            .unwrap();
+
+        let mut user_req = UpdateClientPreferencesRequest::new();
+        user_req.insert("theme.activeId".into(), json!("dark"));
+        svc.update_preferences_for_user("system_default_user", false, user_req)
+            .await
+            .unwrap();
+
+        let admin_prefs = svc
+            .get_preferences_for_user("system_default_user", true, Some(&["theme.activeId"]))
+            .await
+            .unwrap();
+        let user_prefs = svc
+            .get_preferences_for_user("system_default_user", false, Some(&["theme.activeId"]))
+            .await
+            .unwrap();
+
+        assert_eq!(admin_prefs["theme.activeId"], json!("light"));
+        assert_eq!(user_prefs["theme.activeId"], json!("dark"));
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_update_non_overridable_preference() {
+        let svc = setup().await;
+
+        let mut req = UpdateClientPreferencesRequest::new();
+        req.insert("acp.promptTimeout".into(), json!(120));
+
+        let err = svc
+            .update_preferences_for_user("system_default_user", false, req)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SystemError::BadRequest(_)));
     }
 }

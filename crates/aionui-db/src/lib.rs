@@ -19,10 +19,11 @@ pub use database::{
 pub use error::DbError;
 pub use models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
-    AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams,
-    SkillImportRecordRow, SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
-    UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams,
+    AssistantRow, AssistantUserOverlayRow, ClientPreference, ConversationArtifactRow, ConversationAssistantSnapshotRow,
+    CreateAssistantParams, SkillImportRecordRow, SkillRow, UpdateAgentAvailabilitySnapshotParams,
+    UpdateAgentHandshakeParams, UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertAssistantUserOverlayParams,
+    UpsertConversationAssistantSnapshotParams, UpsertOverrideParams,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
@@ -40,13 +41,14 @@ pub use repository::{
     CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult,
     FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository, IAgentMetadataRepository,
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
-    IAssistantPreferenceRepository, IAssistantRepository, IChannelRepository, IClientPreferenceRepository,
-    IConversationRepository, ICronRepository, IFeedbackDiagnosticsRepository, IMcpServerRepository,
-    IOAuthTokenRepository, IProviderRepository, IRemoteAgentRepository, ISettingsRepository, ISkillRepository,
-    ITeamRepository, IUserRepository, PersistedSessionState, SaveRuntimeStateParams, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
+    IAssistantPreferenceRepository, IAssistantRepository, IAssistantUserOverlayRepository, IChannelRepository,
+    IClientPreferenceRepository, IConversationRepository, ICronRepository, IFeedbackDiagnosticsRepository,
+    IMcpServerRepository, IOAuthTokenRepository, IProviderRepository, IRemoteAgentRepository, ISettingsRepository,
+    ISkillRepository, ITeamRepository, IUserRepository, PersistedSessionState, SaveRuntimeStateParams,
+    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
+    SqliteAssistantRepository, SqliteAssistantUserOverlayRepository, SqliteChannelRepository,
+    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
     SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository,
     SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSkillRepository,
     SqliteTeamRepository, SqliteUserRepository,

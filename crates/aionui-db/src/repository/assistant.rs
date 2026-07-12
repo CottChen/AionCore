@@ -3,8 +3,9 @@
 use crate::error::DbError;
 use crate::models::{
     AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow,
-    CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertAssistantPreferenceParams, UpsertOverrideParams,
+    AssistantUserOverlayRow, CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams,
+    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertAssistantUserOverlayParams,
+    UpsertOverrideParams,
 };
 
 /// CRUD access for user-authored assistant rows.
@@ -105,6 +106,19 @@ pub trait IAssistantOverlayRepository: Send + Sync {
     async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError>;
     async fn upsert(&self, params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError>;
     async fn delete(&self, assistant_definition_id: &str) -> Result<bool, DbError>;
+}
+
+/// Runtime current-user assistant display overlay.
+#[async_trait::async_trait]
+pub trait IAssistantUserOverlayRepository: Send + Sync {
+    async fn get(
+        &self,
+        user_id: &str,
+        assistant_definition_id: &str,
+    ) -> Result<Option<AssistantUserOverlayRow>, DbError>;
+    async fn list_by_user(&self, user_id: &str) -> Result<Vec<AssistantUserOverlayRow>, DbError>;
+    async fn upsert(&self, params: &UpsertAssistantUserOverlayParams<'_>) -> Result<AssistantUserOverlayRow, DbError>;
+    async fn delete(&self, user_id: &str, assistant_definition_id: &str) -> Result<bool, DbError>;
 }
 
 /// Assistant-scoped "auto remember last" preferences.

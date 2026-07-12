@@ -679,10 +679,22 @@ mod tests {
         async fn get_by_keys(&self, _keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
             Ok(vec![])
         }
+        async fn get_all_for_user(&self, _user_id: &str) -> Result<Vec<ClientPreference>, DbError> {
+            Ok(vec![])
+        }
+        async fn get_by_keys_for_user(&self, _user_id: &str, _keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+            Ok(vec![])
+        }
         async fn upsert_batch(&self, _entries: &[(&str, &str)]) -> Result<(), DbError> {
             Ok(())
         }
+        async fn upsert_batch_for_user(&self, _user_id: &str, _entries: &[(&str, &str)]) -> Result<(), DbError> {
+            Ok(())
+        }
         async fn delete_keys(&self, _keys: &[&str]) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn delete_keys_for_user(&self, _user_id: &str, _keys: &[&str]) -> Result<(), DbError> {
             Ok(())
         }
     }

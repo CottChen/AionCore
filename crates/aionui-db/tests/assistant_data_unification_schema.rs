@@ -8,7 +8,9 @@ async fn migration_creates_assistant_unification_tables_and_keeps_legacy_tables(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (
             'assistant_definitions',
             'assistant_overlays',
+            'assistant_user_overlays',
             'assistant_preferences',
+            'user_client_preferences',
             'conversation_assistant_snapshots',
             'assistants',
             'assistant_overrides'
@@ -25,8 +27,10 @@ async fn migration_creates_assistant_unification_tables_and_keeps_legacy_tables(
             "assistant_overlays".to_string(),
             "assistant_overrides".to_string(),
             "assistant_preferences".to_string(),
+            "assistant_user_overlays".to_string(),
             "assistants".to_string(),
             "conversation_assistant_snapshots".to_string(),
+            "user_client_preferences".to_string(),
         ]
     );
 }
@@ -50,6 +54,8 @@ async fn assistant_definition_table_has_expected_default_columns() {
     assert!(!columns.iter().any(|name| name == "assistant_key"));
     assert!(columns.iter().any(|name| name == "default_model_mode"));
     assert!(columns.iter().any(|name| name == "default_permission_mode"));
+    assert!(columns.iter().any(|name| name == "default_workspace_mode"));
+    assert!(columns.iter().any(|name| name == "default_workspace_value"));
     assert!(columns.iter().any(|name| name == "default_skill_ids"));
     assert!(columns.iter().any(|name| name == "default_mcp_ids"));
     assert!(columns.iter().any(|name| name == "avatar_type"));
@@ -60,6 +66,28 @@ async fn assistant_definition_table_has_expected_default_columns() {
         .await
         .unwrap_or_default();
     assert!(overlay_columns.iter().any(|name| name == "assistant_definition_id"));
+
+    let user_overlay_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('assistant_user_overlays')")
+            .fetch_all(db.pool())
+            .await
+            .unwrap_or_default();
+    assert!(user_overlay_columns.iter().any(|name| name == "user_id"));
+    assert!(
+        user_overlay_columns
+            .iter()
+            .any(|name| name == "assistant_definition_id")
+    );
+    assert!(user_overlay_columns.iter().any(|name| name == "sort_order"));
+
+    let user_client_preference_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('user_client_preferences')")
+            .fetch_all(db.pool())
+            .await
+            .unwrap_or_default();
+    assert!(user_client_preference_columns.iter().any(|name| name == "user_id"));
+    assert!(user_client_preference_columns.iter().any(|name| name == "key"));
+    assert!(user_client_preference_columns.iter().any(|name| name == "value"));
 
     let preference_columns: Vec<String> =
         sqlx::query_scalar("SELECT name FROM pragma_table_info('assistant_preferences')")
