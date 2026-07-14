@@ -1,4 +1,4 @@
--- Migration 023: Canonicalize builtin Codex ACP full-access mode metadata.
+-- Fork migration 900021: Canonicalize builtin Codex ACP full-access mode metadata.
 UPDATE agent_metadata
 SET yolo_id = 'agent-full-access',
     updated_at = CAST(strftime('%s','now') AS INTEGER) * 1000
