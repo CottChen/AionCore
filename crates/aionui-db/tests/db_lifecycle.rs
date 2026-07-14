@@ -2,6 +2,8 @@ use aionui_db::{
     DatabaseInitOptions, init_database, init_database_memory, init_database_with_options, maybe_copy_legacy_database,
 };
 use sqlx::Row;
+use std::collections::BTreeSet;
+use std::fs;
 
 // -- T1.1 Initialization --
 
@@ -105,6 +107,33 @@ async fn migrations_applied() {
         .unwrap();
 
     assert!(count.0 >= 1, "at least one migration should be applied");
+}
+
+#[test]
+fn migration_file_versions_are_unique() {
+    let migration_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut seen = BTreeSet::new();
+    let mut duplicates = Vec::new();
+
+    for entry in fs::read_dir(&migration_dir).unwrap() {
+        let entry = entry.unwrap();
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if !file_name.ends_with(".sql") {
+            continue;
+        }
+        let Some((version, _description)) = file_name.split_once('_') else {
+            continue;
+        };
+        if !seen.insert(version.to_string()) {
+            duplicates.push(version.to_string());
+        }
+    }
+
+    assert!(
+        duplicates.is_empty(),
+        "migration file versions must be unique; duplicates: {duplicates:?}"
+    );
 }
 
 // -- T1.5 System default user --
