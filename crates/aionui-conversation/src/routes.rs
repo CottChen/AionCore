@@ -9,10 +9,11 @@ use axum::routing::{get, patch, post};
 use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
-    MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest, WebuiTransferOwnerRequest,
+    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse,
+    ConversationRatingResponse, ConversationResponse, CreateConversationRequest, EnsureConversationRuntimeResponse,
+    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationRatingRequest,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebuiTransferOwnerRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -116,6 +117,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
+        .route("/api/conversations/{id}/ratings/{answerMessageId}", post(submit_rating))
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
@@ -274,6 +276,28 @@ async fn get_msg(
     let result = state
         .service
         .get_message(&user.id, &params.id, &params.message_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+#[derive(serde::Deserialize)]
+struct RatingPathParams {
+    id: String,
+    #[serde(rename = "answerMessageId")]
+    answer_message_id: String,
+}
+
+async fn submit_rating(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<RatingPathParams>,
+    body: Result<Json<SubmitConversationRatingRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ConversationRatingResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let result = state
+        .service
+        .submit_rating(&user.id, &params.id, &params.answer_message_id, req, &state.rating_repo)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))

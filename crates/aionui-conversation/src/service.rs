@@ -17,23 +17,26 @@ use aionui_api_types::{
     ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
     ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
-    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    ConversationMcpStatusKind, ConversationRatingResponse, ConversationRatingVote, ConversationResponse,
+    ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport, SubmitConversationRatingRequest,
+    TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
+    assistant_avatar_response_value, assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
     PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
 };
-use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
+use aionui_db::models::{
+    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRatingRow, ConversationRow, MessageRow,
+};
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageCursor,
-    MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
-    resolve_agent_binding_from_rows,
+    IAssistantPreferenceRepository, IConversationRatingRepository, IConversationRepository, IMcpServerRepository,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
+    UpsertConversationAssistantSnapshotParams, UpsertConversationRatingParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -2427,6 +2430,69 @@ impl ConversationService {
         Ok(response)
     }
 
+    pub async fn submit_rating(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        answer_message_id: &str,
+        req: SubmitConversationRatingRequest,
+        rating_repo: &Arc<dyn IConversationRatingRepository>,
+    ) -> Result<ConversationRatingResponse, ConversationError> {
+        self.conversation_repo
+            .get(conversation_id)
+            .await?
+            .filter(|r| r.user_id == user_id)
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
+        validate_rating_score(req.vote.clone(), req.score)?;
+
+        let question = self
+            .conversation_repo
+            .get_message(conversation_id, &req.question_message_id)
+            .await?
+            .ok_or_else(|| ConversationError::MessageNotFound {
+                id: req.question_message_id.clone(),
+            })?;
+        validate_rating_message(&question, "right", "question_message_id")?;
+
+        let answer = self
+            .conversation_repo
+            .get_message(conversation_id, answer_message_id)
+            .await?
+            .ok_or_else(|| ConversationError::MessageNotFound {
+                id: answer_message_id.to_owned(),
+            })?;
+        validate_rating_message(&answer, "left", "answer_message_id")?;
+
+        let vote = match req.vote {
+            ConversationRatingVote::Up => "up",
+            ConversationRatingVote::Down => "down",
+        };
+        let now = now_ms();
+        let id = format!("rating_{}", generate_short_id());
+        let comment = req.comment.as_deref().map(str::trim).filter(|value| !value.is_empty());
+
+        let row = rating_repo
+            .upsert(&UpsertConversationRatingParams {
+                id: &id,
+                user_id,
+                conversation_id,
+                question_message_id: &req.question_message_id,
+                answer_message_id,
+                vote,
+                score: req.score,
+                comment,
+                question_snapshot: &req.question_snapshot,
+                answer_snapshot: &req.answer_snapshot,
+                now,
+            })
+            .await?;
+
+        Ok(rating_row_to_response(row)?)
+    }
+
     /// List artifacts for a conversation with durable status state.
     pub async fn list_artifacts(
         &self,
@@ -4126,6 +4192,63 @@ fn is_tool_message_type(message_type: MessageType) -> bool {
         message_type,
         MessageType::ToolCall | MessageType::ToolGroup | MessageType::AcpToolCall
     )
+}
+
+fn validate_rating_score(vote: ConversationRatingVote, score: i64) -> Result<(), ConversationError> {
+    match vote {
+        ConversationRatingVote::Up if !(6..=10).contains(&score) => Err(ConversationError::BadRequest {
+            reason: "like score must be between 6 and 10".into(),
+        }),
+        ConversationRatingVote::Down if !(0..=5).contains(&score) => Err(ConversationError::BadRequest {
+            reason: "dislike score must be between 0 and 5".into(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+fn validate_rating_message(
+    row: &MessageRow,
+    expected_position: &str,
+    field_name: &str,
+) -> Result<(), ConversationError> {
+    if row.r#type != "text" {
+        return Err(ConversationError::BadRequest {
+            reason: format!("{field_name} must reference a text message"),
+        });
+    }
+    if row.position.as_deref() != Some(expected_position) {
+        return Err(ConversationError::BadRequest {
+            reason: format!("{field_name} has invalid message position"),
+        });
+    }
+    Ok(())
+}
+
+fn rating_row_to_response(row: ConversationRatingRow) -> Result<ConversationRatingResponse, ConversationError> {
+    let vote = match row.vote.as_str() {
+        "up" => ConversationRatingVote::Up,
+        "down" => ConversationRatingVote::Down,
+        other => {
+            return Err(ConversationError::internal(format!(
+                "Invalid stored conversation rating vote: {other}"
+            )));
+        }
+    };
+
+    Ok(ConversationRatingResponse {
+        id: row.id,
+        user_id: row.user_id,
+        conversation_id: row.conversation_id,
+        question_message_id: row.question_message_id,
+        answer_message_id: row.answer_message_id,
+        vote,
+        score: row.score,
+        comment: row.comment,
+        question_snapshot: row.question_snapshot,
+        answer_snapshot: row.answer_snapshot,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
 }
 
 #[cfg(test)]

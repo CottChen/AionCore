@@ -4,6 +4,7 @@ pub mod assistant;
 pub mod channel;
 mod client_preference;
 pub mod conversation;
+pub mod conversation_rating;
 pub mod cron;
 pub mod diagnostics;
 mod diagnostics_sanitizer;
@@ -19,6 +20,7 @@ mod sqlite_assistant;
 mod sqlite_channel;
 mod sqlite_client_preference;
 mod sqlite_conversation;
+mod sqlite_conversation_rating;
 mod sqlite_cron;
 mod sqlite_diagnostics;
 mod sqlite_mcp_server;
@@ -41,6 +43,7 @@ pub use assistant::{
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;
 pub use conversation::IConversationRepository;
+pub use conversation_rating::IConversationRatingRepository;
 pub use cron::ICronRepository;
 pub use diagnostics::{
     FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult,
@@ -61,6 +64,7 @@ pub use sqlite_assistant::{
 pub use sqlite_channel::SqliteChannelRepository;
 pub use sqlite_client_preference::SqliteClientPreferenceRepository;
 pub use sqlite_conversation::SqliteConversationRepository;
+pub use sqlite_conversation_rating::SqliteConversationRatingRepository;
 pub use sqlite_cron::SqliteCronRepository;
 pub use sqlite_diagnostics::SqliteFeedbackDiagnosticsRepository;
 pub use sqlite_mcp_server::SqliteMcpServerRepository;

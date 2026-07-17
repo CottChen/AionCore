@@ -20,9 +20,9 @@ use aionui_db::{
     IAssistantUserOverlayRepository, IConversationRepository, IProviderRepository, SqliteAcpSessionRepository,
     SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteAssistantUserOverlayRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteSettingsRepository,
+    SqliteAssistantUserOverlayRepository, SqliteClientPreferenceRepository, SqliteConversationRatingRepository,
+    SqliteConversationRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
+    SqliteRemoteAgentRepository, SqliteSettingsRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -392,6 +392,9 @@ pub fn build_conversation_state(
         service: conversation_service,
         task_manager: services.worker_task_manager.clone(),
         user_repo: services.user_repo.clone(),
+        rating_repo: Arc::new(SqliteConversationRatingRepository::new(
+            services.database.pool().clone(),
+        )),
         active_leases: services.active_lease_registry.clone(),
     }
 }
