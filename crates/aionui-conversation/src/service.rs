@@ -2430,6 +2430,40 @@ impl ConversationService {
         Ok(response)
     }
 
+    async fn resolve_rating_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        msg_id: Option<&str>,
+        field_name: &str,
+    ) -> Result<MessageRow, ConversationError> {
+        if let Some(row) = self.conversation_repo.get_message(conversation_id, message_id).await? {
+            return Ok(row);
+        }
+
+        if let Some(msg_id) = msg_id.map(str::trim).filter(|value| !value.is_empty()) {
+            if let Some(row) = self
+                .conversation_repo
+                .get_message_by_msg_id(conversation_id, msg_id, "text")
+                .await?
+            {
+                debug!(
+                    conversation_id,
+                    message_id,
+                    msg_id,
+                    field_name,
+                    resolved_message_id = %row.id,
+                    "resolved conversation rating message by msg_id fallback"
+                );
+                return Ok(row);
+            }
+        }
+
+        Err(ConversationError::MessageNotFound {
+            id: message_id.to_owned(),
+        })
+    }
+
     pub async fn submit_rating(
         &self,
         user_id: &str,
@@ -2449,22 +2483,35 @@ impl ConversationService {
         validate_rating_score(req.vote.clone(), req.score)?;
 
         let question = self
-            .conversation_repo
-            .get_message(conversation_id, &req.question_message_id)
-            .await?
-            .ok_or_else(|| ConversationError::MessageNotFound {
-                id: req.question_message_id.clone(),
-            })?;
+            .resolve_rating_message(
+                conversation_id,
+                &req.question_message_id,
+                req.question_msg_id.as_deref(),
+                "question_message_id",
+            )
+            .await?;
         validate_rating_message(&question, "right", "question_message_id")?;
 
         let answer = self
-            .conversation_repo
-            .get_message(conversation_id, answer_message_id)
-            .await?
-            .ok_or_else(|| ConversationError::MessageNotFound {
-                id: answer_message_id.to_owned(),
-            })?;
+            .resolve_rating_message(
+                conversation_id,
+                answer_message_id,
+                req.answer_msg_id.as_deref(),
+                "answer_message_id",
+            )
+            .await?;
         validate_rating_message(&answer, "left", "answer_message_id")?;
+
+        let question_snapshot = req
+            .question_snapshot
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| rating_message_snapshot(&question));
+        let answer_snapshot = req
+            .answer_snapshot
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| rating_message_snapshot(&answer));
 
         let vote = match req.vote {
             ConversationRatingVote::Up => "up",
@@ -2479,13 +2526,13 @@ impl ConversationService {
                 id: &id,
                 user_id,
                 conversation_id,
-                question_message_id: &req.question_message_id,
-                answer_message_id,
+                question_message_id: &question.id,
+                answer_message_id: &answer.id,
                 vote,
                 score: req.score,
                 comment,
-                question_snapshot: &req.question_snapshot,
-                answer_snapshot: &req.answer_snapshot,
+                question_snapshot: &question_snapshot,
+                answer_snapshot: &answer_snapshot,
                 now,
             })
             .await?;
@@ -4222,6 +4269,18 @@ fn validate_rating_message(
         });
     }
     Ok(())
+}
+
+fn rating_message_snapshot(row: &MessageRow) -> String {
+    serde_json::from_str::<serde_json::Value>(&row.content)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("content")
+                .and_then(|content| content.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| row.content.clone())
 }
 
 fn rating_row_to_response(row: ConversationRatingRow) -> Result<ConversationRatingResponse, ConversationError> {

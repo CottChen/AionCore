@@ -131,12 +131,18 @@ pub enum ConversationRatingVote {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct SubmitConversationRatingRequest {
     pub question_message_id: String,
+    #[serde(default)]
+    pub question_msg_id: Option<String>,
+    #[serde(default)]
+    pub answer_msg_id: Option<String>,
     pub vote: ConversationRatingVote,
     pub score: i64,
     #[serde(default)]
     pub comment: Option<String>,
-    pub question_snapshot: String,
-    pub answer_snapshot: String,
+    #[serde(default)]
+    pub question_snapshot: Option<String>,
+    #[serde(default)]
+    pub answer_snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
