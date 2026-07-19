@@ -70,6 +70,20 @@ pub trait IConversationRepository: Send + Sync {
         Ok(None)
     }
 
+    /// Returns persisted assistant snapshots for a set of conversations.
+    async fn list_assistant_snapshots(
+        &self,
+        conversation_ids: &[String],
+    ) -> Result<Vec<ConversationAssistantSnapshotRow>, DbError> {
+        let mut snapshots = Vec::new();
+        for conversation_id in conversation_ids {
+            if let Some(snapshot) = self.get_assistant_snapshot(conversation_id).await? {
+                snapshots.push(snapshot);
+            }
+        }
+        Ok(snapshots)
+    }
+
     /// Inserts or updates a persisted assistant snapshot for a conversation.
     async fn upsert_assistant_snapshot(
         &self,

@@ -914,10 +914,7 @@ impl AssistantService {
         agent_rows: &[AgentManagementRow],
     ) -> Result<AssistantRuntimeProjection, AssistantError> {
         let effective_agent_id = effective_agent_id_for_definition(definition, state);
-        let runtime_backend = resolve_agent_binding(&self.pool, effective_agent_id)
-            .await
-            .map_err(|e| AssistantError::Internal(format!("resolve agent binding: {e}")))?
-            .map(|binding| binding.runtime_backend);
+        let runtime_backend = resolve_runtime_backend_from_management_rows(agent_rows, effective_agent_id);
         Ok(assistant_projection_for_definition(
             definition,
             state,
@@ -2570,6 +2567,46 @@ fn assistant_projection_for_definition(
     }
 }
 
+fn resolve_runtime_backend_from_management_rows(rows: &[AgentManagementRow], value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    rows.iter()
+        .filter(|row| row.id == value)
+        .min_by_key(|row| agent_management_match_rank(row))
+        .or_else(|| {
+            rows.iter()
+                .filter(|row| row.backend.as_deref() == Some(value))
+                .min_by_key(|row| agent_management_match_rank(row))
+        })
+        .or_else(|| {
+            rows.iter()
+                .filter(|row| row.agent_type.serde_name() == value)
+                .min_by_key(|row| agent_management_match_rank(row))
+        })
+        .map(runtime_backend_for_management_row)
+}
+
+fn runtime_backend_for_management_row(row: &AgentManagementRow) -> String {
+    row.backend
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| row.agent_type.serde_name())
+        .to_owned()
+}
+
+fn agent_management_match_rank(row: &AgentManagementRow) -> (i32, i64, &str) {
+    let source_rank = match row.agent_source {
+        AgentSource::Builtin => 0,
+        AgentSource::Internal => 1,
+        _ => 2,
+    };
+    (source_rank, row.sort_order, row.name.as_str())
+}
+
 fn generated_definition_is_uninstalled(definition: &AssistantDefinitionRow, agent_rows: &[AgentManagementRow]) -> bool {
     if definition.source != "generated" {
         return false;
@@ -3500,6 +3537,8 @@ mod tests {
                 default_permission_value: None,
                 default_thought_level_mode: "auto",
                 default_thought_level_value: None,
+                default_workspace_mode: "auto",
+                default_workspace_value: None,
                 default_skills_mode: "auto",
                 default_skill_ids: "not json",
                 custom_skill_names: "[]",

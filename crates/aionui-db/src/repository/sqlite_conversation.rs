@@ -23,6 +23,24 @@ impl SqliteConversationRepository {
         Self { pool }
     }
 
+    async fn list_assistant_snapshots_chunk(
+        &self,
+        conversation_ids: &[String],
+    ) -> Result<Vec<ConversationAssistantSnapshotRow>, DbError> {
+        if conversation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = vec!["?"; conversation_ids.len()].join(",");
+        let sql = format!("SELECT * FROM conversation_assistant_snapshots WHERE conversation_id IN ({placeholders})");
+        let mut query = sqlx::query_as::<_, ConversationAssistantSnapshotRow>(&sql);
+        for conversation_id in conversation_ids {
+            query = query.bind(conversation_id);
+        }
+
+        Ok(query.fetch_all(&self.pool).await?)
+    }
+
     async fn insert_message_once(&self, message: &MessageRow) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO messages \
@@ -430,6 +448,17 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(row)
     }
 
+    async fn list_assistant_snapshots(
+        &self,
+        conversation_ids: &[String],
+    ) -> Result<Vec<ConversationAssistantSnapshotRow>, DbError> {
+        let mut snapshots = Vec::new();
+        for chunk in conversation_ids.chunks(500) {
+            snapshots.extend(self.list_assistant_snapshots_chunk(chunk).await?);
+        }
+        Ok(snapshots)
+    }
+
     async fn upsert_assistant_snapshot(
         &self,
         params: &UpsertConversationAssistantSnapshotParams<'_>,
@@ -760,28 +789,17 @@ impl IConversationRepository for SqliteConversationRepository {
         page_size: u32,
     ) -> Result<PaginatedResult<MessageSearchRow>, DbError> {
         let effective_page = if page == 0 { 1 } else { page };
-        let effective_size = if page_size == 0 { 20 } else { page_size };
+        let effective_size = if page_size == 0 { 20 } else { page_size.min(20) };
         let offset = (effective_page - 1) * effective_size;
         let fetch_limit = effective_size + 1;
 
         let like_pattern = format!("%{keyword}%");
 
-        let count_row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM messages m \
-             INNER JOIN conversations c ON m.conversation_id = c.id \
-             WHERE c.user_id = ? AND m.content LIKE ?",
-        )
-        .bind(user_id)
-        .bind(&like_pattern)
-        .fetch_one(&self.pool)
-        .await?;
-        let total = count_row.0 as u64;
-
         let rows = sqlx::query_as::<_, MessageSearchRow>(
             "SELECT \
                 m.id AS message_id, \
                 m.type, \
-                m.content, \
+                substr(m.content, 1, 65536) AS content, \
                 m.created_at, \
                 c.id AS conversation_id, \
                 c.name AS conversation_name, \
@@ -797,7 +815,10 @@ impl IConversationRepository for SqliteConversationRepository {
                 c.updated_at AS conversation_updated_at \
              FROM messages m \
              INNER JOIN conversations c ON m.conversation_id = c.id \
-             WHERE c.user_id = ? AND m.content LIKE ? \
+             WHERE c.user_id = ? \
+               AND m.hidden = 0 \
+               AND m.type = 'text' \
+               AND m.content LIKE ? \
              ORDER BY m.created_at DESC \
              LIMIT ? OFFSET ?",
         )
@@ -814,6 +835,7 @@ impl IConversationRepository for SqliteConversationRepository {
         } else {
             rows
         };
+        let total = offset as u64 + items.len() as u64 + u64::from(has_more);
 
         Ok(PaginatedResult { items, total, has_more })
     }
@@ -1041,7 +1063,8 @@ async fn execute_count(pool: &SqlitePool, sql: &str, binds: &[BindValue]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::init_database_memory;
+    use crate::repository::{IAssistantDefinitionRepository, SqliteAssistantDefinitionRepository};
+    use crate::{UpsertAssistantDefinitionParams, init_database_memory};
 
     async fn setup() -> (SqliteConversationRepository, crate::Database) {
         let db = init_database_memory().await.unwrap();
@@ -1080,6 +1103,73 @@ mod tests {
             status: Some("finish".to_string()),
             hidden: false,
             created_at: now,
+        }
+    }
+
+    fn assistant_definition_params<'a>(
+        definition_id: &'a str,
+        assistant_id: &'a str,
+    ) -> UpsertAssistantDefinitionParams<'a> {
+        UpsertAssistantDefinitionParams {
+            id: definition_id,
+            assistant_id,
+            source: "user",
+            owner_type: "user",
+            source_ref: Some(assistant_id),
+            source_version: None,
+            source_hash: None,
+            name: "Assistant",
+            name_i18n: "{}",
+            description: None,
+            description_i18n: "{}",
+            avatar_type: "none",
+            avatar_value: None,
+            agent_id: "aionrs",
+            rule_resource_type: "inline",
+            rule_resource_ref: None,
+            rule_inline_content: Some(""),
+            recommended_prompts: "[]",
+            recommended_prompts_i18n: "{}",
+            default_model_mode: "auto",
+            default_model_value: None,
+            default_permission_mode: "auto",
+            default_permission_value: None,
+            default_thought_level_mode: "auto",
+            default_thought_level_value: None,
+            default_workspace_mode: "auto",
+            default_workspace_value: None,
+            default_skills_mode: "auto",
+            default_skill_ids: "[]",
+            custom_skill_names: "[]",
+            default_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            default_mcp_ids: "[]",
+        }
+    }
+
+    fn snapshot_params<'a>(
+        conversation_id: &'a str,
+        assistant_definition_id: &'a str,
+        assistant_id: &'a str,
+    ) -> UpsertConversationAssistantSnapshotParams<'a> {
+        UpsertConversationAssistantSnapshotParams {
+            conversation_id,
+            assistant_definition_id,
+            assistant_id,
+            assistant_source: "user",
+            agent_id: "aionrs",
+            rules_content: "",
+            default_model_mode: "auto",
+            resolved_model_id: None,
+            default_permission_mode: "auto",
+            resolved_permission_value: None,
+            default_thought_level_mode: "auto",
+            resolved_thought_level_value: None,
+            default_skills_mode: "auto",
+            resolved_skill_ids: "[]",
+            resolved_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            resolved_mcp_ids: "[]",
         }
     }
 
@@ -1149,6 +1239,44 @@ mod tests {
         let found = repo.get(&conv.id).await.unwrap().unwrap();
         assert_eq!(found.user_id, "user_target");
         assert!(found.updated_at >= conv.updated_at);
+    }
+
+    #[tokio::test]
+    async fn list_assistant_snapshots_returns_requested_conversations() {
+        let (repo, db) = setup().await;
+        let definition_repo = SqliteAssistantDefinitionRepository::new(db.pool().clone());
+        definition_repo
+            .upsert(&assistant_definition_params("asstdef_batch", "assistant_batch"))
+            .await
+            .unwrap();
+
+        let conv_a = sample_conversation(SYSTEM_USER_ID);
+        let conv_b = sample_conversation(SYSTEM_USER_ID);
+        let conv_c = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv_a).await.unwrap();
+        repo.create(&conv_b).await.unwrap();
+        repo.create(&conv_c).await.unwrap();
+        repo.upsert_assistant_snapshot(&snapshot_params(&conv_a.id, "asstdef_batch", "assistant_batch"))
+            .await
+            .unwrap();
+        repo.upsert_assistant_snapshot(&snapshot_params(&conv_b.id, "asstdef_batch", "assistant_batch"))
+            .await
+            .unwrap();
+        repo.upsert_assistant_snapshot(&snapshot_params(&conv_c.id, "asstdef_batch", "assistant_batch"))
+            .await
+            .unwrap();
+
+        let snapshots = repo
+            .list_assistant_snapshots(&[conv_a.id.clone(), conv_c.id.clone(), "missing".to_string()])
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> =
+            snapshots.into_iter().map(|snapshot| snapshot.conversation_id).collect();
+
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&conv_a.id));
+        assert!(ids.contains(&conv_c.id));
+        assert!(!ids.contains(&conv_b.id));
     }
 
     #[tokio::test]
@@ -1799,7 +1927,7 @@ mod tests {
 
         let result = repo.search_messages(SYSTEM_USER_ID, "keyword", 1, 2).await.unwrap();
         assert_eq!(result.items.len(), 2);
-        assert_eq!(result.total, 5);
+        assert!(result.total >= result.items.len() as u64);
         assert!(result.has_more);
     }
 

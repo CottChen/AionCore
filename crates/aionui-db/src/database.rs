@@ -1,3 +1,4 @@
+use std::env;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -12,8 +13,11 @@ use tracing::{info, warn};
 
 use crate::error::DbError;
 
-/// Maximum number of connections in the pool.
-const MAX_CONNECTIONS: u32 = 5;
+/// Default maximum number of connections in the file-backed SQLite pool.
+const DEFAULT_MAX_CONNECTIONS: u32 = 8;
+const MIN_MAX_CONNECTIONS: u32 = 1;
+const MAX_MAX_CONNECTIONS: u32 = 32;
+const SQLITE_MAX_CONNECTIONS_ENV: &str = "AIONUI_SQLITE_MAX_CONNECTIONS";
 
 /// SQLite busy timeout in milliseconds.
 const BUSY_TIMEOUT_MS: u64 = 5000;
@@ -264,7 +268,7 @@ async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError
         .journal_mode(SqliteJournalMode::Wal);
 
     let pool = PoolOptions::<Sqlite>::new()
-        .max_connections(MAX_CONNECTIONS)
+        .max_connections(sqlite_max_connections())
         .connect_with(opts)
         .await
         .map_err(|e| DatabaseInitError::new("database.open", DbError::Query(e)))?;
@@ -326,6 +330,28 @@ fn is_retryable_startup_file_error(error: &std::io::Error) -> bool {
         | std::io::ErrorKind::TimedOut
         | std::io::ErrorKind::WouldBlock => true,
         _ => matches!(error.raw_os_error(), Some(5 | 32 | 33)),
+    }
+}
+
+fn sqlite_max_connections() -> u32 {
+    parse_sqlite_max_connections(env::var(SQLITE_MAX_CONNECTIONS_ENV).ok().as_deref())
+}
+
+fn parse_sqlite_max_connections(raw: Option<&str>) -> u32 {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return DEFAULT_MAX_CONNECTIONS;
+    };
+    match raw.parse::<u32>() {
+        Ok(value) => value.clamp(MIN_MAX_CONNECTIONS, MAX_MAX_CONNECTIONS),
+        Err(_) => {
+            warn!(
+                env = SQLITE_MAX_CONNECTIONS_ENV,
+                value = raw,
+                default = DEFAULT_MAX_CONNECTIONS,
+                "Invalid SQLite max connection setting; using default"
+            );
+            DEFAULT_MAX_CONNECTIONS
+        }
     }
 }
 
@@ -820,5 +846,27 @@ mod tests {
     fn startup_file_retry_rejects_non_transient_errors() {
         let err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing file");
         assert!(!is_retryable_startup_file_error(&err));
+    }
+
+    #[test]
+    fn sqlite_max_connections_uses_default_for_missing_or_blank_value() {
+        assert_eq!(parse_sqlite_max_connections(None), DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(parse_sqlite_max_connections(Some("   ")), DEFAULT_MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn sqlite_max_connections_accepts_valid_value() {
+        assert_eq!(parse_sqlite_max_connections(Some("12")), 12);
+    }
+
+    #[test]
+    fn sqlite_max_connections_clamps_out_of_range_values() {
+        assert_eq!(parse_sqlite_max_connections(Some("0")), MIN_MAX_CONNECTIONS);
+        assert_eq!(parse_sqlite_max_connections(Some("100")), MAX_MAX_CONNECTIONS);
+    }
+
+    #[test]
+    fn sqlite_max_connections_uses_default_for_invalid_value() {
+        assert_eq!(parse_sqlite_max_connections(Some("many")), DEFAULT_MAX_CONNECTIONS);
     }
 }

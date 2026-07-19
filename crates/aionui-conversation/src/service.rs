@@ -29,7 +29,8 @@ use aionui_common::{
     PaginatedResult, WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{
-    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRatingRow, ConversationRow, MessageRow,
+    AgentMetadataRow, AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRatingRow, ConversationRow,
+    MessageRow,
 };
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
@@ -156,6 +157,14 @@ struct AssistantSnapshot {
     default_modes: AssistantSnapshotDefaultModes,
     resolved_defaults: AssistantSnapshotResolvedDefaults,
     created_at: i64,
+}
+
+#[derive(Debug, Default)]
+struct ConversationListHydrationContext {
+    auto_inject_names: Vec<String>,
+    assistant_snapshots: HashMap<String, ConversationAssistantSnapshotRow>,
+    assistant_definitions: HashMap<String, AssistantDefinitionRow>,
+    agent_rows: Vec<AgentMetadataRow>,
 }
 
 fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -374,6 +383,8 @@ pub struct ConversationAgentTurnOutcome {
 // ── Construction & Dependency Injection ──────────────────────────────
 
 impl ConversationService {
+    const MAX_SEARCH_KEYWORD_CHARS: usize = 100;
+
     pub fn new(
         workspace_root: PathBuf,
         broadcaster: Arc<dyn EventBroadcaster>,
@@ -630,6 +641,22 @@ impl ConversationService {
         Ok(())
     }
 
+    fn attach_assistant_identity_from_context(
+        &self,
+        response: &mut ConversationResponse,
+        context: &ConversationListHydrationContext,
+    ) -> Result<(), ConversationError> {
+        if response.assistant.is_some() {
+            return Ok(());
+        }
+
+        let Some(snapshot) = context.assistant_snapshots.get(&response.id) else {
+            return Ok(());
+        };
+        response.assistant = Some(self.assistant_identity_from_snapshot_context(snapshot, context)?);
+        Ok(())
+    }
+
     async fn assistant_identity_from_snapshot(
         &self,
         snapshot: &ConversationAssistantSnapshotRow,
@@ -644,6 +671,43 @@ impl ConversationService {
             Some(definition) => (
                 definition.source,
                 definition.name,
+                assistant_avatar_response_value_with_version(
+                    definition.avatar_type.as_str(),
+                    definition.avatar_value.as_deref(),
+                    definition.assistant_id.as_str(),
+                    definition.updated_at,
+                )
+                .unwrap_or_default(),
+            ),
+            None => (
+                snapshot.assistant_source.clone(),
+                snapshot.assistant_id.clone(),
+                String::new(),
+            ),
+        };
+
+        Ok(aionui_api_types::ConversationAssistantIdentityResponse {
+            id: snapshot.assistant_id.clone(),
+            source,
+            name,
+            avatar,
+            backend: runtime_backend,
+        })
+    }
+
+    fn assistant_identity_from_snapshot_context(
+        &self,
+        snapshot: &ConversationAssistantSnapshotRow,
+        context: &ConversationListHydrationContext,
+    ) -> Result<aionui_api_types::ConversationAssistantIdentityResponse, ConversationError> {
+        let runtime_backend = resolve_agent_binding_from_rows(&context.agent_rows, &snapshot.agent_id)
+            .map(|binding| binding.runtime_backend)
+            .unwrap_or_else(|| snapshot.agent_id.clone());
+        let current_definition = context.assistant_definitions.get(&snapshot.assistant_id);
+        let (source, name, avatar) = match current_definition {
+            Some(definition) => (
+                definition.source.clone(),
+                definition.name.clone(),
                 assistant_avatar_response_value_with_version(
                     definition.avatar_type.as_str(),
                     definition.avatar_value.as_deref(),
@@ -1785,6 +1849,8 @@ impl ConversationService {
         };
 
         let result = self.conversation_repo.list_paginated(user_id, &filters).await?;
+        let conversation_ids: Vec<String> = result.items.iter().map(|row| row.id.clone()).collect();
+        let hydration = self.list_hydration_context(&conversation_ids).await?;
 
         // Tolerate per-row deserialization failures — a single legacy row
         // (e.g. an abandoned agent_type='gemini' conversation post-migration)
@@ -1804,10 +1870,10 @@ impl ConversationService {
                     continue;
                 }
             };
-            self.backfill_extra_inplace(&row_id, &mut extra).await;
+            backfill_extra_value(&mut extra, &hydration.auto_inject_names);
             match row_to_response_with_extra(row, extra, &self.workspace_root) {
                 Ok(mut resp) => {
-                    self.attach_assistant_identity(&mut resp).await?;
+                    self.attach_assistant_identity_from_context(&mut resp, &hydration)?;
                     items.push(resp);
                 }
                 Err(err) => warn!(
@@ -1822,6 +1888,56 @@ impl ConversationService {
             items,
             total: result.total,
             has_more: result.has_more,
+        })
+    }
+
+    async fn list_hydration_context(
+        &self,
+        conversation_ids: &[String],
+    ) -> Result<ConversationListHydrationContext, ConversationError> {
+        let auto_inject_names = self.skill_resolver.auto_inject_names().await;
+        if conversation_ids.is_empty() {
+            return Ok(ConversationListHydrationContext {
+                auto_inject_names,
+                ..Default::default()
+            });
+        }
+
+        let snapshots = self
+            .conversation_repo
+            .list_assistant_snapshots(conversation_ids)
+            .await?;
+        let assistant_snapshots: HashMap<String, ConversationAssistantSnapshotRow> = snapshots
+            .into_iter()
+            .map(|snapshot| (snapshot.conversation_id.clone(), snapshot))
+            .collect();
+
+        if assistant_snapshots.is_empty() {
+            return Ok(ConversationListHydrationContext {
+                auto_inject_names,
+                ..Default::default()
+            });
+        }
+
+        let assistant_definitions: HashMap<String, AssistantDefinitionRow> =
+            if let Some(definition_repo) = self.assistant_definition_repo() {
+                definition_repo
+                    .list()
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("assistant definition list failed: {e}")))?
+                    .into_iter()
+                    .map(|definition| (definition.assistant_id.clone(), definition))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+        let agent_rows = self.agent_metadata_repo.list_all().await?;
+
+        Ok(ConversationListHydrationContext {
+            auto_inject_names,
+            assistant_snapshots,
+            assistant_definitions,
+            agent_rows,
         })
     }
 
@@ -2625,18 +2741,25 @@ impl ConversationService {
         user_id: &str,
         query: SearchMessagesQuery,
     ) -> Result<MessageSearchResponse, ConversationError> {
-        if query.keyword.trim().is_empty() {
+        let keyword = query.keyword.trim();
+        if keyword.is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "keyword must not be empty".into(),
             });
         }
 
+        if keyword.chars().count() > Self::MAX_SEARCH_KEYWORD_CHARS {
+            return Err(ConversationError::BadRequest {
+                reason: format!("keyword must be at most {} characters", Self::MAX_SEARCH_KEYWORD_CHARS),
+            });
+        }
+
         let page = query.page.unwrap_or(1);
-        let page_size = query.page_size.unwrap_or(20);
+        let page_size = query.page_size.unwrap_or(20).min(20);
 
         let result = self
             .conversation_repo
-            .search_messages(user_id, &query.keyword, page, page_size)
+            .search_messages(user_id, keyword, page, page_size)
             .await?;
 
         let items = result
@@ -3581,9 +3704,17 @@ impl ConversationService {
     /// failure.
     async fn backfill_extra_inplace(&self, conversation_id: &str, extra: &mut serde_json::Value) {
         let auto_inject = self.skill_resolver.auto_inject_names().await;
-        let mut mutated = backfill_skills_if_missing(extra, &auto_inject);
-        mutated |= backfill_cron_job_id_alias(extra);
-        if !mutated {
+        self.backfill_extra_inplace_with_auto_inject(conversation_id, extra, &auto_inject)
+            .await;
+    }
+
+    async fn backfill_extra_inplace_with_auto_inject(
+        &self,
+        conversation_id: &str,
+        extra: &mut serde_json::Value,
+        auto_inject: &[String],
+    ) {
+        if !backfill_extra_value(extra, auto_inject) {
             return;
         }
         let serialized = match serde_json::to_string(extra) {
@@ -3609,6 +3740,12 @@ impl ConversationService {
             );
         }
     }
+}
+
+fn backfill_extra_value(extra: &mut serde_json::Value, auto_inject: &[String]) -> bool {
+    let mut mutated = backfill_skills_if_missing(extra, auto_inject);
+    mutated |= backfill_cron_job_id_alias(extra);
+    mutated
 }
 
 fn backfill_cron_job_id_alias(extra: &mut serde_json::Value) -> bool {

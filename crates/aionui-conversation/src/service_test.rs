@@ -2801,6 +2801,19 @@ async fn search_messages_whitespace_keyword_returns_bad_request() {
     assert!(matches!(err, ConversationError::BadRequest { .. }));
 }
 
+#[tokio::test]
+async fn search_messages_long_keyword_returns_bad_request() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+
+    let query = SearchMessagesQuery {
+        keyword: "x".repeat(101),
+        page: None,
+        page_size: None,
+    };
+    let err = svc.search_messages("user_1", query).await.unwrap_err();
+    assert!(matches!(err, ConversationError::BadRequest { .. }));
+}
+
 // ── Mock Agent ───────────────────────────────────────────────────
 
 struct MockAgent {
