@@ -2557,22 +2557,21 @@ impl ConversationService {
             return Ok(row);
         }
 
-        if let Some(msg_id) = msg_id.map(str::trim).filter(|value| !value.is_empty()) {
-            if let Some(row) = self
+        if let Some(msg_id) = msg_id.map(str::trim).filter(|value| !value.is_empty())
+            && let Some(row) = self
                 .conversation_repo
                 .get_message_by_msg_id(conversation_id, msg_id, "text")
                 .await?
-            {
-                debug!(
-                    conversation_id,
-                    message_id,
-                    msg_id,
-                    field_name,
-                    resolved_message_id = %row.id,
-                    "resolved conversation rating message by msg_id fallback"
-                );
-                return Ok(row);
-            }
+        {
+            debug!(
+                conversation_id,
+                message_id,
+                msg_id,
+                field_name,
+                resolved_message_id = %row.id,
+                "resolved conversation rating message by msg_id fallback"
+            );
+            return Ok(row);
         }
 
         Err(ConversationError::MessageNotFound {
@@ -2653,7 +2652,7 @@ impl ConversationService {
             })
             .await?;
 
-        Ok(rating_row_to_response(row)?)
+        rating_row_to_response(row)
     }
 
     /// List artifacts for a conversation with durable status state.
