@@ -16,11 +16,13 @@ use aionui_api_types::{
 };
 use aionui_common::{generate_prefixed_id, now_ms};
 use aionui_db::{
-    AssistantDefinitionRow, AssistantOverlayRow, AssistantRow, AssistantUserOverlayRow, CreateAssistantParams,
-    IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
-    IAssistantPreferenceRepository, IAssistantRepository, IAssistantUserOverlayRepository, IProviderRepository,
-    SqlitePool, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantRow, AssistantUserOverlayRow,
+    CreateAssistantParams, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
+    IAssistantUserOverlayRepository, IProviderRepository, SqliteAgentMetadataRepository, SqlitePool,
+    UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertAssistantUserOverlayParams, resolve_agent_binding,
+    resolve_agent_binding_from_rows,
 };
 use aionui_extension::{AssistantClassifier, AssistantRuleDispatcher, ExtensionError};
 use serde_json;
@@ -704,6 +706,11 @@ impl AssistantService {
 
     async fn list_with_user_overlay(&self, user_id: Option<&str>) -> Result<Vec<AssistantResponse>, AssistantError> {
         let projections = self.reconcile_generated_assistants().await?;
+        let agent_metadata_rows = self.list_agent_metadata_rows().await?;
+        let projection_context = AssistantProjectionContext {
+            agent_rows: &projections,
+            agent_metadata_rows: &agent_metadata_rows,
+        };
         let definitions = self
             .definition_repo
             .list()
@@ -742,7 +749,7 @@ impl AssistantService {
                 user_state_map.get(&definition.id),
             );
             let projection = self
-                .project_definition(definition, effective_state.as_ref(), &projections)
+                .project_definition(definition, effective_state.as_ref(), &projection_context)
                 .await?;
             result.push(self.definition_to_response(definition, effective_state.as_ref(), &projection)?);
         }
@@ -778,6 +785,11 @@ impl AssistantService {
         user_id: Option<&str>,
     ) -> Result<AssistantResponse, AssistantError> {
         let projections = self.reconcile_generated_assistants().await?;
+        let agent_metadata_rows = self.list_agent_metadata_rows().await?;
+        let projection_context = AssistantProjectionContext {
+            agent_rows: &projections,
+            agent_metadata_rows: &agent_metadata_rows,
+        };
         if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
             if generated_definition_is_uninstalled(&definition, &projections) {
                 return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
@@ -789,7 +801,7 @@ impl AssistantService {
             };
             let effective_state = self.effective_state(&definition, state.as_ref(), user_state.as_ref());
             let projection = self
-                .project_definition(&definition, effective_state.as_ref(), &projections)
+                .project_definition(&definition, effective_state.as_ref(), &projection_context)
                 .await?;
             return self.definition_to_response(&definition, effective_state.as_ref(), &projection);
         }
@@ -817,6 +829,11 @@ impl AssistantService {
         user_id: Option<&str>,
     ) -> Result<AssistantDetailResponse, AssistantError> {
         let projections = self.reconcile_generated_assistants().await?;
+        let agent_metadata_rows = self.list_agent_metadata_rows().await?;
+        let projection_context = AssistantProjectionContext {
+            agent_rows: &projections,
+            agent_metadata_rows: &agent_metadata_rows,
+        };
         if let Some(definition) = self.definition_repo.get_by_assistant_id(id).await? {
             if generated_definition_is_uninstalled(&definition, &projections) {
                 return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
@@ -830,7 +847,7 @@ impl AssistantService {
             let preference = self.preference_repo.get(&definition.id).await?;
             let rules_content = self.read_rule(id, locale).await?;
             let projection = self
-                .project_definition(&definition, effective_state.as_ref(), &projections)
+                .project_definition(&definition, effective_state.as_ref(), &projection_context)
                 .await?;
             return self.definition_to_detail_response(
                 &definition,
@@ -842,6 +859,13 @@ impl AssistantService {
         }
 
         Err(AssistantError::NotFound(format!("assistant '{id}' not found")))
+    }
+
+    async fn list_agent_metadata_rows(&self) -> Result<Vec<AgentMetadataRow>, AssistantError> {
+        SqliteAgentMetadataRepository::new(self.pool.clone())
+            .list_all()
+            .await
+            .map_err(|e| AssistantError::Internal(format!("list agent metadata: {e}")))
     }
 
     // -----------------------------------------------------------------------
@@ -911,15 +935,16 @@ impl AssistantService {
         &self,
         definition: &AssistantDefinitionRow,
         state: Option<&AssistantOverlayRow>,
-        agent_rows: &[AgentManagementRow],
+        context: &AssistantProjectionContext<'_>,
     ) -> Result<AssistantRuntimeProjection, AssistantError> {
         let effective_agent_id = effective_agent_id_for_definition(definition, state);
-        let runtime_backend = resolve_runtime_backend_from_management_rows(agent_rows, effective_agent_id);
+        let runtime_agent = resolve_runtime_agent(context, effective_agent_id);
         Ok(assistant_projection_for_definition(
             definition,
             state,
-            agent_rows,
-            runtime_backend.as_deref(),
+            context.agent_rows,
+            runtime_agent.as_ref().map(|agent| agent.agent_id.as_str()),
+            runtime_agent.as_ref().map(|agent| agent.runtime_backend.as_str()),
         ))
     }
 
@@ -2470,10 +2495,16 @@ struct AssistantRuntimeProjection {
     deletable: bool,
 }
 
+struct AssistantProjectionContext<'a> {
+    agent_rows: &'a [AgentManagementRow],
+    agent_metadata_rows: &'a [AgentMetadataRow],
+}
+
 fn assistant_projection_for_definition(
     definition: &AssistantDefinitionRow,
     state: Option<&AssistantOverlayRow>,
     agent_rows: &[AgentManagementRow],
+    resolved_agent_id: Option<&str>,
     resolved_runtime_backend: Option<&str>,
 ) -> AssistantRuntimeProjection {
     let enabled = state.is_none_or(|row| row.enabled);
@@ -2490,7 +2521,8 @@ fn assistant_projection_for_definition(
     // keyed by its `agent_type` ("aionrs") instead. Match on either so aionrs
     // assistants resolve to the aionrs row rather than falling back to Missing.
     let row_matches_backend = |row: &&AgentManagementRow| {
-        row.backend.as_deref() == Some(effective_agent_id)
+        Some(row.id.as_str()) == resolved_agent_id
+            || row.backend.as_deref() == Some(effective_agent_id)
             || row.agent_type.serde_name() == effective_agent_id
             || row.backend.as_deref() == Some(fallback_runtime_backend)
             || row.agent_type.serde_name() == fallback_runtime_backend
@@ -2567,26 +2599,46 @@ fn assistant_projection_for_definition(
     }
 }
 
-fn resolve_runtime_backend_from_management_rows(rows: &[AgentManagementRow], value: &str) -> Option<String> {
+struct ResolvedRuntimeAgent {
+    agent_id: String,
+    runtime_backend: String,
+}
+
+fn resolve_runtime_agent(context: &AssistantProjectionContext<'_>, value: &str) -> Option<ResolvedRuntimeAgent> {
     let value = value.trim();
     if value.is_empty() {
         return None;
     }
 
-    rows.iter()
+    context
+        .agent_rows
+        .iter()
         .filter(|row| row.id == value)
         .min_by_key(|row| agent_management_match_rank(row))
         .or_else(|| {
-            rows.iter()
+            context
+                .agent_rows
+                .iter()
                 .filter(|row| row.backend.as_deref() == Some(value))
                 .min_by_key(|row| agent_management_match_rank(row))
         })
         .or_else(|| {
-            rows.iter()
+            context
+                .agent_rows
+                .iter()
                 .filter(|row| row.agent_type.serde_name() == value)
                 .min_by_key(|row| agent_management_match_rank(row))
         })
-        .map(runtime_backend_for_management_row)
+        .map(|row| ResolvedRuntimeAgent {
+            agent_id: row.id.clone(),
+            runtime_backend: runtime_backend_for_management_row(row),
+        })
+        .or_else(|| {
+            resolve_agent_binding_from_rows(context.agent_metadata_rows, value).map(|binding| ResolvedRuntimeAgent {
+                agent_id: binding.agent_id,
+                runtime_backend: binding.runtime_backend,
+            })
+        })
 }
 
 fn runtime_backend_for_management_row(row: &AgentManagementRow) -> String {
