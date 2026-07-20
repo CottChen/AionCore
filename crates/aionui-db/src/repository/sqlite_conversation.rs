@@ -32,7 +32,16 @@ impl SqliteConversationRepository {
         }
 
         let placeholders = vec!["?"; conversation_ids.len()].join(",");
-        let sql = format!("SELECT * FROM conversation_assistant_snapshots WHERE conversation_id IN ({placeholders})");
+        let sql = format!(
+            "SELECT \
+                conversation_id, assistant_definition_id, assistant_id, assistant_source, agent_id, \
+                '' AS rules_content, \
+                default_model_mode, resolved_model_id, default_permission_mode, resolved_permission_value, \
+                default_thought_level_mode, resolved_thought_level_value, default_skills_mode, resolved_skill_ids, \
+                resolved_disabled_builtin_skill_ids, default_mcps_mode, resolved_mcp_ids, created_at, updated_at \
+             FROM conversation_assistant_snapshots \
+             WHERE conversation_id IN ({placeholders})"
+        );
         let mut query = sqlx::query_as::<_, ConversationAssistantSnapshotRow>(&sql);
         for conversation_id in conversation_ids {
             query = query.bind(conversation_id);
@@ -1256,9 +1265,11 @@ mod tests {
         repo.create(&conv_a).await.unwrap();
         repo.create(&conv_b).await.unwrap();
         repo.create(&conv_c).await.unwrap();
-        repo.upsert_assistant_snapshot(&snapshot_params(&conv_a.id, "asstdef_batch", "assistant_batch"))
-            .await
-            .unwrap();
+        let snapshot_a = UpsertConversationAssistantSnapshotParams {
+            rules_content: "large rules body should not be loaded by list",
+            ..snapshot_params(&conv_a.id, "asstdef_batch", "assistant_batch")
+        };
+        repo.upsert_assistant_snapshot(&snapshot_a).await.unwrap();
         repo.upsert_assistant_snapshot(&snapshot_params(&conv_b.id, "asstdef_batch", "assistant_batch"))
             .await
             .unwrap();
@@ -1270,6 +1281,15 @@ mod tests {
             .list_assistant_snapshots(&[conv_a.id.clone(), conv_c.id.clone(), "missing".to_string()])
             .await
             .unwrap();
+        let listed_a = snapshots
+            .iter()
+            .find(|snapshot| snapshot.conversation_id == conv_a.id)
+            .unwrap();
+        assert!(listed_a.rules_content.is_empty());
+
+        let full_a = repo.get_assistant_snapshot(&conv_a.id).await.unwrap().unwrap();
+        assert_eq!(full_a.rules_content, "large rules body should not be loaded by list");
+
         let ids: std::collections::HashSet<_> =
             snapshots.into_iter().map(|snapshot| snapshot.conversation_id).collect();
 
