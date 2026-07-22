@@ -117,8 +117,8 @@ dependencies = [
 
 [[package]]
 name = "aion-agent"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-compact",
  "aion-config",
@@ -148,8 +148,8 @@ dependencies = [
 
 [[package]]
 name = "aion-compact"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "regex",
  "serde",
@@ -160,8 +160,8 @@ dependencies = [
 
 [[package]]
 name = "aion-config"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-compact",
  "aion-process",
@@ -185,8 +185,8 @@ dependencies = [
 
 [[package]]
 name = "aion-mcp"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-config",
  "aion-protocol",
@@ -206,8 +206,8 @@ dependencies = [
 
 [[package]]
 name = "aion-memory"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-config",
  "chrono",
@@ -220,8 +220,8 @@ dependencies = [
 
 [[package]]
 name = "aion-process"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "libc",
  "tokio",
@@ -231,8 +231,8 @@ dependencies = [
 
 [[package]]
 name = "aion-protocol"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-types",
  "serde",
@@ -244,8 +244,8 @@ dependencies = [
 
 [[package]]
 name = "aion-providers"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-config",
  "aion-types",
@@ -272,8 +272,8 @@ dependencies = [
 
 [[package]]
 name = "aion-skills"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-config",
  "aion-mcp",
@@ -299,8 +299,8 @@ dependencies = [
 
 [[package]]
 name = "aion-tools"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "aion-config",
  "aion-process",
@@ -308,6 +308,7 @@ dependencies = [
  "aion-types",
  "anyhow",
  "async-trait",
+ "base64",
  "futures",
  "glob",
  "lru",
@@ -320,10 +321,11 @@ dependencies = [
 
 [[package]]
 name = "aion-types"
-version = "0.2.3"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+version = "0.2.6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "serde",
  "serde_json",
@@ -332,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-ai-agent"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "agent-client-protocol",
  "aion-agent",
@@ -360,6 +362,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "hex",
+ "http 1.4.0",
  "libc",
  "regex",
  "rusqlite",
@@ -380,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-api-types"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-common",
  "serde",
@@ -389,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-app"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -443,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assets"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-common",
  "axum",
@@ -458,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-assistant"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -484,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-auth"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -508,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-channel"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -539,7 +542,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-common"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -556,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-conversation"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -584,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-cron"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-ai-agent",
  "aionui-api-types",
@@ -611,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-db"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-common",
  "async-trait",
@@ -627,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-extension"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -659,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-file"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -687,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-mcp"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -714,7 +717,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-office"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -740,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-realtime"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-api-types",
  "axum",
@@ -755,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-runtime"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "dirs",
  "flate2",
@@ -777,12 +780,11 @@ dependencies = [
  "walkdir",
  "which 7.0.3",
  "zip 2.4.2",
- "zstd",
 ]
 
 [[package]]
 name = "aionui-shell"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-api-types",
  "aionui-common",
@@ -813,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "aionui-system"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "aionui-api-types",
  "aionui-auth",
@@ -837,12 +839,13 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 
 [[package]]
 name = "aionui-team"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "agent-client-protocol",
  "aionui-ai-agent",
@@ -869,8 +872,9 @@ dependencies = [
 
 [[package]]
 name = "aionui-team-prompts"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
+ "aionui-api-types",
  "serde",
  "serde_json",
 ]
@@ -6106,7 +6110,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -6549,7 +6553,7 @@ dependencies = [
 [[package]]
 name = "workspace-hack"
 version = "0.1.0"
-source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.3#e884400a8d8629f22531f132facd6dca195701c6"
+source = "git+https://github.com/iOfficeAI/aionrs.git?tag=v0.2.6#3cb928d451f278e3f88a9664c39ea3db5d13129a"
 dependencies = [
  "bitflags",
  "cc",

@@ -1708,7 +1708,7 @@ async fn teammate_first_wake_uses_canonical_prompt_at_service_boundary() {
             "user1",
             CreateTeamRequest {
                 name: "Recover Teammate".into(),
-                agents: two_agent_input(),
+                agents: aionrs_two_agent_input(),
                 workspace: None,
             },
         )
@@ -1960,8 +1960,6 @@ fn word_creator_definition() -> AssistantDefinitionRow {
         source: "builtin".into(),
         owner_type: "system".into(),
         source_ref: Some("word-creator".into()),
-        source_version: None,
-        source_hash: None,
         name: "Word Creator".into(),
         name_i18n: "{}".into(),
         description: Some("Drafts Word documents".into()),
@@ -1969,9 +1967,8 @@ fn word_creator_definition() -> AssistantDefinitionRow {
         avatar_type: "builtin_asset".into(),
         avatar_value: None,
         agent_id: "claude".into(),
-        rule_resource_type: "inline".into(),
+        rule_resource_type: "none".into(),
         rule_resource_ref: None,
-        rule_inline_content: None,
         recommended_prompts: "[]".into(),
         recommended_prompts_i18n: "{}".into(),
         default_model_mode: "auto".into(),
@@ -2018,6 +2015,16 @@ fn two_agent_input() -> Vec<TeamAgentInput> {
             conversation_id: None,
         },
     ]
+}
+
+fn aionrs_two_agent_input() -> Vec<TeamAgentInput> {
+    two_agent_input()
+        .into_iter()
+        .map(|mut agent| {
+            agent.backend = Some("aionrs".into());
+            agent
+        })
+        .collect()
 }
 
 fn team_agent_input(name: &str, role: &str, model: &str) -> TeamAgentInput {
@@ -2358,8 +2365,6 @@ async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
             source: "builtin".into(),
             owner_type: "system".into(),
             source_ref: Some("assistant-lead".into()),
-            source_version: None,
-            source_hash: None,
             name: "Lead Assistant".into(),
             name_i18n: "{}".into(),
             description: None,
@@ -2367,9 +2372,8 @@ async fn tc_create_team_prefers_assistant_avatar_over_backend_logo() {
             avatar_type: "builtin_asset".into(),
             avatar_value: Some("avatars/assistant-lead.png".into()),
             agent_id: "claude".into(),
-            rule_resource_type: "inline".into(),
+            rule_resource_type: "none".into(),
             rule_resource_ref: None,
-            rule_inline_content: None,
             recommended_prompts: "[]".into(),
             recommended_prompts_i18n: "{}".into(),
             default_model_mode: "auto".into(),
@@ -2433,8 +2437,6 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
             source: "user".into(),
             owner_type: "user".into(),
             source_ref: None,
-            source_version: None,
-            source_hash: None,
             name: "Lead Assistant".into(),
             name_i18n: "{}".into(),
             description: None,
@@ -2442,9 +2444,8 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
             avatar_type: "emoji".into(),
             avatar_value: Some("🤖".into()),
             agent_id: "claude".into(),
-            rule_resource_type: "inline".into(),
+            rule_resource_type: "user_file".into(),
             rule_resource_ref: None,
-            rule_inline_content: None,
             recommended_prompts: "[]".into(),
             recommended_prompts_i18n: "{}".into(),
             default_model_mode: "auto".into(),
@@ -2513,8 +2514,6 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
             source: "user".into(),
             owner_type: "user".into(),
             source_ref: None,
-            source_version: None,
-            source_hash: None,
             name: "Lead Assistant".into(),
             name_i18n: "{}".into(),
             description: None,
@@ -2522,9 +2521,8 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
             avatar_type: "emoji".into(),
             avatar_value: Some("🤖".into()),
             agent_id: "claude".into(),
-            rule_resource_type: "inline".into(),
+            rule_resource_type: "user_file".into(),
             rule_resource_ref: None,
-            rule_inline_content: None,
             recommended_prompts: "[]".into(),
             recommended_prompts_i18n: "{}".into(),
             default_model_mode: "auto".into(),
@@ -2604,8 +2602,6 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
             source: "user".into(),
             owner_type: "user".into(),
             source_ref: None,
-            source_version: None,
-            source_hash: None,
             name: "Lead Assistant".into(),
             name_i18n: "{}".into(),
             description: None,
@@ -2613,9 +2609,8 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
             avatar_type: "emoji".into(),
             avatar_value: Some("🤖".into()),
             agent_id: "claude".into(),
-            rule_resource_type: "inline".into(),
+            rule_resource_type: "user_file".into(),
             rule_resource_ref: None,
-            rule_inline_content: None,
             recommended_prompts: "[]".into(),
             recommended_prompts_i18n: "{}".into(),
             default_model_mode: "auto".into(),
@@ -2855,8 +2850,6 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
             source: "user".into(),
             owner_type: "user".into(),
             source_ref: None,
-            source_version: None,
-            source_hash: None,
             name: "Worker Assistant".into(),
             name_i18n: "{}".into(),
             description: None,
@@ -2864,9 +2857,8 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
             avatar_type: "emoji".into(),
             avatar_value: Some("🤖".into()),
             agent_id: "claude".into(),
-            rule_resource_type: "inline".into(),
+            rule_resource_type: "user_file".into(),
             rule_resource_ref: None,
-            rule_inline_content: None,
             recommended_prompts: "[]".into(),
             recommended_prompts_i18n: "{}".into(),
             default_model_mode: "auto".into(),
@@ -2954,8 +2946,6 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
             source: "user".into(),
             owner_type: "user".into(),
             source_ref: None,
-            source_version: None,
-            source_hash: None,
             name: "Worker Assistant".into(),
             name_i18n: "{}".into(),
             description: None,
@@ -2963,9 +2953,8 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
             avatar_type: "emoji".into(),
             avatar_value: Some("🤖".into()),
             agent_id: "claude".into(),
-            rule_resource_type: "inline".into(),
+            rule_resource_type: "user_file".into(),
             rule_resource_ref: None,
-            rule_inline_content: None,
             recommended_prompts: "[]".into(),
             recommended_prompts_i18n: "{}".into(),
             default_model_mode: "auto".into(),
@@ -4760,8 +4749,6 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
             source: "user".into(),
             owner_type: "user".into(),
             source_ref: None,
-            source_version: None,
-            source_hash: None,
             name: "Worker Assistant".into(),
             name_i18n: "{}".into(),
             description: None,
@@ -4769,9 +4756,8 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
             avatar_type: "emoji".into(),
             avatar_value: Some("🤖".into()),
             agent_id: "claude".into(),
-            rule_resource_type: "inline".into(),
+            rule_resource_type: "user_file".into(),
             rule_resource_ref: None,
-            rule_inline_content: None,
             recommended_prompts: "[]".into(),
             recommended_prompts_i18n: "{}".into(),
             default_model_mode: "auto".into(),
@@ -4957,7 +4943,7 @@ async fn lead_send_agent_message_in_session_requires_active_team_run() {
         .expect("seeded teammate slot");
 
     let err = svc
-        .send_agent_message_from_agent(&created.id, &lead_slot_id, &worker_slot_id, "Do this")
+        .send_agent_message_from_agent(&created.id, &lead_slot_id, &worker_slot_id, "Do this", None)
         .await
         .expect_err("leader direct message should require active Team Run");
     assert!(err.to_string().contains("no active team run"));
@@ -5616,7 +5602,7 @@ async fn d9_ensure_session_persists_team_mcp_stdio_config() {
             "user1",
             CreateTeamRequest {
                 name: "T".into(),
-                agents: two_agent_input(),
+                agents: aionrs_two_agent_input(),
                 workspace: None,
             },
         )

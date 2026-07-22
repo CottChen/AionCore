@@ -7,6 +7,7 @@ use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{
     ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
+    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
@@ -53,7 +54,7 @@ use crate::convert::{
     row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
 use crate::error::ConversationError;
-use crate::session_context::SessionContextBuilder;
+use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
@@ -336,6 +337,7 @@ pub struct ConversationService {
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
+    runtime_token_service: Option<Arc<RuntimeTokenService>>,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -410,6 +412,7 @@ impl ConversationService {
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
+            runtime_token_service: None,
 
             conversation_repo,
             agent_metadata_repo,
@@ -425,6 +428,11 @@ impl ConversationService {
     pub fn with_runtime_helper_context(mut self, helper_bin: String, base_url: String) -> Self {
         self.runtime_helper_bin = Some(helper_bin);
         self.runtime_base_url = Some(base_url);
+        self
+    }
+
+    pub fn with_runtime_token_service(mut self, runtime_token_service: Arc<RuntimeTokenService>) -> Self {
+        self.runtime_token_service = Some(runtime_token_service);
         self
     }
 
@@ -3530,6 +3538,34 @@ pub(crate) fn agent_error_top_level_code(error: &AgentError) -> &'static str {
 }
 
 impl ConversationService {
+    /// Loads the persisted runtime permission gate inputs for an aionrs
+    /// rebuild. Returns `None` for non-aionrs conversations and for aionrs
+    /// conversations without a persisted assistant snapshot (assistant-less
+    /// sessions are out of scope — spec §5). This is the only place a
+    /// `conversation_repo` handle is needed, so the seed is computed here and
+    /// threaded into `SessionContextBuilder` (spec §7.3, A-2).
+    async fn load_aionrs_permission_seed(
+        &self,
+        row: &aionui_db::models::ConversationRow,
+    ) -> Result<Option<AionrsRuntimePermissionSeed>, ConversationError> {
+        if row.r#type != AgentType::Aionrs.serde_name() {
+            return Ok(None);
+        }
+        let snapshot = self
+            .conversation_repo
+            .get_assistant_snapshot(&row.id)
+            .await
+            .map_err(|e| {
+                ConversationError::internal(format!(
+                    "Failed to load assistant snapshot for aionrs permission seed: {e}"
+                ))
+            })?;
+        Ok(snapshot.map(|snapshot| AionrsRuntimePermissionSeed {
+            default_permission_mode: snapshot.default_permission_mode,
+            resolved_permission_value: snapshot.resolved_permission_value,
+        }))
+    }
+
     /// Build typed agent runtime context from a conversation database row.
     ///
     /// Raw `conversation.extra` parsing lives in [`SessionContextBuilder`]
@@ -3540,8 +3576,9 @@ impl ConversationService {
         row: &aionui_db::models::ConversationRow,
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
+        let seed = self.load_aionrs_permission_seed(row).await?;
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options(row)
+            .build_options(row, seed)
             .await
     }
 
@@ -3551,8 +3588,9 @@ impl ConversationService {
         workspace_override: Option<&str>,
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
+        let seed = self.load_aionrs_permission_seed(row).await?;
         SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options_with_workspace_override(row, workspace_override)
+            .build_options_with_workspace_override(row, workspace_override, seed)
             .await
     }
 
@@ -3562,12 +3600,31 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
     ) {
+        let runtime_token = self.runtime_token_for_build(build_opts, user_id, conversation_id);
         build_opts.apply_conversation_runtime_context(
             user_id,
             conversation_id,
             self.runtime_helper_bin.as_deref(),
             self.runtime_base_url.as_deref(),
+            runtime_token.as_deref(),
         );
+    }
+
+    fn runtime_token_for_build(
+        &self,
+        build_opts: &BuildTaskOptions,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Option<String> {
+        build_opts.context.team.as_ref()?;
+        let service = self.runtime_token_service.as_ref()?;
+        let issue = service.issue(
+            user_id,
+            conversation_id,
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            [RuntimeTokenScope::TeamContext, RuntimeTokenScope::TeamCall],
+        );
+        Some(issue.token)
     }
 
     /// Ensure native skill links exist in the runtime workspace. Auto

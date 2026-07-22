@@ -10,8 +10,9 @@ use std::time::Instant;
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::{
     AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionPhase, TeamSessionStatus,
-    TeamSessionStatusPayload, WebSocketMessage,
+    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
+    TeamSessionStatusPayload, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
+    TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -37,6 +38,9 @@ use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogPort};
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
+use crate::runtime_tools::{
+    ResolvedTeamToolContext, agent_for_conversation, error_payload, execute_with_scheduler, role_to_tool_role,
+};
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
 use crate::team_run::TeamRunManager;
 use crate::types::{Team, TeamAgent, TeammateRole};
@@ -1722,6 +1726,109 @@ impl TeamSessionService {
         self.sessions.get(team_id).map(|e| e.session.scheduler().clone())
     }
 
+    pub async fn resolve_team_tool_context(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ResolvedTeamToolContext, TeamToolErrorPayload> {
+        let Some(binding_lookup) = self
+            .conversation_port
+            .lookup_team_binding_by_conversation(conversation_id)
+            .await
+            .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?
+        else {
+            return Err(error_payload(
+                TeamToolErrorCode::ConversationNotFound,
+                "conversation not found",
+            ));
+        };
+
+        if binding_lookup.user_id != user_id {
+            return Err(error_payload(
+                TeamToolErrorCode::PermissionDenied,
+                "conversation does not belong to user",
+            ));
+        }
+
+        let Some(team_id) = binding_lookup.team_id.clone() else {
+            return Ok(ResolvedTeamToolContext {
+                response: TeamToolContextResponse {
+                    in_team: false,
+                    conversation_id: conversation_id.to_owned(),
+                    team_id: None,
+                    team_name: None,
+                    slot_id: None,
+                    role: None,
+                    agent_name: None,
+                    transport: None,
+                    allowed_tools: Vec::new(),
+                },
+                context: None,
+            });
+        };
+
+        let team_row = self
+            .repo
+            .get_team(&team_id)
+            .await
+            .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?
+            .ok_or_else(|| error_payload(TeamToolErrorCode::TeamNotFound, "team not found"))?;
+        if team_row.user_id != user_id {
+            return Err(error_payload(
+                TeamToolErrorCode::PermissionDenied,
+                "team does not belong to user",
+            ));
+        }
+
+        let binding = TeamSessionBinding {
+            team_id: team_id.clone(),
+            slot_id: binding_lookup.slot_id,
+            role: binding_lookup.role,
+            runtime_seed: Default::default(),
+            mcp: None,
+        };
+        let agents: Vec<crate::types::TeamAgent> = serde_json::from_str(&team_row.agents)
+            .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?;
+        let agent = agent_for_conversation(&agents, conversation_id, &binding)?;
+        let context = crate::tool_executor::TeamToolContext {
+            team_id: team_id.clone(),
+            caller_slot_id: agent.slot_id.clone(),
+            caller_role: agent.role,
+            user_id: Some(user_id.to_owned()),
+            conversation_id: Some(conversation_id.to_owned()),
+            transport: TeamToolTransport::CliAssumed,
+        };
+        let allowed_tools = aionui_api_types::team_tool_descriptors_for_role(role_to_tool_role(agent.role))
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect::<Vec<_>>();
+        Ok(ResolvedTeamToolContext {
+            response: TeamToolContextResponse {
+                in_team: true,
+                conversation_id: conversation_id.to_owned(),
+                team_id: Some(team_id),
+                team_name: Some(team_row.name),
+                slot_id: Some(agent.slot_id.clone()),
+                role: Some(role_to_tool_role(agent.role)),
+                agent_name: Some(agent.name.clone()),
+                transport: Some(TeamToolTransport::CliAssumed),
+                allowed_tools,
+            },
+            context: Some(context),
+        })
+    }
+
+    pub async fn execute_team_tool(
+        &self,
+        context: &crate::tool_executor::TeamToolContext,
+        call: TeamToolCall,
+    ) -> Result<serde_json::Value, TeamToolErrorPayload> {
+        let scheduler = self
+            .get_session_scheduler(&context.team_id)
+            .ok_or_else(|| error_payload(TeamToolErrorCode::TeamNotFound, "active team session not found"))?;
+        execute_with_scheduler(&scheduler, &self.self_ref, context, call).await
+    }
+
     #[cfg(test)]
     fn session_has_slow_monitor(&self, team_id: &str) -> bool {
         self.sessions
@@ -1821,6 +1928,8 @@ impl TeamSessionService {
                 member_count = agents.len(),
                 "team idle cleanup stopping idle team session"
             );
+            info!(team_id, reason = "idle_cleanup", "broadcasting team session stopped");
+            self.broadcast_session_status(&team_id, TeamSessionStatus::Stopped, None, |_| {});
             self.stop_session_unchecked(&team_id);
             for agent in agents {
                 self.task_manager
@@ -1984,6 +2093,7 @@ impl TeamSessionService {
         from_slot_id: &str,
         to_slot_id: &str,
         content: &str,
+        files: Option<Vec<String>>,
     ) -> Result<AgentMessageQueueResult, TeamError> {
         self.require_active_team_run_for_team_work(team_id).await?;
         let session = {
@@ -1994,7 +2104,7 @@ impl TeamSessionService {
             Arc::clone(&entry.session)
         };
         session
-            .send_agent_message_from_agent(from_slot_id, to_slot_id, content)
+            .send_agent_message_from_agent(from_slot_id, to_slot_id, content, files)
             .await
     }
 
@@ -2568,6 +2678,76 @@ mod tests {
         assert!(unhandled.is_empty());
         assert_eq!(svc.session_count_for_test(), 0);
         assert_eq!(task_manager.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_cleanup_broadcasts_team_session_stopped() {
+        let task_manager = Arc::new(MutableTaskManager::new());
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_broadcaster_and_task_manager(task_manager.clone());
+        let created = svc
+            .create_team("user-test", two_agent_team_request("Idle Cleanup Stopped Broadcast"))
+            .await
+            .unwrap();
+        let lead = created.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+        let worker = created
+            .assistants
+            .iter()
+            .find(|agent| agent.role == "teammate")
+            .unwrap();
+        task_manager.insert_idle_finished_agent(&lead.conversation_id);
+        task_manager.insert_idle_finished_agent(&worker.conversation_id);
+
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+
+        let unhandled = svc
+            .cleanup_idle_team_runtime_tasks(vec![lead.conversation_id.clone()], &ActiveLeaseRegistry::new(), 300_000)
+            .await;
+
+        assert!(unhandled.is_empty());
+        assert_eq!(svc.session_count_for_test(), 0);
+        assert_eq!(task_manager.active_count(), 0);
+
+        let stopped_events: Vec<_> = broadcaster
+            .events_by_name("team.sessionStatusChanged")
+            .into_iter()
+            .filter(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("stopped"))
+            .collect();
+        assert_eq!(
+            stopped_events.len(),
+            1,
+            "idle cleanup must broadcast exactly one stopped status"
+        );
+        assert_eq!(
+            stopped_events[0]
+                .data
+                .get("team_id")
+                .and_then(serde_json::Value::as_str),
+            Some(created.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_session_does_not_broadcast_team_session_stopped() {
+        let (svc, _repo, _task_manager, _conv_repo, broadcaster) =
+            setup_with_factory_metadata_team_repo_conversation_repo_and_broadcaster();
+        let created = svc
+            .create_team(
+                "user-test",
+                single_agent_team_request("Explicit Stop No Stopped Broadcast"),
+            )
+            .await
+            .unwrap();
+        svc.ensure_session("user-test", &created.id).await.unwrap();
+
+        svc.stop_session("user-test", &created.id).await.unwrap();
+
+        let stopped_count = broadcaster
+            .events_by_name("team.sessionStatusChanged")
+            .into_iter()
+            .filter(|event| event.data.get("status").and_then(serde_json::Value::as_str) == Some("stopped"))
+            .count();
+        assert_eq!(stopped_count, 0, "explicit stop must not broadcast a stopped status");
     }
 
     #[test]
