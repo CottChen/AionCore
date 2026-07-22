@@ -451,7 +451,7 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
                 default_skills_mode, default_skill_ids, custom_skill_names, default_disabled_builtin_skill_ids,
                 default_mcps_mode, default_mcp_ids,
                 created_at, updated_at, deleted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             ON CONFLICT(id) DO UPDATE SET
                 assistant_id = excluded.assistant_id,
                 source = excluded.source,
