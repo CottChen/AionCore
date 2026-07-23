@@ -17,7 +17,7 @@ use crate::types::{FileWatchEvent, OfficeFileAddedEvent};
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(200);
 
 /// Office file extensions to match (lowercase).
-const OFFICE_EXTENSIONS: &[&str] = &["pptx", "docx", "xlsx"];
+const OFFICE_EXTENSIONS: &[&str] = &["pptx", "docx", "xlsx", "csv"];
 
 // ---------------------------------------------------------------------------
 // Pure helpers (testable without I/O)
@@ -67,7 +67,7 @@ fn should_emit(debounce: &DashMap<String, Instant>, key: &str) -> bool {
 /// - **Single-file watches** share one [`RecommendedWatcher`] instance; each
 ///   path is registered via `watch()` with [`RecursiveMode::NonRecursive`].
 /// - **Workspace Office watches** each get their own watcher running in
-///   [`RecursiveMode::Recursive`], filtering for `.pptx`/`.docx`/`.xlsx`
+///   [`RecursiveMode::Recursive`], filtering for `.pptx`/`.docx`/`.xlsx`/`.csv`
 ///   creation events.
 pub struct FileWatchService {
     broadcaster: Arc<dyn EventBroadcaster>,
@@ -292,6 +292,11 @@ mod tests {
     #[test]
     fn office_file_xlsx() {
         assert!(is_office_file(Path::new("/ws/data.xlsx")));
+    }
+
+    #[test]
+    fn office_file_csv() {
+        assert!(is_office_file(Path::new("/ws/data.csv")));
     }
 
     #[test]

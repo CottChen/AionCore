@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aionui_api_types::{PreviewState, PreviewStatusEvent, WebSocketMessage};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::Builder as CmdBuilder;
 use dashmap::DashMap;
+use sha1::{Digest, Sha1};
 use tokio::sync::Mutex;
 
 use crate::error::OfficeError;
@@ -282,6 +283,7 @@ impl DefaultProcessSpawner {
 
 struct TokioProcessHandle {
     child: Mutex<Option<tokio::process::Child>>,
+    cleanup_paths: Vec<PathBuf>,
 }
 
 impl ProcessHandle for TokioProcessHandle {
@@ -292,6 +294,7 @@ impl ProcessHandle for TokioProcessHandle {
             }
             *guard = None;
         }
+        cleanup_temp_paths(&self.cleanup_paths);
     }
 
     fn is_alive(&self) -> bool {
@@ -304,38 +307,58 @@ impl ProcessHandle for TokioProcessHandle {
     }
 }
 
+impl Drop for TokioProcessHandle {
+    fn drop(&mut self) {
+        cleanup_temp_paths(&self.cleanup_paths);
+    }
+}
+
 #[async_trait::async_trait]
 impl ProcessSpawner for DefaultProcessSpawner {
     async fn spawn_officecli(
         &self,
         file_path: &str,
         port: u16,
-        _doc_type: DocType,
+        doc_type: DocType,
     ) -> Result<Box<dyn ProcessHandle>, OfficeError> {
         let officecli = resolve_officecli_path().ok_or(OfficeError::OfficecliNotFound)?;
         if !officecli_supports_watch(&officecli).await {
             return Err(OfficeError::OfficecliNotFound);
         }
 
+        let mut cleanup_paths = Vec::new();
+        let watch_file_path = if doc_type == DocType::Excel && is_csv_file_path(Path::new(file_path)) {
+            let workbook_path = prepare_csv_preview_workbook(&officecli, Path::new(file_path), &self._data_dir).await?;
+            cleanup_paths.push(workbook_path.clone());
+            workbook_path
+        } else {
+            PathBuf::from(file_path)
+        };
+
         let mut builder = CmdBuilder::new(&officecli);
         builder
             .arg("watch")
-            .arg(file_path)
+            .arg(&watch_file_path)
             .arg("--port")
             .arg(port.to_string())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let child = builder.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                OfficeError::OfficecliNotFound
-            } else {
-                OfficeError::StartFailed(e.to_string())
+        let child = match builder.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                cleanup_temp_paths(&cleanup_paths);
+                return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                    OfficeError::OfficecliNotFound
+                } else {
+                    OfficeError::StartFailed(e.to_string())
+                });
             }
-        })?;
+        };
 
         Ok(Box::new(TokioProcessHandle {
             child: Mutex::new(Some(child)),
+            cleanup_paths,
         }))
     }
 
@@ -422,6 +445,146 @@ fn resolve_path(file_path: &str) -> Result<String, OfficeError> {
     let path = Path::new(file_path);
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     Ok(resolved.to_string_lossy().into_owned())
+}
+
+fn is_csv_file_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("csv"))
+}
+
+async fn prepare_csv_preview_workbook(
+    officecli: &Path,
+    source_path: &Path,
+    data_dir: &Path,
+) -> Result<PathBuf, OfficeError> {
+    let target_path = csv_preview_workbook_path(source_path, data_dir);
+    if let Some(parent) = target_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let result = async {
+        run_officecli_checked(
+            officecli,
+            [
+                "create".into(),
+                target_path.to_string_lossy().into_owned(),
+                "--type".into(),
+                "xlsx".into(),
+            ],
+            "create csv preview workbook",
+        )
+        .await?;
+
+        run_officecli_checked(
+            officecli,
+            [
+                "import".into(),
+                target_path.to_string_lossy().into_owned(),
+                "/Sheet1".into(),
+                source_path.to_string_lossy().into_owned(),
+                "--format".into(),
+                "csv".into(),
+            ],
+            "import csv preview workbook",
+        )
+        .await?;
+
+        Ok::<(), OfficeError>(())
+    }
+    .await;
+
+    if let Err(error) = result {
+        cleanup_temp_paths(std::slice::from_ref(&target_path));
+        return Err(error);
+    }
+
+    if let Err(error) = run_officecli_checked(
+        officecli,
+        ["close".into(), target_path.to_string_lossy().into_owned()],
+        "close csv preview workbook",
+    )
+    .await
+    {
+        tracing::debug!(error = %error, "failed to close temporary csv preview workbook resident");
+    }
+
+    Ok(target_path)
+}
+
+fn csv_preview_workbook_path(source_path: &Path, data_dir: &Path) -> PathBuf {
+    let stem = source_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(sanitize_preview_stem)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "csv".to_owned());
+
+    let mut hasher = Sha1::new();
+    hasher.update(source_path.to_string_lossy().as_bytes());
+    if let Ok(metadata) = std::fs::metadata(source_path) {
+        hasher.update(metadata.len().to_le_bytes());
+        if let Ok(modified) = metadata.modified().and_then(|time| {
+            time.duration_since(UNIX_EPOCH)
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        }) {
+            hasher.update(modified.as_nanos().to_le_bytes());
+        }
+    }
+    hasher.update(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    let digest = format!("{:x}", hasher.finalize());
+
+    data_dir
+        .join("office-preview")
+        .join("csv")
+        .join(format!("{stem}-{}.xlsx", &digest[..12]))
+}
+
+fn sanitize_preview_stem(stem: &str) -> String {
+    stem.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+async fn run_officecli_checked<I>(officecli: &Path, args: I, label: &str) -> Result<(), OfficeError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut builder = CmdBuilder::clean_cli(officecli);
+    builder.args(args);
+    let output = builder
+        .output()
+        .await
+        .map_err(|error| OfficeError::StartFailed(format!("{label} failed to spawn: {error}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(OfficeError::StartFailed(format!("{label} failed: {stderr}")));
+    }
+
+    Ok(())
+}
+
+fn cleanup_temp_paths(paths: &[PathBuf]) {
+    for path in paths {
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(path = %path.display(), error = %error, "failed to remove temporary office preview file");
+        }
+    }
 }
 
 fn session_key(resolved_path: &str, doc_type: DocType) -> String {
@@ -639,6 +802,109 @@ mod tests {
             "mock spawn failure".into()
         )));
         assert!(!is_port_in_use_start_failure(&OfficeError::OfficecliNotFound));
+    }
+
+    #[test]
+    fn csv_detection_is_case_insensitive() {
+        assert!(is_csv_file_path(Path::new("/tmp/data.csv")));
+        assert!(is_csv_file_path(Path::new("/tmp/data.CSV")));
+        assert!(!is_csv_file_path(Path::new("/tmp/data.xlsx")));
+    }
+
+    #[test]
+    fn csv_preview_path_uses_xlsx_extension_under_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("My Report.csv");
+        std::fs::write(&source, b"a,b\n1,2\n").unwrap();
+
+        let target = csv_preview_workbook_path(&source, dir.path());
+
+        assert!(target.starts_with(dir.path().join("office-preview").join("csv")));
+        assert_eq!(target.extension().and_then(|value| value.to_str()), Some("xlsx"));
+        assert!(target.file_name().unwrap().to_string_lossy().starts_with("My_Report-"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_csv_preview_workbook_uses_officecli_create_import_and_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let officecli = dir.path().join("officecli");
+        std::fs::write(
+            &officecli,
+            r#"#!/bin/sh
+cmd="$1"
+target="$2"
+if [ "$cmd" = "create" ]; then
+  printf 'created\n' > "$target"
+  exit 0
+fi
+if [ "$cmd" = "import" ]; then
+  printf 'import:%s:%s\n' "$3" "$4" >> "$target"
+  exit 0
+fi
+if [ "$cmd" = "close" ]; then
+  printf 'closed\n' >> "$target"
+  exit 0
+fi
+exit 1
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&officecli).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&officecli, perms).unwrap();
+
+        let source = dir.path().join("data.csv");
+        std::fs::write(&source, b"name,age\nAlice,30\n").unwrap();
+
+        let target = prepare_csv_preview_workbook(&officecli, &source, dir.path())
+            .await
+            .unwrap();
+        let content = std::fs::read_to_string(&target).unwrap();
+
+        assert!(content.contains("created"));
+        assert!(content.contains(&format!("import:/Sheet1:{}", source.to_string_lossy())));
+        assert!(content.contains("closed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepare_csv_preview_workbook_removes_temp_file_when_import_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let officecli = dir.path().join("officecli");
+        std::fs::write(
+            &officecli,
+            r#"#!/bin/sh
+cmd="$1"
+target="$2"
+if [ "$cmd" = "create" ]; then
+  printf 'created\n' > "$target"
+  exit 0
+fi
+if [ "$cmd" = "import" ]; then
+  exit 2
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&officecli).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&officecli, perms).unwrap();
+
+        let source = dir.path().join("data.csv");
+        std::fs::write(&source, b"name,age\nAlice,30\n").unwrap();
+
+        let result = prepare_csv_preview_workbook(&officecli, &source, dir.path()).await;
+
+        assert!(result.is_err());
+        let csv_preview_dir = dir.path().join("office-preview").join("csv");
+        let remaining_files = std::fs::read_dir(csv_preview_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(remaining_files, 0);
     }
 
     #[cfg(unix)]

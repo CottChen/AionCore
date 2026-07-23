@@ -187,6 +187,23 @@ async fn office_watch_detects_xlsx() {
 }
 
 #[tokio::test]
+async fn office_watch_detects_csv() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, recorder) = make_service();
+    svc.start_office_watch(dir.path().to_str().unwrap()).await.unwrap();
+    settle().await;
+
+    std::fs::write(dir.path().join("data.csv"), "name,age\nAlice,30\n").unwrap();
+    settle().await;
+
+    let events = recorder.take_events();
+    assert!(
+        events.iter().any(|e| e.name == "workspaceOfficeWatch.fileAdded"),
+        "expected fileAdded for .csv, got: {events:?}"
+    );
+}
+
+#[tokio::test]
 async fn office_watch_detects_pptx() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, recorder) = make_service();
