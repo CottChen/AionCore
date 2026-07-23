@@ -3336,6 +3336,7 @@ mod tests {
     use super::*;
     use aionui_db::{
         CreateProviderParams, IUserRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+        SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
         SqliteAssistantUserOverlayRepository, SqliteProviderRepository, SqliteUserRepository, UpsertOverrideParams,
         init_database_memory,
     };
