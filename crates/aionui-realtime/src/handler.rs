@@ -238,6 +238,7 @@ fn handle_subscribe_show_open(state: &WsHandlerState, conn_id: ConnectionId, dat
     let has_open_directory = properties.iter().any(|v| v.as_str() == Some("openDirectory"));
 
     let is_file_mode = has_open_file && !has_open_directory;
+    let default_path = inner.get("defaultPath").and_then(|v| v.as_str());
 
     let response = WebSocketMessage::new(
         "show-open-request",
@@ -245,6 +246,7 @@ fn handle_subscribe_show_open(state: &WsHandlerState, conn_id: ConnectionId, dat
             "id": id,
             "properties": properties,
             "isFileMode": is_file_mode,
+            "defaultPath": default_path,
         }),
     );
 

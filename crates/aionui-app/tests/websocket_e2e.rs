@@ -448,7 +448,7 @@ async fn t5_3_subscribe_show_open_directory_mode() {
 
     let payload = json!({
         "name": "subscribe-show-open",
-        "data": {"id": "req-dir", "data": {"properties": ["openDirectory"]}}
+        "data": {"id": "req-dir", "data": {"defaultPath": "/projects/demo", "properties": ["openDirectory"]}}
     });
     tx.send(send_json(&payload.to_string())).await.unwrap();
 
@@ -456,6 +456,7 @@ async fn t5_3_subscribe_show_open_directory_mode() {
     assert_eq!(msg["name"], "show-open-request");
     assert_eq!(msg["data"]["id"], "req-dir");
     assert_eq!(msg["data"]["isFileMode"], false);
+    assert_eq!(msg["data"]["defaultPath"], "/projects/demo");
 }
 
 #[tokio::test]
