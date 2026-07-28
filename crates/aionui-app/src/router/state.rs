@@ -51,6 +51,7 @@ use aionui_team::{
 
 use crate::config::derive_encryption_key;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
+use crate::router::upload_workspace_resolver::AppUploadWorkspaceResolver;
 use crate::services::AppServices;
 
 #[derive(Debug)]
@@ -449,8 +450,13 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
     let watch_service = Arc::new(FileWatchService::new(broadcaster).map_err(file_watch_init_error)?);
     let snapshot_service = Arc::new(SnapshotService::new());
+    let preference_repo = Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone()));
     Ok(FileRouterState {
         file_service,
+        upload_workspace_resolver: Arc::new(AppUploadWorkspaceResolver::new(
+            services.conversation_repo.clone(),
+            preference_repo,
+        )),
         watch_service,
         snapshot_service,
         allowed_roots,

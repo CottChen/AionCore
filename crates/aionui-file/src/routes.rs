@@ -2,7 +2,7 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Json, Multipart, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, Query, State};
 use axum::routing::{get, post};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -16,12 +16,13 @@ use aionui_api_types::{
     SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest,
     SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipRequest,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_common::constants::UPLOAD_MAX_SIZE;
 
 use crate::browse;
 use crate::error::FileError;
-use crate::traits::{FileServiceRef, FileWatchServiceRef, SnapshotServiceRef};
+use crate::traits::{FileServiceRef, FileWatchServiceRef, SnapshotServiceRef, UploadWorkspaceResolverRef};
 use crate::types::{
     CompareResult, CopyResult, DirOrFile, FileChangeInfo, FileMetadata, SnapshotInfo, SnapshotMode, WorkspaceFlatFile,
     ZipEntry,
@@ -91,6 +92,7 @@ impl Default for BrowseRoots {
 #[derive(Clone)]
 pub struct FileRouterState {
     pub file_service: FileServiceRef,
+    pub upload_workspace_resolver: UploadWorkspaceResolverRef,
     pub watch_service: FileWatchServiceRef,
     pub snapshot_service: SnapshotServiceRef,
     pub allowed_roots: Vec<std::path::PathBuf>,
@@ -332,6 +334,7 @@ struct UploadMultipartFields {
     file_name: Option<String>,
     dispo_file_name: Option<String>,
     conversation_id: Option<String>,
+    workspace_relative_path: Option<String>,
 }
 
 /// Strip any directory component from a file name and reject empty results.
@@ -352,6 +355,7 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
     let mut file_name: Option<String> = None;
     let mut dispo_file_name: Option<String> = None;
     let mut conversation_id: Option<String> = None;
+    let mut workspace_relative_path: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -392,6 +396,13 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
                     conversation_id = Some(trimmed.to_owned());
                 }
             }
+            "workspace_relative_path" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("failed to read workspace_relative_path: {e}")))?;
+                workspace_relative_path = Some(text);
+            }
             _ => {}
         }
     }
@@ -403,11 +414,13 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
         file_name,
         dispo_file_name,
         conversation_id,
+        workspace_relative_path,
     })
 }
 
 async fn upload_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let fields = extract_upload_multipart(multipart).await?;
@@ -416,10 +429,34 @@ async fn upload_file(
         ApiError::BadRequest("missing file name: provide 'file_name' or a multipart filename".to_owned())
     })?;
 
-    let path = state
-        .file_service
-        .create_upload_file(&file_name, &fields.file_data, fields.conversation_id.as_deref())
-        .await?;
+    let force_workspace = fields.workspace_relative_path.is_some();
+    let workspace = match fields.conversation_id.as_deref() {
+        Some(conversation_id) => {
+            state
+                .upload_workspace_resolver
+                .resolve_workspace(&user.id, conversation_id, force_workspace)
+                .await?
+        }
+        None if force_workspace => {
+            return Err(ApiError::BadRequest(
+                "workspace upload requires conversation_id".to_owned(),
+            ));
+        }
+        None => None,
+    };
+
+    let path = if let Some(workspace) = workspace {
+        let relative_dir = fields.workspace_relative_path.as_deref().unwrap_or("uploads");
+        state
+            .file_service
+            .create_workspace_upload_file(&file_name, &fields.file_data, &workspace, Path::new(relative_dir))
+            .await?
+    } else {
+        state
+            .file_service
+            .create_upload_file(&file_name, &fields.file_data, fields.conversation_id.as_deref())
+            .await?
+    };
     Ok(Json(ApiResponse::ok(path)))
 }
 
