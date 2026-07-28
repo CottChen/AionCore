@@ -6,6 +6,7 @@ mod runtime_team_tools;
 mod state;
 mod team_conversation_adapters;
 mod trace;
+mod upload_workspace_resolver;
 
 pub use routes::{
     RouterRuntime, create_router, create_router_with_all_state, create_router_with_runtime, create_router_with_states,

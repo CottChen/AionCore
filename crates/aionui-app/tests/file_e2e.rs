@@ -6,7 +6,9 @@ use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, build_app, build_app_with_file_roots, json_with_token, setup_and_login};
+use common::{
+    body_json, build_app, build_app_with_data_dir, build_app_with_file_roots, json_with_token, setup_and_login,
+};
 
 // ===========================================================================
 // Auth guard
@@ -1006,6 +1008,49 @@ struct UploadMultipart {
     parts: Vec<u8>,
 }
 
+async fn create_upload_conversation(
+    app: &mut axum::Router,
+    token: &str,
+    csrf: &str,
+    workspace: Option<&std::path::Path>,
+) -> (String, String) {
+    let mut extra = json!({ "backend": "gemini" });
+    if let Some(workspace) = workspace {
+        extra["workspace"] = json!(workspace.to_string_lossy());
+        extra["custom_workspace"] = json!(true);
+    }
+    let req = json_with_token(
+        "POST",
+        "/api/conversations",
+        json!({
+            "type": "acp",
+            "name": "Upload test",
+            "extra": extra
+        }),
+        token,
+        csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    (
+        json["data"]["id"].as_str().unwrap().to_owned(),
+        json["data"]["extra"]["workspace"].as_str().unwrap().to_owned(),
+    )
+}
+
+async fn set_save_upload_to_workspace(app: &mut axum::Router, token: &str, csrf: &str, enabled: bool) {
+    let req = json_with_token(
+        "PUT",
+        "/api/settings/client",
+        json!({ "upload.saveToWorkspace": enabled }),
+        token,
+        csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 impl UploadMultipart {
     fn new() -> Self {
         Self {
@@ -1097,6 +1142,140 @@ async fn upload_accepts_small_png_and_returns_readable_path() {
     // Cleanup.
     let _ = std::fs::remove_file(p);
     let _ = std::fs::remove_dir(p.parent().unwrap());
+}
+
+#[tokio::test]
+async fn upload_with_preference_uses_project_workspace_uploads_directory() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(data_dir.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    set_save_upload_to_workspace(&mut app, &token, &csrf, true).await;
+    let (conversation_id, _) = create_upload_conversation(&mut app, &token, &csrf, Some(project_dir.path())).await;
+
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "project.txt", "text/plain", b"project")
+        .add_text("conversation_id", &conversation_id)
+        .build();
+    let resp = app
+        .oneshot(upload_request(&content_type, body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let uploaded = std::path::PathBuf::from(json["data"].as_str().unwrap());
+    assert_eq!(
+        std::fs::canonicalize(uploaded.parent().unwrap()).unwrap(),
+        std::fs::canonicalize(project_dir.path().join("uploads")).unwrap()
+    );
+    assert_eq!(std::fs::read(uploaded).unwrap(), b"project");
+}
+
+#[tokio::test]
+async fn upload_with_preference_uses_temporary_conversation_workspace() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(data_dir.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    set_save_upload_to_workspace(&mut app, &token, &csrf, true).await;
+    let (conversation_id, workspace) = create_upload_conversation(&mut app, &token, &csrf, None).await;
+
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "temporary.txt", "text/plain", b"temporary")
+        .add_text("conversation_id", &conversation_id)
+        .build();
+    let resp = app
+        .oneshot(upload_request(&content_type, body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let uploaded = std::path::PathBuf::from(json["data"].as_str().unwrap());
+    assert_eq!(
+        std::fs::canonicalize(uploaded.parent().unwrap()).unwrap(),
+        std::fs::canonicalize(std::path::Path::new(&workspace).join("uploads")).unwrap()
+    );
+    assert_eq!(std::fs::read(uploaded).unwrap(), b"temporary");
+}
+
+#[tokio::test]
+async fn explicit_workspace_upload_uses_selected_directory_when_preference_is_disabled() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project_dir.path().join("docs/specs")).unwrap();
+    let (mut app, services) = build_app_with_data_dir(data_dir.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (conversation_id, _) = create_upload_conversation(&mut app, &token, &csrf, Some(project_dir.path())).await;
+
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "selected.txt", "text/plain", b"selected")
+        .add_text("conversation_id", &conversation_id)
+        .add_text("workspace_relative_path", "docs/specs")
+        .build();
+    let resp = app
+        .oneshot(upload_request(&content_type, body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let uploaded = std::path::PathBuf::from(json["data"].as_str().unwrap());
+    assert_eq!(
+        std::fs::canonicalize(uploaded.parent().unwrap()).unwrap(),
+        std::fs::canonicalize(project_dir.path().join("docs/specs")).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn explicit_workspace_upload_rejects_traversal() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(data_dir.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (conversation_id, _) = create_upload_conversation(&mut app, &token, &csrf, Some(project_dir.path())).await;
+
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "escape.txt", "text/plain", b"escape")
+        .add_text("conversation_id", &conversation_id)
+        .add_text("workspace_relative_path", "../outside")
+        .build();
+    let resp = app
+        .oneshot(upload_request(&content_type, body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "BAD_REQUEST");
+    assert_eq!(
+        json["error"],
+        "workspace upload path '../outside' must be relative and must not contain traversal"
+    );
+}
+
+#[tokio::test]
+async fn explicit_workspace_upload_rejects_another_users_conversation() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(data_dir.path()).await;
+    let (admin_token, admin_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (conversation_id, _) =
+        create_upload_conversation(&mut app, &admin_token, &admin_csrf, Some(project_dir.path())).await;
+    let (user_token, user_csrf) = setup_and_login(&mut app, &services, "upload-user", "StrongP@ss2").await;
+
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "forbidden.txt", "text/plain", b"forbidden")
+        .add_text("conversation_id", &conversation_id)
+        .add_text("workspace_relative_path", "")
+        .build();
+    let resp = app
+        .oneshot(upload_request(&content_type, body, &user_token, &user_csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "NOT_FOUND");
+    assert_eq!(json["error"], "conversation not found");
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aionui_common::FileChangeOperation;
@@ -6,6 +6,21 @@ use aionui_common::FileChangeOperation;
 use crate::error::FileError;
 
 use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotInfo, WorkspaceFlatFile, ZipEntry};
+
+/// Resolves whether an authenticated conversation upload should be stored in
+/// its workspace. Composition-layer implementations own preference and
+/// conversation lookups so the file domain stays independent of persistence.
+#[async_trait::async_trait]
+pub trait IUploadWorkspaceResolver: Send + Sync {
+    async fn resolve_workspace(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        force_workspace: bool,
+    ) -> Result<Option<PathBuf>, FileError>;
+}
+
+pub type UploadWorkspaceResolverRef = Arc<dyn IUploadWorkspaceResolver>;
 
 /// Core file operations: directory browsing, file read/write, management,
 /// image processing, and ZIP packaging.
@@ -98,6 +113,18 @@ pub trait IFileService: Send + Sync {
         file_name: &str,
         data: &[u8],
         conversation_id: Option<&str>,
+    ) -> Result<String, FileError>;
+
+    /// Write an upload inside a conversation workspace.
+    ///
+    /// `relative_dir` must be a relative directory below `workspace`.
+    /// Symlinks that resolve outside the workspace are rejected.
+    async fn create_workspace_upload_file(
+        &self,
+        file_name: &str,
+        data: &[u8],
+        workspace: &Path,
+        relative_dir: &Path,
     ) -> Result<String, FileError>;
 
     // -- Image processing --
