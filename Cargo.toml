@@ -71,7 +71,9 @@ http = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+csv = "1.4"
 encoding_rs = "0.8"
+encoding_rs_io = "0.1"
 
 # Async utilities
 futures-util = "0.3"
@@ -149,7 +151,7 @@ which = "7"
 
 # Office
 calamine = "0.36"
-rust_xlsxwriter = "0.82"
+rust_xlsxwriter = { version = "0.82", features = ["constant_memory"] }
 sha1 = "0.10"
 sha2 = "0.10"
 

@@ -15,7 +15,10 @@ tokio.workspace = true
 reqwest.workspace = true
 which.workspace = true
 calamine.workspace = true
+csv.workspace = true
 encoding_rs.workspace = true
+encoding_rs_io.workspace = true
+rust_xlsxwriter.workspace = true
 sha1.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,5 +29,4 @@ async-trait.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-rust_xlsxwriter.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

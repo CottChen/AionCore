@@ -5,9 +5,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aionui_api_types::{PreviewState, PreviewStatusEvent, WebSocketMessage};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::Builder as CmdBuilder;
-use calamine::{DataType, Reader, open_workbook_auto};
+use csv::{ByteRecord, ReaderBuilder};
 use dashmap::DashMap;
 use encoding_rs::GB18030;
+use encoding_rs_io::DecodeReaderBytesBuilder;
+use rust_xlsxwriter::Workbook;
 use sha1::{Digest, Sha1};
 use tokio::sync::Mutex;
 
@@ -21,6 +23,10 @@ const POLL_MAX_ATTEMPTS: u32 = 150;
 const START_PORT_MAX_ATTEMPTS: usize = 3;
 const STOP_DELAY_MS: u64 = 500;
 const VERSION_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const CSV_SNIFF_BYTES: usize = 64 * 1024;
+const EXCEL_MAX_ROWS: usize = 1_048_576;
+const EXCEL_MAX_COLUMNS: usize = 16_384;
+const EXCEL_MAX_CELL_CHARS: usize = 32_767;
 
 // ---------------------------------------------------------------------------
 // ProcessSpawner trait — abstraction for child process management
@@ -330,7 +336,7 @@ impl ProcessSpawner for DefaultProcessSpawner {
 
         let mut cleanup_paths = Vec::new();
         let watch_file_path = if doc_type == DocType::Excel && is_csv_file_path(Path::new(file_path)) {
-            let workbook_path = prepare_csv_preview_workbook(&officecli, Path::new(file_path), &self._data_dir).await?;
+            let workbook_path = prepare_csv_preview_workbook(Path::new(file_path), &self._data_dir).await?;
             cleanup_paths.push(workbook_path.clone());
             workbook_path
         } else {
@@ -455,68 +461,23 @@ fn is_csv_file_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("csv"))
 }
 
-async fn prepare_csv_preview_workbook(
-    officecli: &Path,
-    source_path: &Path,
-    data_dir: &Path,
-) -> Result<PathBuf, OfficeError> {
+async fn prepare_csv_preview_workbook(source_path: &Path, data_dir: &Path) -> Result<PathBuf, OfficeError> {
     let target_path = csv_preview_workbook_path(source_path, data_dir);
     if let Some(parent) = target_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let normalized_source_path = target_path.with_extension("utf8.csv");
-    let source_has_data = normalize_csv_for_preview(source_path, &normalized_source_path).await?;
-
-    let result = async {
-        run_officecli_checked(
-            officecli,
-            [
-                "create".into(),
-                target_path.to_string_lossy().into_owned(),
-                "--type".into(),
-                "xlsx".into(),
-            ],
-            "create csv preview workbook",
-        )
-        .await?;
-
-        run_officecli_checked(
-            officecli,
-            [
-                "import".into(),
-                target_path.to_string_lossy().into_owned(),
-                "/Sheet1".into(),
-                normalized_source_path.to_string_lossy().into_owned(),
-                "--format".into(),
-                "csv".into(),
-            ],
-            "import csv preview workbook",
-        )
-        .await?;
-
-        Ok::<(), OfficeError>(())
-    }
-    .await;
-
-    cleanup_temp_paths(std::slice::from_ref(&normalized_source_path));
+    let source_path = source_path.to_owned();
+    let worker_target_path = target_path.clone();
+    let result =
+        match tokio::task::spawn_blocking(move || convert_csv_to_preview_workbook(&source_path, &worker_target_path))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(OfficeError::Conversion(format!("CSV preview worker failed: {error}"))),
+        };
 
     if let Err(error) = result {
-        cleanup_temp_paths(std::slice::from_ref(&target_path));
-        return Err(error);
-    }
-
-    if let Err(error) = run_officecli_checked(
-        officecli,
-        ["close".into(), target_path.to_string_lossy().into_owned()],
-        "close csv preview workbook",
-    )
-    .await
-    {
-        tracing::debug!(error = %error, "failed to close temporary csv preview workbook resident");
-    }
-
-    if source_has_data && let Err(error) = validate_csv_preview_workbook(&target_path) {
         cleanup_temp_paths(std::slice::from_ref(&target_path));
         return Err(error);
     }
@@ -524,46 +485,156 @@ async fn prepare_csv_preview_workbook(
     Ok(target_path)
 }
 
-async fn normalize_csv_for_preview(source_path: &Path, target_path: &Path) -> Result<bool, OfficeError> {
-    let bytes = tokio::fs::read(source_path).await?;
-    let decoded = decode_csv_text(&bytes)?;
-    let has_data = csv_text_has_data(&decoded);
-    tokio::fs::write(target_path, decoded.as_bytes()).await?;
-    Ok(has_data)
+#[derive(Debug)]
+enum CsvPreviewError {
+    InvalidUtf8,
+    Conversion(String),
 }
 
-fn decode_csv_text(bytes: &[u8]) -> Result<String, OfficeError> {
-    let utf8_bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    if let Ok(text) = std::str::from_utf8(utf8_bytes) {
-        return Ok(text.to_owned());
-    }
-
-    GB18030
-        .decode_without_bom_handling_and_without_replacement(bytes)
-        .map(|text| text.into_owned())
-        .ok_or_else(|| OfficeError::Conversion("CSV is not valid UTF-8 or GB18030".into()))
-}
-
-fn csv_text_has_data(text: &str) -> bool {
-    text.chars()
-        .any(|ch| !ch.is_whitespace() && !matches!(ch, ',' | ';' | '\t' | '"'))
-}
-
-fn validate_csv_preview_workbook(path: &Path) -> Result<(), OfficeError> {
-    let mut workbook = open_workbook_auto(path)
-        .map_err(|error| OfficeError::Conversion(format!("failed to open CSV preview workbook: {error}")))?;
-    let sheet_names = workbook.sheet_names().to_vec();
-
-    for sheet_name in sheet_names {
-        let range = workbook.worksheet_range(&sheet_name).map_err(|error| {
-            OfficeError::Conversion(format!("failed to read CSV preview sheet '{sheet_name}': {error}"))
-        })?;
-        if range.cells().any(|(_, _, cell)| !cell.is_empty()) {
-            return Ok(());
+fn convert_csv_to_preview_workbook(source_path: &Path, target_path: &Path) -> Result<(), OfficeError> {
+    let delimiter = detect_csv_delimiter(source_path)?;
+    match write_csv_preview_workbook(source_path, target_path, delimiter, None) {
+        Ok(()) => Ok(()),
+        Err(CsvPreviewError::InvalidUtf8) => {
+            write_csv_preview_workbook(source_path, target_path, delimiter, Some(GB18030))
+                .map_err(csv_preview_error_to_office_error)
         }
+        Err(error) => Err(csv_preview_error_to_office_error(error)),
+    }
+}
+
+fn write_csv_preview_workbook(
+    source_path: &Path,
+    target_path: &Path,
+    delimiter: u8,
+    encoding: Option<&'static encoding_rs::Encoding>,
+) -> Result<(), CsvPreviewError> {
+    let source = std::fs::File::open(source_path)
+        .map_err(|error| CsvPreviewError::Conversion(format!("failed to open CSV: {error}")))?;
+    let mut decoder_builder = DecodeReaderBytesBuilder::new();
+    decoder_builder.strip_bom(true);
+    if let Some(encoding) = encoding {
+        decoder_builder.encoding(Some(encoding));
+    } else {
+        decoder_builder.utf8_passthru(true);
+    }
+    let decoded = decoder_builder.build(source);
+    let mut reader = ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(decoded);
+
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet_with_constant_memory();
+    worksheet
+        .set_name("Sheet1")
+        .map_err(|error| CsvPreviewError::Conversion(format!("failed to name CSV preview sheet: {error}")))?;
+
+    let mut record = ByteRecord::new();
+    let mut row = 0usize;
+    let mut truncated_rows = false;
+    let mut truncated_columns = false;
+    let mut truncated_cells = 0usize;
+
+    while reader
+        .read_byte_record(&mut record)
+        .map_err(|error| CsvPreviewError::Conversion(format!("failed to parse CSV: {error}")))?
+    {
+        if row >= EXCEL_MAX_ROWS {
+            truncated_rows = true;
+            break;
+        }
+
+        for (column, field) in record.iter().enumerate() {
+            if column >= EXCEL_MAX_COLUMNS {
+                truncated_columns = true;
+                break;
+            }
+            let value = std::str::from_utf8(field).map_err(|_| CsvPreviewError::InvalidUtf8)?;
+            let value = truncate_csv_cell(value);
+            if value.len() != field.len() {
+                truncated_cells += 1;
+            }
+            worksheet
+                .write_string(row as u32, column as u16, value)
+                .map_err(|error| CsvPreviewError::Conversion(format!("failed to write CSV preview cell: {error}")))?;
+        }
+        row += 1;
     }
 
-    Err(OfficeError::Conversion("CSV import produced an empty workbook".into()))
+    workbook
+        .save(target_path)
+        .map_err(|error| CsvPreviewError::Conversion(format!("failed to save CSV preview workbook: {error}")))?;
+
+    if truncated_rows || truncated_columns || truncated_cells > 0 {
+        tracing::warn!(
+            source_path = %source_path.display(),
+            truncated_rows,
+            truncated_columns,
+            truncated_cells,
+            "CSV preview was truncated to Excel worksheet limits"
+        );
+    }
+
+    Ok(())
+}
+
+fn csv_preview_error_to_office_error(error: CsvPreviewError) -> OfficeError {
+    match error {
+        CsvPreviewError::InvalidUtf8 => {
+            OfficeError::Conversion("CSV contains text that could not be decoded as UTF-8 or GB18030".into())
+        }
+        CsvPreviewError::Conversion(message) => OfficeError::Conversion(message),
+    }
+}
+
+fn detect_csv_delimiter(source_path: &Path) -> Result<u8, OfficeError> {
+    use std::io::Read;
+
+    let mut source = std::fs::File::open(source_path)?;
+    let mut sample = vec![0u8; CSV_SNIFF_BYTES];
+    let length = source.read(&mut sample)?;
+    sample.truncate(length);
+
+    let candidates = [b',', b'\t', b';', b'|'];
+    let mut counts = [0usize; 4];
+    let mut in_quotes = false;
+    let mut index = 0usize;
+    while index < sample.len() {
+        let byte = sample[index];
+        if byte == b'"' {
+            if in_quotes && sample.get(index + 1) == Some(&b'"') {
+                index += 2;
+                continue;
+            }
+            in_quotes = !in_quotes;
+        } else if !in_quotes && matches!(byte, b'\r' | b'\n') {
+            break;
+        } else if !in_quotes {
+            for (candidate_index, candidate) in candidates.iter().enumerate() {
+                if byte == *candidate {
+                    counts[candidate_index] += 1;
+                }
+            }
+        }
+        index += 1;
+    }
+
+    let delimiter_index = counts
+        .iter()
+        .enumerate()
+        .max_by_key(|(index, count)| (**count, std::cmp::Reverse(*index)))
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    Ok(candidates[delimiter_index])
+}
+
+fn truncate_csv_cell(value: &str) -> &str {
+    value
+        .char_indices()
+        .nth(EXCEL_MAX_CELL_CHARS)
+        .map_or(value, |(index, _)| &value[..index])
 }
 
 fn csv_preview_workbook_path(source_path: &Path, data_dir: &Path) -> PathBuf {
@@ -610,25 +681,6 @@ fn sanitize_preview_stem(stem: &str) -> String {
             }
         })
         .collect()
-}
-
-async fn run_officecli_checked<I>(officecli: &Path, args: I, label: &str) -> Result<(), OfficeError>
-where
-    I: IntoIterator<Item = String>,
-{
-    let mut builder = CmdBuilder::clean_cli(officecli);
-    builder.args(args);
-    let output = builder
-        .output()
-        .await
-        .map_err(|error| OfficeError::StartFailed(format!("{label} failed to spawn: {error}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(OfficeError::StartFailed(format!("{label} failed: {stderr}")));
-    }
-
-    Ok(())
 }
 
 fn cleanup_temp_paths(paths: &[PathBuf]) {
@@ -878,181 +930,77 @@ mod tests {
         assert!(target.file_name().unwrap().to_string_lossy().starts_with("My_Report-"));
     }
 
-    #[test]
-    fn csv_decoder_strips_utf8_bom() {
-        let decoded = decode_csv_text(b"\xEF\xBB\xBFname,city\nAlice,Beijing\n").unwrap();
+    fn preview_cell(path: &Path, row: u32, column: u32) -> String {
+        use calamine::{DataType, Reader, open_workbook_auto};
 
-        assert_eq!(decoded, "name,city\nAlice,Beijing\n");
+        let mut workbook = open_workbook_auto(path).unwrap();
+        let range = workbook.worksheet_range("Sheet1").unwrap();
+        range
+            .get_value((row, column))
+            .filter(|cell| !cell.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_default()
     }
 
-    #[test]
-    fn csv_decoder_accepts_gb18030_chinese_text() {
-        let expected = "姓名,城市\n张三,北京\n";
-        let (encoded, _, had_errors) = GB18030.encode(expected);
-        assert!(!had_errors);
-
-        let decoded = decode_csv_text(&encoded).unwrap();
-
-        assert_eq!(decoded, expected);
-    }
-
-    #[test]
-    fn csv_decoder_rejects_bytes_outside_utf8_and_gb18030() {
-        let error = decode_csv_text(&[0xFF]).unwrap_err();
-
-        assert!(matches!(error, OfficeError::Conversion(message) if message.contains("UTF-8 or GB18030")));
-    }
-
-    #[cfg(unix)]
     #[tokio::test]
-    async fn prepare_csv_preview_workbook_normalizes_gb18030_before_import() {
+    async fn csv_preview_workbook_strips_utf8_bom() {
         let dir = tempfile::tempdir().unwrap();
-        let officecli = dir.path().join("officecli");
-        let fixture_path = dir.path().join("fixture.xlsx");
-        let mut workbook = rust_xlsxwriter::Workbook::new();
-        let sheet = workbook.add_worksheet();
-        sheet.write_string(0, 0, "姓名").unwrap();
-        sheet.write_string(1, 0, "张三").unwrap();
-        workbook.save(&fixture_path).unwrap();
+        let source = dir.path().join("utf8-bom.csv");
+        std::fs::write(&source, b"\xEF\xBB\xBFname,city\nAlice,Beijing\n").unwrap();
 
-        std::fs::write(
-            &officecli,
-            r#"#!/bin/sh
-cmd="$1"
-target="$2"
-base_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-if [ "$cmd" = "create" ]; then
-  printf 'create\n' >> "$base_dir/commands.log"
-  printf 'created\n' > "$target"
-  exit 0
-fi
-if [ "$cmd" = "import" ]; then
-  printf 'import:%s:%s\n' "$3" "$4" >> "$base_dir/commands.log"
-  cp "$4" "$base_dir/imported.csv"
-  cp "$base_dir/fixture.xlsx" "$target"
-  exit 0
-fi
-if [ "$cmd" = "close" ]; then
-  printf 'close\n' >> "$base_dir/commands.log"
-  exit 0
-fi
-exit 1
-"#,
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&officecli).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&officecli, perms).unwrap();
+        let target = prepare_csv_preview_workbook(&source, dir.path()).await.unwrap();
 
-        let source = dir.path().join("data.csv");
-        let expected = "姓名,城市\n张三,北京\n";
-        let (encoded, _, had_errors) = GB18030.encode(expected);
+        assert_eq!(preview_cell(&target, 0, 0), "name");
+        assert_eq!(preview_cell(&target, 1, 1), "Beijing");
+    }
+
+    #[tokio::test]
+    async fn csv_preview_workbook_decodes_gb18030_chinese_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("gb18030.csv");
+        let (encoded, _, had_errors) = GB18030.encode("姓名,城市\n张三,北京\n");
         assert!(!had_errors);
         std::fs::write(&source, &encoded).unwrap();
 
-        let target = prepare_csv_preview_workbook(&officecli, &source, dir.path())
-            .await
-            .unwrap();
-        let imported = std::fs::read_to_string(dir.path().join("imported.csv")).unwrap();
-        let commands = std::fs::read_to_string(dir.path().join("commands.log")).unwrap();
+        let target = prepare_csv_preview_workbook(&source, dir.path()).await.unwrap();
 
-        assert_eq!(imported, expected);
-        assert!(commands.contains("import:/Sheet1:"));
-        assert!(commands.contains(".utf8.csv"));
-        assert!(commands.contains("close"));
-        assert!(target.exists());
-        assert!(!target.with_extension("utf8.csv").exists());
+        assert_eq!(preview_cell(&target, 0, 0), "姓名");
+        assert_eq!(preview_cell(&target, 1, 1), "北京");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn prepare_csv_preview_workbook_removes_temp_file_when_import_fails() {
+    async fn csv_preview_workbook_detects_semicolon_delimiter_and_quotes() {
         let dir = tempfile::tempdir().unwrap();
-        let officecli = dir.path().join("officecli");
-        std::fs::write(
-            &officecli,
-            r#"#!/bin/sh
-cmd="$1"
-target="$2"
-if [ "$cmd" = "create" ]; then
-  printf 'created\n' > "$target"
-  exit 0
-fi
-if [ "$cmd" = "import" ]; then
-  exit 2
-fi
-exit 0
-"#,
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&officecli).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&officecli, perms).unwrap();
+        let source = dir.path().join("semicolon.csv");
+        std::fs::write(&source, "name;note\nAlice;\"Beijing, China\"\n").unwrap();
 
-        let source = dir.path().join("data.csv");
-        std::fs::write(&source, b"name,age\nAlice,30\n").unwrap();
+        let target = prepare_csv_preview_workbook(&source, dir.path()).await.unwrap();
 
-        let result = prepare_csv_preview_workbook(&officecli, &source, dir.path()).await;
-
-        assert!(result.is_err());
-        let csv_preview_dir = dir.path().join("office-preview").join("csv");
-        let remaining_files = std::fs::read_dir(csv_preview_dir)
-            .map(|entries| entries.count())
-            .unwrap_or(0);
-        assert_eq!(remaining_files, 0);
+        assert_eq!(preview_cell(&target, 0, 1), "note");
+        assert_eq!(preview_cell(&target, 1, 1), "Beijing, China");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn prepare_csv_preview_workbook_rejects_silent_empty_import() {
+    async fn csv_preview_failure_does_not_prevent_later_conversion() {
         let dir = tempfile::tempdir().unwrap();
-        let officecli = dir.path().join("officecli");
-        let fixture_path = dir.path().join("empty.xlsx");
-        let mut workbook = rust_xlsxwriter::Workbook::new();
-        workbook.add_worksheet().set_name("Sheet1").unwrap();
-        workbook.save(&fixture_path).unwrap();
+        let missing = dir.path().join("missing.csv");
+        let valid = dir.path().join("valid.csv");
+        std::fs::write(&valid, "name,age\nAlice,30\n").unwrap();
 
-        std::fs::write(
-            &officecli,
-            r#"#!/bin/sh
-cmd="$1"
-target="$2"
-base_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-if [ "$cmd" = "create" ]; then
-  printf 'created\n' > "$target"
-  exit 0
-fi
-if [ "$cmd" = "import" ]; then
-  cp "$base_dir/empty.xlsx" "$target"
-  exit 0
-fi
-if [ "$cmd" = "close" ]; then
-  exit 0
-fi
-exit 1
-"#,
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&officecli).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&officecli, perms).unwrap();
+        let first_result = prepare_csv_preview_workbook(&missing, dir.path()).await;
+        let target = prepare_csv_preview_workbook(&valid, dir.path()).await.unwrap();
 
-        let source = dir.path().join("data.csv");
-        std::fs::write(&source, b"name,age\nAlice,30\n").unwrap();
+        assert!(first_result.is_err());
+        assert_eq!(preview_cell(&target, 1, 0), "Alice");
+    }
 
-        let error = prepare_csv_preview_workbook(&officecli, &source, dir.path())
-            .await
-            .unwrap_err();
+    #[test]
+    fn csv_cell_is_truncated_at_excel_character_limit() {
+        let value = "界".repeat(EXCEL_MAX_CELL_CHARS + 1);
 
-        assert!(matches!(error, OfficeError::Conversion(message) if message.contains("empty workbook")));
-        let csv_preview_dir = dir.path().join("office-preview").join("csv");
-        let remaining_files = std::fs::read_dir(csv_preview_dir)
-            .map(|entries| entries.count())
-            .unwrap_or(0);
-        assert_eq!(remaining_files, 0);
+        let truncated = truncate_csv_cell(&value);
+
+        assert_eq!(truncated.chars().count(), EXCEL_MAX_CELL_CHARS);
     }
 
     #[cfg(unix)]
