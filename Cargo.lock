@@ -730,6 +730,7 @@ dependencies = [
  "axum",
  "calamine",
  "dashmap",
+ "encoding_rs",
  "reqwest",
  "rust_xlsxwriter",
  "serde",
