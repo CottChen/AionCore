@@ -9,11 +9,12 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, State};
+use axum::extract::{Extension, Json, Path, Query, State};
 use axum::routing::{get, patch, post, put};
 
 use aionui_api_types::{
-    AgentLogoEntry, AgentManagementRow, AgentMetadata, AgentOverridesResponse, ApiResponse, CustomAgentUpsertRequest,
+    AgentLogoEntry, AgentManagementRow, AgentMetadata, AgentOverridesResponse, AgentSessionBackend,
+    AgentSessionListQuery, AgentSessionSnapshot, AgentSessionSummary, ApiResponse, CustomAgentUpsertRequest,
     DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse, SetAgentOverridesRequest,
     SetEnabledRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
@@ -26,6 +27,8 @@ use crate::routes::state::AgentRouterState;
 pub fn agent_routes(state: AgentRouterState) -> Router {
     Router::new()
         .route("/api/agents/logos", get(list_agent_logos))
+        .route("/api/agent-sessions", get(list_agent_sessions))
+        .route("/api/agent-sessions/{backend}/{id}", get(inspect_agent_session))
         .route("/api/agents/management", get(list_management_agents))
         .route("/api/agents/{id}/health-check", post(health_check_by_id))
         .route("/api/agents/provider-health-check", post(provider_health_check))
@@ -38,6 +41,34 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
         .route("/api/agents/custom/{id}", put(update_custom).delete(delete_custom))
         .route("/api/agents/custom/try-connect", post(try_connect_custom))
         .with_state(state)
+}
+
+async fn list_agent_sessions(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Query(query): Query<AgentSessionListQuery>,
+) -> Result<Json<ApiResponse<Vec<AgentSessionSummary>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .session_inspection
+            .list(query.backend, query.scope, query.limit)
+            .await
+            .map_err(agent_error_to_api_error)?,
+    )))
+}
+
+async fn inspect_agent_session(
+    State(state): State<AgentRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path((backend, id)): Path<(AgentSessionBackend, String)>,
+) -> Result<Json<ApiResponse<AgentSessionSnapshot>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .session_inspection
+            .inspect(backend, id)
+            .await
+            .map_err(agent_error_to_api_error)?,
+    )))
 }
 
 async fn list_agent_logos(

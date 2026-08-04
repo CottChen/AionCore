@@ -52,6 +52,7 @@ pub use runtime_token::{
 };
 pub use services::AgentAvailabilityFeedbackPort;
 pub use services::AgentService;
+pub use services::AgentSessionInspectionService;
 pub use services::RemoteAgentService;
 pub use session_context::{
     AcpSessionBuildContext, AgentSessionContext, AgentSessionKind, AionrsSessionBuildContext, ConversationContext,

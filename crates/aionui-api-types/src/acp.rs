@@ -2,6 +2,109 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// CLI session storage supported by the read-only inspection API.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionBackend {
+    Codex,
+    Opencode,
+    Pi,
+}
+
+/// Parent/child relationship filter for locally persisted CLI sessions.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionScope {
+    #[default]
+    All,
+    Main,
+    Child,
+}
+
+/// Query parameters for listing locally persisted CLI sessions.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentSessionListQuery {
+    pub backend: AgentSessionBackend,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub scope: AgentSessionScope,
+}
+
+/// Compact metadata shown in the CLI session list and child-session links.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentSessionSummary {
+    pub id: String,
+    pub backend: AgentSessionBackend,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// Normalized event kinds shared by Codex rollout and Pi session files.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSessionItemKind {
+    UserMessage,
+    AgentMessage,
+    Thinking,
+    ToolCall,
+}
+
+/// One normalized item within a CLI turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentSessionItem {
+    pub kind: AgentSessionItemKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+/// A normalized user-to-agent turn from local CLI history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentSessionTurn {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    pub items: Vec<AgentSessionItem>,
+}
+
+/// Complete read-only snapshot for a CLI session ID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentSessionSnapshot {
+    pub session: AgentSessionSummary,
+    pub turns: Vec<AgentSessionTurn>,
+    pub children: Vec<AgentSessionSummary>,
+    pub truncated: bool,
+}
+
 /// Request body for detecting an ACP CLI executable.
 ///
 /// `backend` is a vendor label (e.g. "claude"). The service resolves it
