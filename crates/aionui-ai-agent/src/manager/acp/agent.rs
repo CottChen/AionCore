@@ -126,6 +126,31 @@ enum AcpStartupConnectError {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
+fn log_acp_startup_connect_failure(
+    conversation_id: &str,
+    agent_id: &str,
+    agent_name: &str,
+    backend: Option<&str>,
+    command: &std::path::Path,
+    pid: u32,
+    error: &AcpError,
+    stderr_tail: &str,
+) {
+    error!(
+        conversation_id = %conversation_id,
+        agent_id = %agent_id,
+        agent_name = %agent_name,
+        backend = %backend.unwrap_or("unknown"),
+        command = %command.display(),
+        pid,
+        stderr_lines = stderr_tail.lines().count(),
+        stderr_bytes = stderr_tail.len(),
+        error = %ErrorChain(error),
+        "Failed to establish ACP protocol connection"
+    );
+}
+
 impl AcpStartupConnectError {
     fn into_agent_error(self) -> AgentError {
         match self {
@@ -231,15 +256,24 @@ async fn spawn_and_connect_acp_once(
             let _ = unregister_agent_process(&params.data_dir, process.pid());
             return Err(AcpStartupConnectError::StartupCrash { exit_code, signal, stderr });
         }
-        res = &mut connect_fut => res.map_err(|e| {
-            error!(
-                conversation_id = %params.conversation_id,
-                error = %ErrorChain(&e),
-                "Failed to establish ACP protocol connection"
-            );
-            let _ = unregister_agent_process(&params.data_dir, process.pid());
-            AcpStartupConnectError::Agent(AgentError::from(e))
-        })?,
+        res = &mut connect_fut => match res {
+            Ok(protocol) => protocol,
+            Err(error) => {
+                let stderr_tail = process.peek_stderr_tail(64).await;
+                log_acp_startup_connect_failure(
+                    &params.conversation_id,
+                    &params.metadata.id,
+                    &params.metadata.name,
+                    params.metadata.backend.as_deref(),
+                    &params.command_spec.command,
+                    process.pid(),
+                    &error,
+                    &stderr_tail,
+                );
+                let _ = unregister_agent_process(&params.data_dir, process.pid());
+                return Err(AcpStartupConnectError::Agent(AgentError::from(error)));
+            }
+        },
     };
 
     Ok(AcpStartupConnection {
@@ -1827,6 +1861,34 @@ mod tests {
         assert!(captured.contains("backend=openclaw"));
         assert!(captured.contains("pid=4242"));
         assert!(captured.contains("reason=no_session_id"));
+    }
+
+    #[test]
+    fn acp_startup_failure_log_identifies_agent_without_leaking_stderr() {
+        let captured = capture_logs(tracing::Level::INFO, || {
+            super::log_acp_startup_connect_failure(
+                "conv-timeout",
+                "codex-agent-id",
+                "Codex CLI",
+                Some("codex"),
+                std::path::Path::new("/managed/codex-acp"),
+                4242,
+                &AcpError::InitTimeout { timeout_secs: 30 },
+                "secret raw stderr payload",
+            );
+        });
+
+        assert!(captured.contains("conversation_id=conv-timeout"), "{captured}");
+        assert!(captured.contains("agent_id=codex-agent-id"), "{captured}");
+        assert!(captured.contains("backend=codex"), "{captured}");
+        assert!(captured.contains("command=/managed/codex-acp"), "{captured}");
+        assert!(captured.contains("pid=4242"), "{captured}");
+        assert!(captured.contains("stderr_lines=1"), "{captured}");
+        assert!(captured.contains("stderr_bytes=25"), "{captured}");
+        assert!(
+            !captured.contains("secret raw stderr payload"),
+            "raw stderr must not be logged: {captured}"
+        );
     }
 
     #[test]
