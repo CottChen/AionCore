@@ -385,7 +385,7 @@ async fn auth_middleware_local_mode_uses_token_user_when_present() {
     let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
     let hash = aionui_auth::hash_password("StrongP@ss1").unwrap();
     let user = user_repo.create_user("alice", &hash).await.unwrap();
-    let token = jwt_service.sign(&user.id, &user.username).unwrap();
+    let token = jwt_service.sign(&user.id, user.username.as_deref().unwrap()).unwrap();
     let app = protected_local_auth_app(jwt_service, user_repo);
 
     let resp = app
