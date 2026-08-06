@@ -20,8 +20,6 @@ use aionui_common::ApiError;
 use crate::error::AssistantError;
 pub use crate::state::AssistantRouterState;
 
-const SYSTEM_USER_ID: &str = "system_default_user";
-
 /// Build the router for `/api/assistants/*`.
 pub fn assistant_routes(state: AssistantRouterState) -> Router {
     Router::new()
@@ -64,78 +62,66 @@ async fn list(
 
 async fn create(
     State(state): State<AssistantRouterState>,
-    Extension(user): Extension<CurrentUser>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<CreateAssistantRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<AssistantResponse>>), ApiError> {
-    ensure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let created = state.service.create(req).await?;
+    let created = state.service.create_for_user(&current_user.id, req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
 }
 
 async fn get_one(
     State(state): State<AssistantRouterState>,
-    Extension(user): Extension<CurrentUser>,
+    Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     Query(query): Query<GetAssistantDetailQuery>,
 ) -> Result<Json<ApiResponse<AssistantDetailResponse>>, ApiError> {
     let detail = state
         .service
-        .get_detail_for_user(&id, query.locale.as_deref(), &user.id)
+        .get_detail_for_user(&current_user.id, &id, query.locale.as_deref())
         .await?;
     Ok(Json(ApiResponse::ok(detail)))
 }
 
 async fn update(
     State(state): State<AssistantRouterState>,
-    Extension(user): Extension<CurrentUser>,
+    Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<UpdateAssistantRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
-    ensure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let updated = state.service.update(&id, req).await?;
+    let updated = state.service.update_for_user(&current_user.id, &id, req).await?;
     Ok(Json(ApiResponse::ok(updated)))
 }
 
 async fn delete_one(
     State(state): State<AssistantRouterState>,
-    Extension(user): Extension<CurrentUser>,
+    Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    ensure_admin(&user)?;
-    state.service.delete(&id).await?;
+    state.service.delete_for_user(&current_user.id, &id).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn set_state(
     State(state): State<AssistantRouterState>,
-    Extension(user): Extension<CurrentUser>,
+    Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SetAssistantStateRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let resp = state.service.set_state_for_user(&id, &user.id, req).await?;
+    let resp = state.service.set_state_for_user(&current_user.id, &id, req).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
 
 async fn import(
     State(state): State<AssistantRouterState>,
-    Extension(user): Extension<CurrentUser>,
+    Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ImportAssistantsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportAssistantsResult>>, ApiError> {
-    ensure_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let result = state.service.import(req).await?;
+    let result = state.service.import_for_user(&current_user.id, req).await?;
     Ok(Json(ApiResponse::ok(result)))
-}
-
-fn ensure_admin(user: &CurrentUser) -> Result<(), ApiError> {
-    if user.id == SYSTEM_USER_ID {
-        Ok(())
-    } else {
-        Err(ApiError::Forbidden("Administrator access required".into()))
-    }
 }
 
 /// Serve the raw avatar bytes for an assistant. Content-Type inferred from the
