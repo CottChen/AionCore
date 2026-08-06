@@ -134,12 +134,7 @@ fn json_request_for_user(user_id: &str, method: &str, uri: &str, body: serde_jso
     req
 }
 
-fn json_request_as_regular_user(
-    user_id: &str,
-    method: &str,
-    uri: &str,
-    body: serde_json::Value,
-) -> Request<Body> {
+fn json_request_as_regular_user(user_id: &str, method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
     let mut req = Request::builder()
         .method(method)
         .uri(uri)
@@ -296,15 +291,6 @@ async fn settings_are_scoped_by_current_user() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let stored_value: String = sqlx::query_scalar(
-        "SELECT value FROM user_client_preferences WHERE user_id = ? AND key = 'theme.activeId'",
-    )
-    .bind(TEST_USER_ID)
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(stored_value, "\"dark\"");
-
     let owner_app = settings_routes(build_state(&db));
     let owner_resp = owner_app
         .oneshot(get_request_for_user(TEST_USER_ID, "/api/settings"))
@@ -458,6 +444,14 @@ async fn client_preferences_are_scoped_by_current_user() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+
+    let stored_value: String =
+        sqlx::query_scalar("SELECT value FROM user_client_preferences WHERE user_id = ? AND key = 'theme.activeId'")
+            .bind(TEST_USER_ID)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored_value, "\"dark\"");
 
     let owner_app = settings_routes(build_state(&db));
     let owner_resp = owner_app
