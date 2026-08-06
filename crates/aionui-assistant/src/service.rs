@@ -3654,6 +3654,7 @@ mod tests {
             AssistantServiceDeps {
                 definition_repo: Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone())),
                 state_repo: Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone())),
+                user_state_repo: Arc::new(SqliteAssistantUserOverlayRepository::new(db.pool().clone())),
                 preference_repo: Arc::new(SqliteAssistantPreferenceRepository::new(db.pool().clone())),
                 repo: Arc::new(SqliteAssistantRepository::new(db.pool().clone())),
                 override_repo: Arc::new(SqliteAssistantOverrideRepository::new(db.pool().clone())),
