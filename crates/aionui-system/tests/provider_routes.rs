@@ -30,6 +30,7 @@ use aionui_system::{
 const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42; 32];
 const TEST_USER_ID: &str = "user-1";
 const OTHER_USER_ID: &str = "user-2";
+const ADMIN_USER_ID: &str = "system_default_user";
 
 fn build_state(db: &aionui_db::Database) -> SystemRouterState {
     let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
@@ -71,7 +72,7 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 }
 
 fn get_request(uri: &str) -> Request<Body> {
-    get_request_for_user(TEST_USER_ID, uri)
+    get_request_for_user(ADMIN_USER_ID, uri)
 }
 
 fn get_request_for_user(user_id: &str, uri: &str) -> Request<Body> {
@@ -87,7 +88,7 @@ fn get_request_for_user(user_id: &str, uri: &str) -> Request<Body> {
 
 fn admin_user() -> CurrentUser {
     CurrentUser {
-        id: "system_default_user".to_string(),
+        id: ADMIN_USER_ID.to_string(),
         username: "admin".to_string(),
         user_type: UserType::Local,
         status: UserStatus::Active,
@@ -263,7 +264,7 @@ async fn create_provider_ignores_body_user_id() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    assert_eq!(owner, TEST_USER_ID);
+    assert_eq!(owner, ADMIN_USER_ID);
 
     let other_app = system_routes(build_state(&db));
     let resp = other_app
@@ -367,7 +368,10 @@ async fn create_provider_persists_model_settings() {
     assert_eq!(create_resp.status(), StatusCode::CREATED);
 
     let list_app = system_routes(build_state(&db));
-    let list_resp = list_app.oneshot(get_request("/api/providers")).await.unwrap();
+    let list_resp = list_app
+        .oneshot(get_request_for_user(ADMIN_USER_ID, "/api/providers"))
+        .await
+        .unwrap();
     let list_json = body_json(list_resp).await;
     assert_eq!(
         list_json["data"][0]["model_settings"]["gpt-5.6-sol"]["image_input"],
@@ -539,7 +543,7 @@ async fn update_provider_nonexistent() {
 }
 
 #[tokio::test]
-async fn cross_user_provider_update_delete_are_not_found() {
+async fn cross_user_provider_update_delete_are_forbidden() {
     let (_app, db) = setup().await;
     let (_, id) = create_one(&db).await;
 
@@ -553,14 +557,14 @@ async fn cross_user_provider_update_delete_are_not_found() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     let delete_app = system_routes(build_state(&db));
     let resp = delete_app
         .oneshot(delete_request_for_user(OTHER_USER_ID, &format!("/api/providers/{id}")))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     let owner_app = system_routes(build_state(&db));
     let resp = owner_app.oneshot(get_request("/api/providers")).await.unwrap();
