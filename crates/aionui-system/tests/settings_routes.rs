@@ -84,6 +84,32 @@ fn get_request(uri: &str) -> Request<Body> {
     req
 }
 
+fn get_request_for_user(user_id: &str, uri: &str) -> Request<Body> {
+    let mut req = Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+    req.extensions_mut().insert(if user_id == TEST_USER_ID {
+        admin_user()
+    } else {
+        CurrentUser {
+            id: user_id.to_owned(),
+            username: user_id.to_owned(),
+            user_type: UserType::Local,
+            status: UserStatus::Active,
+        }
+    });
+    req
+}
+
+fn get_request_as_regular_user(user_id: &str, uri: &str) -> Request<Body> {
+    let mut req = Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap();
+    req.extensions_mut().insert(CurrentUser {
+        id: user_id.to_owned(),
+        username: user_id.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
+    });
+    req
+}
+
 fn json_request(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
     json_request_for_user(TEST_USER_ID, method, uri, body)
 }
@@ -104,6 +130,27 @@ fn json_request_for_user(user_id: &str, method: &str, uri: &str, body: serde_jso
             user_type: UserType::Local,
             status: UserStatus::Active,
         }
+    });
+    req
+}
+
+fn json_request_as_regular_user(
+    user_id: &str,
+    method: &str,
+    uri: &str,
+    body: serde_json::Value,
+) -> Request<Body> {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    req.extensions_mut().insert(CurrentUser {
+        id: user_id.to_owned(),
+        username: user_id.to_owned(),
+        user_type: UserType::Local,
+        status: UserStatus::Active,
     });
     req
 }
@@ -249,6 +296,15 @@ async fn settings_are_scoped_by_current_user() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
+    let stored_value: String = sqlx::query_scalar(
+        "SELECT value FROM user_client_preferences WHERE user_id = ? AND key = 'theme.activeId'",
+    )
+    .bind(TEST_USER_ID)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored_value, "\"dark\"");
+
     let owner_app = settings_routes(build_state(&db));
     let owner_resp = owner_app
         .oneshot(get_request_for_user(TEST_USER_ID, "/api/settings"))
@@ -378,14 +434,26 @@ async fn client_preferences_are_scoped_by_current_user() {
     let (app, db) = setup().await;
 
     let resp = app
-        .oneshot(json_request_for_user(
+        .oneshot(json_request_as_regular_user(
             TEST_USER_ID,
             "PUT",
             "/api/settings/client",
             serde_json::json!({
-                "theme": "dark",
+                "theme.activeId": "dark",
                 "user_id": OTHER_USER_ID
             }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let app = settings_routes(build_state(&db));
+    let resp = app
+        .oneshot(json_request_as_regular_user(
+            TEST_USER_ID,
+            "PUT",
+            "/api/settings/client",
+            serde_json::json!({ "theme.activeId": "dark" }),
         ))
         .await
         .unwrap();
@@ -393,15 +461,15 @@ async fn client_preferences_are_scoped_by_current_user() {
 
     let owner_app = settings_routes(build_state(&db));
     let owner_resp = owner_app
-        .oneshot(get_request_for_user(TEST_USER_ID, "/api/settings/client"))
+        .oneshot(get_request_as_regular_user(TEST_USER_ID, "/api/settings/client"))
         .await
         .unwrap();
     let owner_json = body_json(owner_resp).await;
-    assert_eq!(owner_json["data"]["theme"], "dark");
+    assert_eq!(owner_json["data"]["theme.activeId"], "dark");
 
     let other_app = settings_routes(build_state(&db));
     let other_resp = other_app
-        .oneshot(get_request_for_user(OTHER_USER_ID, "/api/settings/client"))
+        .oneshot(get_request_as_regular_user(OTHER_USER_ID, "/api/settings/client"))
         .await
         .unwrap();
     let other_json = body_json(other_resp).await;

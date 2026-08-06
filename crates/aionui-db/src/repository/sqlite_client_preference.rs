@@ -51,7 +51,7 @@ impl IClientPreferenceRepository for SqliteClientPreferenceRepository {
 
     async fn get_all_for_user(&self, user_id: &str) -> Result<Vec<ClientPreference>, DbError> {
         let rows = sqlx::query_as::<_, ClientPreference>(
-            "SELECT key, value, updated_at FROM user_client_preferences WHERE user_id = ? ORDER BY key",
+            "SELECT user_id, key, value, updated_at FROM user_client_preferences WHERE user_id = ? ORDER BY key",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -67,7 +67,7 @@ impl IClientPreferenceRepository for SqliteClientPreferenceRepository {
 
         let placeholders: Vec<&str> = keys.iter().map(|_| "?").collect();
         let sql = format!(
-            "SELECT key, value, updated_at FROM user_client_preferences \
+            "SELECT user_id, key, value, updated_at FROM user_client_preferences \
              WHERE user_id = ? AND key IN ({}) ORDER BY key",
             placeholders.join(", ")
         );
