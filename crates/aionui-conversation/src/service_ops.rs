@@ -192,8 +192,10 @@ impl ConversationService {
 
     pub async fn get_config_options(
         &self,
+        user_id: &str,
         conversation_id: &str,
     ) -> Result<GetConfigOptionsResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
         self.task(conversation_id)?
             .get_config_options()
             .await
@@ -202,6 +204,7 @@ impl ConversationService {
 
     pub async fn set_config_option(
         &self,
+        user_id: &str,
         conversation_id: &str,
         option_id: &str,
         req: SetConfigOptionRequest,
@@ -216,6 +219,7 @@ impl ConversationService {
                 reason: "value must not be empty".into(),
             });
         }
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
         let agent = self.task(conversation_id)?;
         let response = match agent.set_config_option(option_id, &req.value).await {
             Ok(response) => response,
@@ -268,7 +272,10 @@ impl ConversationService {
                 _ => None,
             };
             if let Some(updates) = updates {
-                if let Err(err) = self.persist_runtime_assistant_snapshot(conversation_id, updates).await {
+                if let Err(err) = self
+                    .persist_runtime_assistant_snapshot(user_id, conversation_id, updates)
+                    .await
+                {
                     warn!(
                         conversation_id,
                         option_id,
@@ -277,7 +284,7 @@ impl ConversationService {
                     );
                 }
                 if let Err(err) = self
-                    .persist_runtime_assistant_preferences(conversation_id, updates)
+                    .persist_runtime_assistant_preferences(user_id, conversation_id, updates)
                     .await
                 {
                     warn!(
@@ -295,14 +302,37 @@ impl ConversationService {
 
     // ── Usage / Slash commands ──────────────────────────────────────
 
-    pub async fn get_usage(&self, conversation_id: &str) -> Result<Option<serde_json::Value>, ConversationError> {
-        self.task(conversation_id)?
-            .get_usage()
+    pub async fn get_usage(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<serde_json::Value>, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        // A reaped task must NOT mean "no usage". The indicator's whole point is
+        // to survive switching away and back, and the snapshot it needs is
+        // already durable in `acp_session.session_config.runtime.context_usage`
+        // — `SessionAgentTask::get_usage` reads it from there too. Requiring a
+        // live task here made the figure vanish exactly when the user returned
+        // to an idle conversation.
+        if let Ok(task) = self.task(conversation_id) {
+            return task.get_usage().await.map_err(ConversationError::from);
+        }
+        let state = self
+            .acp_session_repo()
+            .load_runtime_state_for_user(user_id, conversation_id)
             .await
-            .map_err(ConversationError::from)
+            .map_err(|e| ConversationError::internal(format!("Failed to load usage state: {e}")))?;
+        Ok(state
+            .and_then(|s| s.context_usage_json)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()))
     }
 
-    pub async fn get_slash_commands(&self, conversation_id: &str) -> Result<Vec<SlashCommandItem>, ConversationError> {
+    pub async fn get_slash_commands(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<SlashCommandItem>, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
         self.task(conversation_id)?
             .get_slash_commands()
             .await
@@ -313,15 +343,33 @@ impl ConversationService {
 
     pub async fn handle_side_question(
         &self,
+        user_id: &str,
         conversation_id: &str,
         req: SideQuestionRequest,
     ) -> Result<SideQuestionResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
         // `AgentInstance::handle_side_question` already validates that the
         // question is non-empty; no need to duplicate the check here.
         self.task(conversation_id)?
             .handle_side_question(req)
             .await
             .map_err(ConversationError::from)
+    }
+
+    async fn ensure_owned_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), ConversationError> {
+        let exists = self
+            .conversation_repo()
+            .get(user_id, conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
+            .is_some();
+        if exists {
+            Ok(())
+        } else {
+            Err(ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })
+        }
     }
 
     // ── Workspace browsing ──────────────────────────────────────────
@@ -332,6 +380,7 @@ impl ConversationService {
     /// depth cap of [`MAX_DIR_DEPTH`].
     pub async fn browse_workspace(
         &self,
+        user_id: &str,
         conversation_id: &str,
         query: WorkspaceBrowseQuery,
     ) -> Result<Vec<WorkspaceEntry>, ConversationError> {
@@ -343,7 +392,7 @@ impl ConversationService {
 
         let row = self
             .conversation_repo()
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
             .ok_or_else(|| ConversationError::NotFound {

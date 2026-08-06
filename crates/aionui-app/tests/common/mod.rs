@@ -38,7 +38,8 @@ pub async fn build_app_with_data_dir(root: &std::path::Path) -> (axum::Router, A
 /// (E1 `/api/skills`, E3/E4 built-in reads, E5 `/api/skills/info`).
 /// Returns the router, services, and the `SkillPaths` so the test can seed
 /// fixtures at known locations. `/api/skills` reads the database only; tests
-/// that seed skill directories should call `sync_skill_catalog_for_test`.
+/// that seed skill directories should call `sync_skill_catalog_for_test` for
+/// the logged-in user.
 #[allow(dead_code)]
 pub async fn build_app_with_skill_paths(root: &std::path::Path) -> (axum::Router, AppServices, SkillPaths) {
     let db = aionui_db::init_database_memory().await.unwrap();
@@ -90,9 +91,15 @@ pub async fn build_app_with_skill_paths(root: &std::path::Path) -> (axum::Router
     (router, services, paths)
 }
 
-pub async fn sync_skill_catalog_for_test(services: &AppServices, paths: &SkillPaths) {
+pub async fn sync_skill_catalog_for_test(services: &AppServices, paths: &SkillPaths, username: &str) {
     let repo = aionui_db::SqliteSkillRepository::new(services.database.pool().clone());
-    aionui_extension::sync_skill_catalog_into_repo(paths, &repo)
+    let user = services
+        .user_repo
+        .find_by_username(username)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("test user '{username}' should exist"));
+    aionui_extension::sync_skill_catalog_into_repo_for_user(paths, &repo, &user.id)
         .await
         .expect("sync skill catalog");
 }

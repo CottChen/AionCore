@@ -5,6 +5,7 @@ use aionui_db::{IClientPreferenceRepository, IConversationRepository};
 use aionui_file::{FileError, IUploadWorkspaceResolver};
 
 const SAVE_UPLOAD_TO_WORKSPACE_KEY: &str = "upload.saveToWorkspace";
+const SYSTEM_USER_ID: &str = "system_default_user";
 
 pub struct AppUploadWorkspaceResolver {
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -25,7 +26,7 @@ impl AppUploadWorkspaceResolver {
     async fn save_to_workspace_enabled(&self) -> Result<bool, FileError> {
         let rows = self
             .preference_repo
-            .get_by_keys(&[SAVE_UPLOAD_TO_WORKSPACE_KEY])
+            .get_by_keys(SYSTEM_USER_ID, &[SAVE_UPLOAD_TO_WORKSPACE_KEY])
             .await
             .map_err(|error| FileError::Internal(format!("failed to read upload preference: {error}")))?;
 
@@ -50,10 +51,9 @@ impl IUploadWorkspaceResolver for AppUploadWorkspaceResolver {
 
         let row = self
             .conversation_repo
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await
             .map_err(|error| FileError::Internal(format!("failed to resolve upload conversation: {error}")))?
-            .filter(|row| row.user_id == user_id)
             .ok_or_else(|| FileError::NotFound("conversation not found".to_owned()))?;
 
         let extra: serde_json::Value = serde_json::from_str(&row.extra)

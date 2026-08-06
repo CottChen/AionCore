@@ -18,14 +18,17 @@ use crate::models::{
 pub trait IConversationRepository: Send + Sync {
     // ── Conversation CRUD ───────────────────────────────────────────
 
-    /// Returns a conversation by ID, or `None` if not found.
-    async fn get(&self, id: &str) -> Result<Option<ConversationRow>, DbError>;
+    /// Returns a conversation by user and ID, or `None` if not found.
+    async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError>;
+
+    /// Returns the owner user ID for a conversation, or `None` if the conversation does not exist.
+    async fn owner_user_id(&self, id: &str) -> Result<Option<String>, DbError>;
 
     /// Inserts a new conversation row.
     async fn create(&self, row: &ConversationRow) -> Result<(), DbError>;
 
-    /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing.
-    async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
+    /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing for the user.
+    async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 
     /// Transfers a conversation to another user.
     async fn transfer_owner(&self, id: &str, target_user_id: &str) -> Result<(), DbError> {
@@ -34,8 +37,8 @@ pub trait IConversationRepository: Send + Sync {
     }
 
     /// Deletes a conversation (messages cascade via FK).
-    /// Returns `DbError::NotFound` if ID is missing.
-    async fn delete(&self, id: &str) -> Result<(), DbError>;
+    /// Returns `DbError::NotFound` if ID is missing for the user.
+    async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;
 
     /// Lists conversations with cursor-based pagination and optional filters.
     async fn list_paginated(
@@ -65,6 +68,7 @@ pub trait IConversationRepository: Send + Sync {
     /// Returns the persisted assistant snapshot for a conversation, if any.
     async fn get_assistant_snapshot(
         &self,
+        _user_id: &str,
         _conversation_id: &str,
     ) -> Result<Option<ConversationAssistantSnapshotRow>, DbError> {
         Ok(None)
@@ -73,11 +77,12 @@ pub trait IConversationRepository: Send + Sync {
     /// Returns persisted assistant snapshots for a set of conversations.
     async fn list_assistant_snapshots(
         &self,
+        user_id: &str,
         conversation_ids: &[String],
     ) -> Result<Vec<ConversationAssistantSnapshotRow>, DbError> {
         let mut snapshots = Vec::new();
         for conversation_id in conversation_ids {
-            if let Some(snapshot) = self.get_assistant_snapshot(conversation_id).await? {
+            if let Some(snapshot) = self.get_assistant_snapshot(user_id, conversation_id).await? {
                 snapshots.push(snapshot);
             }
         }
@@ -87,36 +92,48 @@ pub trait IConversationRepository: Send + Sync {
     /// Inserts or updates a persisted assistant snapshot for a conversation.
     async fn upsert_assistant_snapshot(
         &self,
+        _user_id: &str,
         _params: &UpsertConversationAssistantSnapshotParams<'_>,
     ) -> Result<Option<ConversationAssistantSnapshotRow>, DbError> {
         Ok(None)
     }
 
     /// Deletes the assistant snapshot bound to a conversation.
-    async fn delete_assistant_snapshot(&self, _conversation_id: &str) -> Result<bool, DbError> {
+    async fn delete_assistant_snapshot(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, DbError> {
         Ok(false)
     }
 
     // ── Message operations ──────────────────────────────────────────
 
     /// Returns cursor-paginated messages for a conversation in ascending display order.
-    async fn list_messages_page(&self, conv_id: &str, params: &MessagePageParams)
-    -> Result<MessagePageResult, DbError>;
+    async fn list_messages_page(
+        &self,
+        user_id: &str,
+        conv_id: &str,
+        params: &MessagePageParams,
+    ) -> Result<MessagePageResult, DbError>;
 
     /// Returns a single message scoped to a conversation.
-    async fn get_message(&self, _conv_id: &str, _message_id: &str) -> Result<Option<MessageRow>, DbError> {
+    async fn get_message(
+        &self,
+        _user_id: &str,
+        _conv_id: &str,
+        _message_id: &str,
+    ) -> Result<Option<MessageRow>, DbError> {
         Ok(None)
     }
 
     /// Inserts a new message row.
-    async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError>;
+    async fn insert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError>;
 
     /// Inserts a message row, or merges mutable fields into the existing row with the same ID.
-    async fn upsert_message(&self, message: &MessageRow) -> Result<(), DbError> {
-        match self.insert_message(message).await {
+    async fn upsert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
+        match self.insert_message(user_id, message).await {
             Ok(()) => Ok(()),
             Err(DbError::Conflict(_)) => {
                 self.update_message(
+                    user_id,
+                    &message.conversation_id,
                     &message.id,
                     &MessageRowUpdate {
                         content: Some(message.content.clone()),
@@ -131,14 +148,69 @@ pub trait IConversationRepository: Send + Sync {
     }
 
     /// Partially updates a message. Returns `DbError::NotFound` if ID is missing.
-    async fn update_message(&self, id: &str, updates: &MessageRowUpdate) -> Result<(), DbError>;
+    async fn update_message(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        id: &str,
+        updates: &MessageRowUpdate,
+    ) -> Result<(), DbError>;
 
     /// Deletes all messages belonging to a conversation.
-    async fn delete_messages_by_conversation(&self, conv_id: &str) -> Result<(), DbError>;
+    async fn delete_messages_by_conversation(&self, user_id: &str, conv_id: &str) -> Result<(), DbError>;
+
+    /// Copies every source message at or before the fork point — `(created_at,
+    /// id)` cursor, endpoint inclusive — into the target conversation inside a
+    /// single transaction, reminting primary keys with time-ordered ids so the
+    /// copies keep their relative `(created_at, id)` display order. `msg_id`
+    /// and `created_at` are preserved verbatim; `backend_turn_id` is dropped
+    /// (it anchors the SOURCE conversation's backend thread and would poison
+    /// fork-point resolution in the copy). Returns the number of copied rows.
+    ///
+    /// Both conversations must belong to `user_id`. Default is unsupported so
+    /// test doubles that never fork don't have to implement it.
+    async fn copy_messages_up_to(
+        &self,
+        _user_id: &str,
+        _source_conversation_id: &str,
+        _target_conversation_id: &str,
+        _cursor: (TimestampMs, &str),
+    ) -> Result<u64, DbError> {
+        Err(DbError::Init(
+            "copy_messages_up_to is not supported by this repository".into(),
+        ))
+    }
+
+    /// Resolves the backend turn anchor for a fork point: the `backend_turn_id`
+    /// of the nearest row at or before the `(created_at, id)` cursor that has
+    /// one. `Ok(None)` when no row up to the fork point carries an anchor
+    /// (HEAD forks never need one; mid-history forks must then be refused).
+    async fn resolve_backend_turn_anchor(
+        &self,
+        _user_id: &str,
+        _conv_id: &str,
+        _cursor: (TimestampMs, &str),
+    ) -> Result<Option<String>, DbError> {
+        Ok(None)
+    }
+
+    /// Finds a message by (conversation_id, msg_id) regardless of type — the
+    /// fork API's fallback: live-streamed frontend messages only know their
+    /// stream `msg_id` (their local `id` is never persisted). Returns the
+    /// EARLIEST match so a fork lands at the segment that opened the bubble.
+    async fn get_message_by_msg_id_any(
+        &self,
+        _user_id: &str,
+        _conv_id: &str,
+        _msg_id: &str,
+    ) -> Result<Option<MessageRow>, DbError> {
+        Ok(None)
+    }
 
     /// Finds a message by (conversation_id, msg_id, type) triple.
     async fn get_message_by_msg_id(
         &self,
+        user_id: &str,
         conv_id: &str,
         msg_id: &str,
         msg_type: &str,
@@ -146,7 +218,7 @@ pub trait IConversationRepository: Send + Sync {
 
     /// Lists stale assistant-side runtime messages that were left in a
     /// non-terminal state by a previous process.
-    async fn list_stale_runtime_messages(&self) -> Result<Vec<MessageRow>, DbError> {
+    async fn list_stale_runtime_messages(&self) -> Result<Vec<StaleRuntimeMessageRow>, DbError> {
         Ok(Vec::new())
     }
 
@@ -160,13 +232,18 @@ pub trait IConversationRepository: Send + Sync {
     ) -> Result<PaginatedResult<MessageSearchRow>, DbError>;
 
     /// Returns persisted conversation artifacts ordered by `created_at`.
-    async fn list_artifacts(&self, _conversation_id: &str) -> Result<Vec<ConversationArtifactRow>, DbError> {
+    async fn list_artifacts(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+    ) -> Result<Vec<ConversationArtifactRow>, DbError> {
         Ok(Vec::new())
     }
 
     /// Returns a conversation artifact by ID scoped to a conversation.
     async fn get_artifact(
         &self,
+        _user_id: &str,
         _conversation_id: &str,
         _artifact_id: &str,
     ) -> Result<Option<ConversationArtifactRow>, DbError> {
@@ -174,13 +251,18 @@ pub trait IConversationRepository: Send + Sync {
     }
 
     /// Inserts or updates a conversation artifact by primary key.
-    async fn upsert_artifact(&self, artifact: &ConversationArtifactRow) -> Result<ConversationArtifactRow, DbError> {
+    async fn upsert_artifact(
+        &self,
+        _user_id: &str,
+        artifact: &ConversationArtifactRow,
+    ) -> Result<ConversationArtifactRow, DbError> {
         Ok(artifact.clone())
     }
 
     /// Updates artifact status and returns the updated row if found.
     async fn update_artifact_status(
         &self,
+        _user_id: &str,
         _conversation_id: &str,
         _artifact_id: &str,
         _status: &str,
@@ -192,6 +274,7 @@ pub trait IConversationRepository: Send + Sync {
     /// Marks all skill suggestion artifacts for a cron job as saved.
     async fn mark_skill_suggest_artifacts_saved(
         &self,
+        _user_id: &str,
         _cron_job_id: &str,
         _updated_at: TimestampMs,
     ) -> Result<Vec<ConversationArtifactRow>, DbError> {
@@ -199,13 +282,17 @@ pub trait IConversationRepository: Send + Sync {
     }
 
     /// Deletes all artifacts belonging to a conversation.
-    async fn delete_artifacts_by_conversation(&self, _conversation_id: &str) -> Result<(), DbError> {
+    async fn delete_artifacts_by_conversation(&self, _user_id: &str, _conversation_id: &str) -> Result<(), DbError> {
         Ok(())
     }
 
     /// Returns legacy persisted cron trigger rows so callers can synthesize
     /// artifact cards for historical conversations created before artifact migration.
-    async fn list_legacy_cron_trigger_messages(&self, _conversation_id: &str) -> Result<Vec<MessageRow>, DbError> {
+    async fn list_legacy_cron_trigger_messages(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+    ) -> Result<Vec<MessageRow>, DbError> {
         Ok(Vec::new())
     }
 }
@@ -249,6 +336,12 @@ pub struct MessagePageResult {
     pub has_more_after: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleRuntimeMessageRow {
+    pub user_id: String,
+    pub message: MessageRow,
+}
+
 /// Filters for paginated conversation listing.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationFilters {
@@ -282,6 +375,12 @@ pub struct ConversationRowUpdate {
     pub extra: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<TimestampMs>,
+    /// Project binding (project-bind side branch); `Some` sets the column.
+    pub project_id: Option<String>,
+    pub folder_id: Option<String>,
+    /// Origin of `name` when this update also renames: `Some("user"|"agent")`
+    /// sets the column, `None` leaves it untouched. Never cleared back to NULL.
+    pub name_source: Option<String>,
 }
 
 /// Partial update payload for a message row.

@@ -17,6 +17,8 @@ use aionui_db::{
 };
 use aionui_realtime::BroadcastEventBus;
 
+const TEST_USER_ID: &str = "system_default_user";
+
 fn test_encryption_key() -> [u8; 32] {
     [0xABu8; 32]
 }
@@ -42,6 +44,7 @@ async fn insert_test_provider(repo: &dyn IProviderRepository, id: &str, platform
     let encrypted_api_key = encrypt_string("sk-test-key-12345", &key).unwrap();
     repo.create(CreateProviderParams {
         id: Some(id),
+        user_id: TEST_USER_ID,
         platform,
         name: "Test Provider",
         base_url: "https://api.example.com/v1",
@@ -68,6 +71,15 @@ fn make_factory(
 ) -> aionui_ai_agent::task_manager::AgentFactory {
     let tmp = tempfile::TempDir::new().unwrap();
     let skill_paths = Arc::new(aionui_extension::resolve_skill_paths(tmp.path(), tmp.path()));
+    // These provider integration tests only build aionrs tasks, which never touch
+    // the session spawner. It just has to be constructable (the field is no longer
+    // optional now that claude/codex always use the direct-CLI session path).
+    let process_registry = Arc::new(aionui_process::FileRegistryStore::new(tmp.path()));
+    let session_spawner: Arc<dyn aionui_process::Spawner> = Arc::new(aionui_process::RealSpawner::new(
+        process_registry,
+        uuid::Uuid::now_v7(),
+        aionui_process::local_machine_id(tmp.path()),
+    ));
     build_agent_factory(AgentFactoryDeps {
         skill_manager: AcpSkillManager::new(skill_paths),
         provider_repo,
@@ -79,6 +91,11 @@ fn make_factory(
         broadcaster: Arc::new(BroadcastEventBus::new(16)),
         backend_binary_path: Arc::new(PathBuf::from("/tmp/aionrs-test/aioncore")),
         mcp_server_repo: None,
+        session_spawner,
+        // No hook bridge in this test: it exercises provider wiring, not the
+        // Antigravity permission path.
+        antigravity_hook_base_url: None,
+        antigravity_hook_tokens: Arc::new(aionui_ai_agent::antigravity_hook::HookTokenRegistry::new()),
     })
 }
 
@@ -91,7 +108,7 @@ fn make_aionrs_options(
     BuildTaskOptions::new(AgentSessionContext {
         conversation: ConversationContext {
             conversation_id: conversation_id.to_owned(),
-            user_id: "user-1".to_owned(),
+            user_id: "system_default_user".to_owned(),
             agent_type: AgentType::Aionrs,
             source: None,
         },

@@ -9,6 +9,7 @@ aionui-api-types.workspace = true
 aionui-realtime.workspace = true
 aionui-auth.workspace = true
 aionui-file.workspace = true
+aionui-project.workspace = true
 aionui-runtime.workspace = true
 axum.workspace = true
 tokio.workspace = true
@@ -29,4 +30,6 @@ async-trait.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
+rust_xlsxwriter.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+aionui-db.workspace = true

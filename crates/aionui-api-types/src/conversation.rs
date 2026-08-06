@@ -5,6 +5,7 @@ use aionui_common::{
 use serde::{Deserialize, Serialize};
 
 use crate::acp::AcpConfigOptionDto;
+use crate::chat_file::ChatFileRef;
 
 /// Per-MCP snapshot status stored in `conversation.extra`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,6 +66,34 @@ pub struct CreateConversationRequest {
     pub extra: serde_json::Value,
 }
 
+/// Body for `POST /api/conversations/{id}/fork`.
+///
+/// Forks the conversation at `message_id` (inclusive) into a NEW conversation
+/// that inherits the parent's workspace/agent/history. The backend session
+/// materializes lazily on the fork's first open (see `AcpBuildExtra.fork`).
+#[derive(Debug, Deserialize)]
+pub struct ForkConversationRequest {
+    /// The fork point: a message in the parent conversation (inclusive).
+    pub message_id: String,
+    /// Optional name for the forked conversation; defaults to the parent's.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Session-fork capability projection for one conversation, sourced from
+/// `agent_metadata.agent_capabilities.session_capabilities.fork` (ACP agents:
+/// handshake-persisted; claude/codex: migration-constructed). `Some` = the fork
+/// entry point may be shown; `None` = hidden. Filled only on the single-
+/// conversation detail path (list responses omit it — no N+1).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForkCapabilityView {
+    /// Whether the backend can fork at an ARBITRARY turn (codex
+    /// `thread/fork.lastTurnId`). `false` = HEAD fork only → the UI shows the
+    /// entry point only on the last turn's messages.
+    #[serde(default)]
+    pub at_turn: bool,
+}
+
 /// Body for `PATCH /api/conversations/:id`.
 ///
 /// All fields optional — only supplied fields are applied.
@@ -72,6 +101,13 @@ pub struct CreateConversationRequest {
 #[derive(Debug, Deserialize)]
 pub struct UpdateConversationRequest {
     pub name: Option<String>,
+    /// Intent of a `name` change: `"user"` = explicit rename (agent titles
+    /// will never overwrite it afterwards), `"auto"` = frontend-derived
+    /// default title (keeps the name overwritable by agent titles).
+    /// Absent defaults to `"user"` so old clients' renames stay protected.
+    /// Ignored when `name` is absent.
+    #[serde(default)]
+    pub name_source: Option<String>,
     pub pinned: Option<bool>,
     pub model: Option<ProviderWithModel>,
     pub extra: Option<serde_json::Value>,
@@ -94,7 +130,7 @@ pub struct CloneConversationRequest {
 pub struct SendMessageRequest {
     pub content: String,
     #[serde(default)]
-    pub files: Vec<String>,
+    pub files: Vec<ChatFileRef>,
     #[serde(default)]
     pub inject_skills: Vec<String>,
     #[serde(default)]
@@ -252,6 +288,11 @@ pub struct SearchMessagesQuery {
 pub struct ConversationResponse {
     pub id: String,
     pub name: String,
+    /// Origin of the current `name`: `"user"` (explicit rename, protected),
+    /// `"agent"` (agent-generated title), or absent for a default/placeholder
+    /// name that agents may replace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_source: Option<String>,
     pub r#type: AgentType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ProviderWithModel>,
@@ -267,6 +308,12 @@ pub struct ConversationResponse {
     pub channel_chat_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant: Option<ConversationAssistantIdentityResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Service-layer post-fill on the DETAIL path only (like `runtime`);
+    /// `None` on list responses. See [`ForkCapabilityView`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_capability: Option<ForkCapabilityView>,
     pub created_at: TimestampMs,
     pub modified_at: TimestampMs,
     pub extra: serde_json::Value,
@@ -287,6 +334,12 @@ pub struct MessageResponse {
     pub status: Option<MessageStatus>,
     pub hidden: bool,
     pub created_at: TimestampMs,
+    /// Backend turn anchor (codex `Turn.id`) stamped on rows persisted while
+    /// that turn streamed. Presence tells the UI a mid-history fork can anchor
+    /// at (or after) this message; absent on legacy/copied rows and on
+    /// backends without turn-anchored forks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_turn_id: Option<String>,
 }
 
 /// Cursor-paginated list of messages.
@@ -338,6 +391,14 @@ pub struct ConversationArtifactResponse {
 
 /// List of conversation artifacts for a single conversation.
 pub type ConversationArtifactListResponse = Vec<ConversationArtifactResponse>;
+
+/// Payload of the `conversation.nameUpdated` websocket event, emitted when an
+/// agent-generated session title is applied to a conversation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationNameUpdatedPayload {
+    pub conversation_id: String,
+    pub name: String,
+}
 
 /// A single item from cross-conversation message search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,9 +539,31 @@ mod tests {
         let raw = json!({ "name": "New Name" });
         let req: UpdateConversationRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.name.as_deref(), Some("New Name"));
+        // Absent name_source deserializes as None (the service treats a
+        // name change without it as an explicit user rename).
+        assert!(req.name_source.is_none());
         assert!(req.pinned.is_none());
         assert!(req.model.is_none());
         assert!(req.extra.is_none());
+    }
+
+    #[test]
+    fn deserialize_update_request_name_source_auto() {
+        let raw = json!({ "name": "Derived title", "name_source": "auto" });
+        let req: UpdateConversationRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.name_source.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn conversation_name_updated_payload_round_trip() {
+        let payload = ConversationNameUpdatedPayload {
+            conversation_id: "conv_1".into(),
+            name: "Fix login bug".into(),
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value, json!({ "conversation_id": "conv_1", "name": "Fix login bug" }));
+        let back: ConversationNameUpdatedPayload = serde_json::from_value(value).unwrap();
+        assert_eq!(back, payload);
     }
 
     #[test]
@@ -612,6 +695,7 @@ mod tests {
         let resp = ConversationResponse {
             id: "conv_1".into(),
             name: "Test".into(),
+            name_source: None,
             r#type: AgentType::Acp,
             model: Some(ProviderWithModel {
                 provider_id: "p1".into(),
@@ -625,9 +709,11 @@ mod tests {
             pinned_at: None,
             channel_chat_id: None,
             assistant: None,
+            project_id: None,
             created_at: 1712345678000,
             modified_at: 1712345678000,
             extra: json!({ "workspace": "/project" }),
+            fork_capability: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "conv_1");
@@ -654,6 +740,7 @@ mod tests {
         let resp = ConversationResponse {
             id: "conv_none".into(),
             name: "Test".into(),
+            name_source: None,
             r#type: AgentType::Acp,
             model: None,
             status: ConversationStatus::Pending,
@@ -663,9 +750,11 @@ mod tests {
             pinned_at: None,
             channel_chat_id: None,
             assistant: None,
+            project_id: None,
             created_at: 1,
             modified_at: 1,
             extra: json!({}),
+            fork_capability: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("model").is_none(), "model None should be omitted");
@@ -686,6 +775,7 @@ mod tests {
         let resp = ConversationResponse {
             id: "conv_2".into(),
             name: "Round".into(),
+            name_source: None,
             r#type: AgentType::Acp,
             model: None,
             status: ConversationStatus::Running,
@@ -695,9 +785,11 @@ mod tests {
             pinned_at: Some(1712345678000),
             channel_chat_id: Some("group:42".into()),
             assistant: None,
+            project_id: None,
             created_at: 1000,
             modified_at: 2000,
             extra: json!({}),
+            fork_capability: None,
         };
         let serialized = serde_json::to_string(&resp).unwrap();
         let deserialized: ConversationResponse = serde_json::from_str(&serialized).unwrap();
@@ -721,6 +813,7 @@ mod tests {
             status: Some(MessageStatus::Finish),
             hidden: false,
             created_at: 1712345678000,
+            backend_turn_id: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "msg_1");
@@ -749,6 +842,7 @@ mod tests {
             status: None,
             hidden: true,
             created_at: 5000,
+            backend_turn_id: None,
         };
         let serialized = serde_json::to_string(&resp).unwrap();
         let deserialized: MessageResponse = serde_json::from_str(&serialized).unwrap();
@@ -770,6 +864,7 @@ mod tests {
             conversation: ConversationResponse {
                 id: "conv_1".into(),
                 name: "Code Review".into(),
+                name_source: None,
                 r#type: AgentType::Acp,
                 model: None,
                 status: ConversationStatus::Finished,
@@ -779,9 +874,11 @@ mod tests {
                 pinned_at: None,
                 channel_chat_id: None,
                 assistant: None,
+                project_id: None,
                 created_at: 1712345678000,
                 modified_at: 1712345678000,
                 extra: json!({}),
+                fork_capability: None,
             },
         };
         let json = serde_json::to_value(&item).unwrap();
@@ -807,6 +904,7 @@ mod tests {
             conversation: ConversationResponse {
                 id: "conv_x".into(),
                 name: "Search Test".into(),
+                name_source: None,
                 r#type: AgentType::Acp,
                 model: None,
                 status: ConversationStatus::Finished,
@@ -816,9 +914,11 @@ mod tests {
                 pinned_at: None,
                 channel_chat_id: None,
                 assistant: None,
+                project_id: None,
                 created_at: 9000,
                 modified_at: 9000,
                 extra: json!({}),
+                fork_capability: None,
             },
         };
         let serialized = serde_json::to_string(&item).unwrap();
@@ -835,13 +935,31 @@ mod tests {
     fn deserialize_send_message_full() {
         let raw = json!({
             "content": "Review this code",
-            "files": ["/tmp/a.rs"],
+            "files": [
+                { "kind": "project", "pe_id": "pe1", "relative_path": "src/a.rs" },
+                { "kind": "upload", "path": "/tmp/a.rs" },
+                { "kind": "local", "path": "/Users/me/notes.txt" }
+            ],
             "inject_skills": ["security-review"],
             "hidden": true
         });
         let req: SendMessageRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.content, "Review this code");
-        assert_eq!(req.files, vec!["/tmp/a.rs"]);
+        assert_eq!(
+            req.files,
+            vec![
+                ChatFileRef::Project {
+                    pe_id: "pe1".into(),
+                    relative_path: "src/a.rs".into()
+                },
+                ChatFileRef::Upload {
+                    path: "/tmp/a.rs".into()
+                },
+                ChatFileRef::Local {
+                    path: "/Users/me/notes.txt".into()
+                },
+            ]
+        );
         assert_eq!(req.inject_skills, vec!["security-review"]);
         assert!(req.hidden);
     }
@@ -878,6 +996,7 @@ mod tests {
             items: vec![ConversationResponse {
                 id: "conv_1".into(),
                 name: "Test".into(),
+                name_source: None,
                 r#type: AgentType::Acp,
                 model: None,
                 status: ConversationStatus::Pending,
@@ -887,9 +1006,11 @@ mod tests {
                 pinned_at: None,
                 channel_chat_id: None,
                 assistant: None,
+                project_id: None,
                 created_at: 1000,
                 modified_at: 1000,
                 extra: json!({}),
+                fork_capability: None,
             }],
             total: 1,
             has_more: false,
@@ -930,6 +1051,7 @@ mod tests {
                 conversation: ConversationResponse {
                     id: "c1".into(),
                     name: "Conv".into(),
+                    name_source: None,
                     r#type: AgentType::Acp,
                     model: None,
                     status: ConversationStatus::Finished,
@@ -939,9 +1061,11 @@ mod tests {
                     pinned_at: None,
                     channel_chat_id: None,
                     assistant: None,
+                    project_id: None,
                     created_at: 5000,
                     modified_at: 5000,
                     extra: json!({}),
+                    fork_capability: None,
                 },
             }],
             total: 1,

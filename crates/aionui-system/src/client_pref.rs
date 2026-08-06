@@ -10,6 +10,7 @@ use crate::keep_awake::{DynKeepAwakeController, KEEP_AWAKE_KEY, NoopKeepAwakeCon
 
 /// Maximum allowed key length for client preferences.
 const MAX_KEY_LENGTH: usize = 255;
+const SYSTEM_USER_ID: &str = "system_default_user";
 const USER_OVERRIDABLE_KEYS: &[&str] = &["theme.activeId", "theme.userThemes"];
 
 /// Business logic for client preferences (generic key-value store).
@@ -30,20 +31,32 @@ impl ClientPrefService {
     pub fn with_keep_awake_controller(
         repo: Arc<dyn IClientPreferenceRepository>,
         keep_awake_controller: DynKeepAwakeController,
+        keep_awake_restore_user_id: impl Into<String>,
     ) -> Self {
-        let service = Self {
-            repo,
-            keep_awake_controller,
-        };
-        service.restore_keep_awake_from_preferences();
+        let service = Self::with_keep_awake_controller_without_restore(repo, keep_awake_controller);
+        service.restore_keep_awake_from_preferences(keep_awake_restore_user_id.into());
         service
     }
 
+    pub fn with_keep_awake_controller_without_restore(
+        repo: Arc<dyn IClientPreferenceRepository>,
+        keep_awake_controller: DynKeepAwakeController,
+    ) -> Self {
+        Self {
+            repo,
+            keep_awake_controller,
+        }
+    }
+
     /// Get all client preferences, or only the specified keys.
-    pub async fn get_preferences(&self, keys: Option<&[&str]>) -> Result<ClientPreferencesResponse, SystemError> {
+    pub async fn get_preferences(
+        &self,
+        user_id: &str,
+        keys: Option<&[&str]>,
+    ) -> Result<ClientPreferencesResponse, SystemError> {
         let rows = match keys {
-            Some(k) if !k.is_empty() => self.repo.get_by_keys(k).await,
-            _ => self.repo.get_all().await,
+            Some(k) if !k.is_empty() => self.repo.get_by_keys(user_id, k).await,
+            _ => self.repo.get_all(user_id).await,
         }
         .map_err(|e| SystemError::Internal(format!("Failed to get preferences: {e}")))?;
 
@@ -87,8 +100,8 @@ impl ClientPrefService {
         keys: Option<&[&str]>,
     ) -> Result<ClientPreferencesResponse, SystemError> {
         let global_rows = match keys {
-            Some(k) if !k.is_empty() => self.repo.get_by_keys(k).await,
-            _ => self.repo.get_all().await,
+            Some(k) if !k.is_empty() => self.repo.get_by_keys(SYSTEM_USER_ID, k).await,
+            _ => self.repo.get_all(SYSTEM_USER_ID).await,
         }
         .map_err(|e| SystemError::Internal(format!("Failed to get preferences: {e}")))?;
 
@@ -108,8 +121,13 @@ impl ClientPrefService {
     }
 
     /// Batch update client preferences. Null values delete the key.
-    pub async fn update_preferences(&self, req: UpdateClientPreferencesRequest) -> Result<(), SystemError> {
-        self.update_preferences_inner(req, PreferenceScope::Global).await
+    pub async fn update_preferences(
+        &self,
+        user_id: &str,
+        req: UpdateClientPreferencesRequest,
+    ) -> Result<(), SystemError> {
+        self.update_preferences_inner(req, PreferenceScope::Primary(user_id))
+            .await
     }
 
     /// Batch update client preferences for a WebUI user.
@@ -123,7 +141,7 @@ impl ClientPrefService {
         req: UpdateClientPreferencesRequest,
     ) -> Result<(), SystemError> {
         if is_admin {
-            return self.update_preferences(req).await;
+            return self.update_preferences(SYSTEM_USER_ID, req).await;
         }
 
         for key in req.keys() {
@@ -134,7 +152,8 @@ impl ClientPrefService {
             }
         }
 
-        self.update_preferences_inner(req, PreferenceScope::User(user_id)).await
+        self.update_preferences_inner(req, PreferenceScope::UserOverlay(user_id))
+            .await
     }
 
     async fn update_preferences_inner(
@@ -174,8 +193,11 @@ impl ClientPrefService {
             }
         }
 
+        let scope_user_id = match scope {
+            PreferenceScope::Primary(user_id) | PreferenceScope::UserOverlay(user_id) => user_id,
+        };
         let previous_keep_awake = if keep_awake_update.is_some() {
-            Some(self.get_stored_keep_awake().await?)
+            Some(self.get_stored_keep_awake(scope_user_id).await?)
         } else {
             None
         };
@@ -187,12 +209,12 @@ impl ClientPrefService {
         if !upserts.is_empty() {
             let entries: Vec<(&str, &str)> = upserts.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             let result = match scope {
-                PreferenceScope::Global => self
+                PreferenceScope::Primary(user_id) => self
                     .repo
-                    .upsert_batch(&entries)
+                    .upsert_batch(user_id, &entries)
                     .await
                     .map_err(|e| SystemError::Internal(format!("Failed to upsert preferences: {e}"))),
-                PreferenceScope::User(user_id) => self
+                PreferenceScope::UserOverlay(user_id) => self
                     .repo
                     .upsert_batch_for_user(user_id, &entries)
                     .await
@@ -209,12 +231,12 @@ impl ClientPrefService {
         if !deletes.is_empty() {
             let keys: Vec<&str> = deletes.iter().map(|k| k.as_str()).collect();
             let result = match scope {
-                PreferenceScope::Global => self
+                PreferenceScope::Primary(user_id) => self
                     .repo
-                    .delete_keys(&keys)
+                    .delete_keys(user_id, &keys)
                     .await
                     .map_err(|e| SystemError::Internal(format!("Failed to delete preferences: {e}"))),
-                PreferenceScope::User(user_id) => self
+                PreferenceScope::UserOverlay(user_id) => self
                     .repo
                     .delete_keys_for_user(user_id, &keys)
                     .await
@@ -231,10 +253,19 @@ impl ClientPrefService {
         Ok(())
     }
 
-    async fn get_stored_keep_awake(&self) -> Result<bool, SystemError> {
+    pub async fn release_keep_awake_for_shutdown(&self) -> Result<(), SystemError> {
+        self.keep_awake_controller.set_enabled(false).await.map_err(|error| {
+            warn!(error = %error, "Failed to release system keep-awake assertion during shutdown");
+            error
+        })?;
+        info!("System keep-awake assertion released during shutdown");
+        Ok(())
+    }
+
+    async fn get_stored_keep_awake(&self, user_id: &str) -> Result<bool, SystemError> {
         let rows = self
             .repo
-            .get_by_keys(&[KEEP_AWAKE_KEY])
+            .get_by_keys(user_id, &[KEEP_AWAKE_KEY])
             .await
             .map_err(|e| SystemError::Internal(format!("Failed to get keep-awake preference: {e}")))?;
 
@@ -260,14 +291,14 @@ impl ClientPrefService {
         Ok(())
     }
 
-    fn restore_keep_awake_from_preferences(&self) {
+    fn restore_keep_awake_from_preferences(&self, user_id: String) {
         let service = self.clone();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             warn!("Cannot restore system keep-awake preference without a Tokio runtime");
             return;
         };
         handle.spawn(async move {
-            match service.get_stored_keep_awake().await {
+            match service.get_stored_keep_awake(&user_id).await {
                 Ok(true) => {
                     if let Err(error) = service.apply_keep_awake(true).await {
                         warn!(error = %error, "Failed to restore system keep-awake assertion");
@@ -281,8 +312,8 @@ impl ClientPrefService {
 }
 
 enum PreferenceScope<'a> {
-    Global,
-    User(&'a str),
+    Primary(&'a str),
+    UserOverlay(&'a str),
 }
 
 fn rows_to_map(rows: Vec<aionui_db::ClientPreference>) -> ClientPreferencesResponse {
@@ -342,6 +373,8 @@ mod tests {
     use tracing::Level;
     use tracing_subscriber::fmt;
 
+    const TEST_USER_ID: &str = "user-1";
+
     #[derive(Clone)]
     struct SharedBuf(Arc<Mutex<Vec<u8>>>);
 
@@ -383,6 +416,15 @@ mod tests {
 
     async fn setup() -> ClientPrefService {
         let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, '', 'active', 0, 1, 1)",
+        )
+        .bind(TEST_USER_ID)
+        .bind(TEST_USER_ID)
+        .execute(db.pool())
+        .await
+        .unwrap();
         let repo = Arc::new(SqliteClientPreferenceRepository::new(db.pool().clone()));
         std::mem::forget(db);
         ClientPrefService::new(repo)
@@ -390,6 +432,15 @@ mod tests {
 
     async fn setup_with_keep_awake_controller(controller: DynKeepAwakeController) -> ClientPrefService {
         let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+             VALUES (?, 'local', ?, '', 'active', 0, 1, 1)",
+        )
+        .bind(TEST_USER_ID)
+        .bind(TEST_USER_ID)
+        .execute(db.pool())
+        .await
+        .unwrap();
         let repo = Arc::new(SqliteClientPreferenceRepository::new(db.pool().clone()));
         std::mem::forget(db);
         ClientPrefService {
@@ -437,7 +488,7 @@ mod tests {
     #[tokio::test]
     async fn get_empty_returns_empty_map() {
         let svc = setup().await;
-        let prefs = svc.get_preferences(None).await.unwrap();
+        let prefs = svc.get_preferences(TEST_USER_ID, None).await.unwrap();
         assert!(prefs.is_empty());
     }
 
@@ -446,9 +497,9 @@ mod tests {
         let svc = setup().await;
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert("system.closeToTray".into(), json!(true));
-        svc.update_preferences(req).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, req).await.unwrap();
 
-        let prefs = svc.get_preferences(None).await.unwrap();
+        let prefs = svc.get_preferences(TEST_USER_ID, None).await.unwrap();
         assert_eq!(prefs["system.closeToTray"], json!(true));
     }
 
@@ -457,9 +508,9 @@ mod tests {
         let svc = setup().await;
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert("pet.size".into(), json!(360));
-        svc.update_preferences(req).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, req).await.unwrap();
 
-        let prefs = svc.get_preferences(None).await.unwrap();
+        let prefs = svc.get_preferences(TEST_USER_ID, None).await.unwrap();
         assert_eq!(prefs["pet.size"], json!(360));
     }
 
@@ -468,9 +519,9 @@ mod tests {
         let svc = setup().await;
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert("theme".into(), json!("dark"));
-        svc.update_preferences(req).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, req).await.unwrap();
 
-        let prefs = svc.get_preferences(None).await.unwrap();
+        let prefs = svc.get_preferences(TEST_USER_ID, None).await.unwrap();
         assert_eq!(prefs["theme"], json!("dark"));
     }
 
@@ -480,13 +531,13 @@ mod tests {
 
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert("theme".into(), json!("dark"));
-        svc.update_preferences(req).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, req).await.unwrap();
 
         let mut req2 = UpdateClientPreferencesRequest::new();
         req2.insert("theme".into(), json!(null));
-        svc.update_preferences(req2).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, req2).await.unwrap();
 
-        let prefs = svc.get_preferences(None).await.unwrap();
+        let prefs = svc.get_preferences(TEST_USER_ID, None).await.unwrap();
         assert!(!prefs.contains_key("theme"));
     }
 
@@ -498,9 +549,9 @@ mod tests {
         req.insert("a".into(), json!(1));
         req.insert("b".into(), json!(2));
         req.insert("c".into(), json!(3));
-        svc.update_preferences(req).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, req).await.unwrap();
 
-        let prefs = svc.get_preferences(Some(&["a", "c"])).await.unwrap();
+        let prefs = svc.get_preferences(TEST_USER_ID, Some(&["a", "c"])).await.unwrap();
         assert_eq!(prefs.len(), 2);
         assert_eq!(prefs["a"], json!(1));
         assert_eq!(prefs["c"], json!(3));
@@ -518,10 +569,10 @@ mod tests {
                 let mut req = UpdateClientPreferencesRequest::new();
                 req.insert("appearance.secretTheme".into(), json!("super-secret-value"));
                 req.insert("appearance.deleted".into(), json!(null));
-                svc.update_preferences(req).await.unwrap();
+                svc.update_preferences(TEST_USER_ID, req).await.unwrap();
 
                 let _ = svc
-                    .get_preferences(Some(&["appearance.secretTheme", "appearance.missing"]))
+                    .get_preferences(TEST_USER_ID, Some(&["appearance.secretTheme", "appearance.missing"]))
                     .await
                     .unwrap();
             });
@@ -551,13 +602,13 @@ mod tests {
 
         let mut req1 = UpdateClientPreferencesRequest::new();
         req1.insert("k".into(), json!("v1"));
-        svc.update_preferences(req1).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, req1).await.unwrap();
 
         let mut req2 = UpdateClientPreferencesRequest::new();
         req2.insert("k".into(), json!("v2"));
-        svc.update_preferences(req2).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, req2).await.unwrap();
 
-        let prefs = svc.get_preferences(None).await.unwrap();
+        let prefs = svc.get_preferences(TEST_USER_ID, None).await.unwrap();
         assert_eq!(prefs["k"], json!("v2"));
     }
 
@@ -566,7 +617,7 @@ mod tests {
         let svc = setup().await;
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert("".into(), json!(true));
-        let err = svc.update_preferences(req).await.unwrap_err();
+        let err = svc.update_preferences(TEST_USER_ID, req).await.unwrap_err();
         assert!(matches!(err, SystemError::BadRequest(_)));
     }
 
@@ -575,7 +626,7 @@ mod tests {
         let svc = setup().await;
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert("x".repeat(256), json!(true));
-        let err = svc.update_preferences(req).await.unwrap_err();
+        let err = svc.update_preferences(TEST_USER_ID, req).await.unwrap_err();
         assert!(matches!(err, SystemError::BadRequest(_)));
     }
 
@@ -586,14 +637,14 @@ mod tests {
         let mut setup_req = UpdateClientPreferencesRequest::new();
         setup_req.insert("keep".into(), json!(1));
         setup_req.insert("remove".into(), json!(2));
-        svc.update_preferences(setup_req).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, setup_req).await.unwrap();
 
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert("remove".into(), json!(null));
         req.insert("new".into(), json!(3));
-        svc.update_preferences(req).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, req).await.unwrap();
 
-        let prefs = svc.get_preferences(None).await.unwrap();
+        let prefs = svc.get_preferences(TEST_USER_ID, None).await.unwrap();
         assert_eq!(prefs.len(), 2);
         assert_eq!(prefs["keep"], json!(1));
         assert_eq!(prefs["new"], json!(3));
@@ -649,10 +700,13 @@ mod tests {
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert(KEEP_AWAKE_KEY.into(), json!(true));
 
-        svc.update_preferences(req).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, req).await.unwrap();
 
         assert_eq!(*controller.calls.lock().unwrap(), vec![true]);
-        let prefs = svc.get_preferences(Some(&[KEEP_AWAKE_KEY])).await.unwrap();
+        let prefs = svc
+            .get_preferences(TEST_USER_ID, Some(&[KEEP_AWAKE_KEY]))
+            .await
+            .unwrap();
         assert_eq!(prefs[KEEP_AWAKE_KEY], json!(true));
     }
 
@@ -662,15 +716,36 @@ mod tests {
         let svc = setup_with_keep_awake_controller(controller.clone()).await;
         let mut setup_req = UpdateClientPreferencesRequest::new();
         setup_req.insert(KEEP_AWAKE_KEY.into(), json!(true));
-        svc.update_preferences(setup_req).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, setup_req).await.unwrap();
 
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert(KEEP_AWAKE_KEY.into(), json!(null));
-        svc.update_preferences(req).await.unwrap();
+        svc.update_preferences(TEST_USER_ID, req).await.unwrap();
 
         assert_eq!(*controller.calls.lock().unwrap(), vec![true, false]);
-        let prefs = svc.get_preferences(Some(&[KEEP_AWAKE_KEY])).await.unwrap();
+        let prefs = svc
+            .get_preferences(TEST_USER_ID, Some(&[KEEP_AWAKE_KEY]))
+            .await
+            .unwrap();
         assert!(!prefs.contains_key(KEEP_AWAKE_KEY));
+    }
+
+    #[tokio::test]
+    async fn keep_awake_shutdown_release_does_not_clear_persisted_preference() {
+        let controller = Arc::new(RecordingKeepAwakeController::default());
+        let svc = setup_with_keep_awake_controller(controller.clone()).await;
+        let mut req = UpdateClientPreferencesRequest::new();
+        req.insert(KEEP_AWAKE_KEY.into(), json!(true));
+        svc.update_preferences(TEST_USER_ID, req).await.unwrap();
+
+        svc.release_keep_awake_for_shutdown().await.unwrap();
+
+        assert_eq!(*controller.calls.lock().unwrap(), vec![true, false]);
+        let prefs = svc
+            .get_preferences(TEST_USER_ID, Some(&[KEEP_AWAKE_KEY]))
+            .await
+            .unwrap();
+        assert_eq!(prefs[KEEP_AWAKE_KEY], json!(true));
     }
 
     #[tokio::test]
@@ -680,11 +755,14 @@ mod tests {
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert(KEEP_AWAKE_KEY.into(), json!("yes"));
 
-        let err = svc.update_preferences(req).await.unwrap_err();
+        let err = svc.update_preferences(TEST_USER_ID, req).await.unwrap_err();
 
         assert!(matches!(err, SystemError::BadRequest(_)));
         assert!(controller.calls.lock().unwrap().is_empty());
-        let prefs = svc.get_preferences(Some(&[KEEP_AWAKE_KEY])).await.unwrap();
+        let prefs = svc
+            .get_preferences(TEST_USER_ID, Some(&[KEEP_AWAKE_KEY]))
+            .await
+            .unwrap();
         assert!(!prefs.contains_key(KEEP_AWAKE_KEY));
     }
 
@@ -698,11 +776,14 @@ mod tests {
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert(KEEP_AWAKE_KEY.into(), json!(true));
 
-        let err = svc.update_preferences(req).await.unwrap_err();
+        let err = svc.update_preferences(TEST_USER_ID, req).await.unwrap_err();
 
         assert!(matches!(err, SystemError::Internal(_)));
         assert_eq!(*controller.calls.lock().unwrap(), vec![true]);
-        let prefs = svc.get_preferences(Some(&[KEEP_AWAKE_KEY])).await.unwrap();
+        let prefs = svc
+            .get_preferences(TEST_USER_ID, Some(&[KEEP_AWAKE_KEY]))
+            .await
+            .unwrap();
         assert!(!prefs.contains_key(KEEP_AWAKE_KEY));
     }
 
@@ -711,10 +792,11 @@ mod tests {
         let initial = setup().await;
         let mut req = UpdateClientPreferencesRequest::new();
         req.insert(KEEP_AWAKE_KEY.into(), json!(true));
-        initial.update_preferences(req).await.unwrap();
+        initial.update_preferences(TEST_USER_ID, req).await.unwrap();
 
         let controller = Arc::new(RecordingKeepAwakeController::default());
-        let service = ClientPrefService::with_keep_awake_controller(initial.repo.clone(), controller.clone());
+        let service =
+            ClientPrefService::with_keep_awake_controller(initial.repo.clone(), controller.clone(), TEST_USER_ID);
 
         for _ in 0..50 {
             if !controller.calls.lock().unwrap().is_empty() {
@@ -724,6 +806,23 @@ mod tests {
         }
 
         assert_eq!(*controller.calls.lock().unwrap(), vec![true]);
+        drop(service);
+    }
+
+    #[tokio::test]
+    async fn keep_awake_without_restore_does_not_read_persisted_default_user_preference() {
+        let initial = setup().await;
+        let mut req = UpdateClientPreferencesRequest::new();
+        req.insert(KEEP_AWAKE_KEY.into(), json!(true));
+        initial.update_preferences(TEST_USER_ID, req).await.unwrap();
+
+        let controller = Arc::new(RecordingKeepAwakeController::default());
+        let service =
+            ClientPrefService::with_keep_awake_controller_without_restore(initial.repo.clone(), controller.clone());
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(controller.calls.lock().unwrap().is_empty());
         drop(service);
     }
 }

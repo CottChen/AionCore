@@ -141,10 +141,14 @@ fn ensure_admin(user: &CurrentUser) -> Result<(), ApiError> {
 /// Serve the raw avatar bytes for an assistant. Content-Type inferred from the
 /// file extension (png/jpg/svg default). Extensions return 404 — the frontend
 /// serves those via `aion-asset://`.
-async fn get_avatar(State(state): State<AssistantRouterState>, Path(id): Path<String>) -> Result<Response, ApiError> {
+async fn get_avatar(
+    State(state): State<AssistantRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
     let asset = state
         .service
-        .avatar_asset(&id)
+        .avatar_asset_for_user(&current_user.id, &id)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("avatar '{id}' not found")))?;
 

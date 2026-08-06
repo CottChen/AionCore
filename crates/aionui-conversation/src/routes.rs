@@ -11,9 +11,10 @@ use aionui_api_types::{
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse,
     ConversationRatingResponse, ConversationResponse, CreateConversationRequest, EnsureConversationRuntimeResponse,
-    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationRatingRequest,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, WebuiTransferOwnerRequest,
+    ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SubmitConversationRatingRequest, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    WebuiTransferOwnerRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -34,6 +35,9 @@ impl From<ConversationError> for ApiError {
             }
             ConversationError::Archived { reason, .. } => ApiError::ConversationArchived(reason),
             ConversationError::BadRequest { reason } => ApiError::BadRequest(reason),
+            ConversationError::Busy { reason } if reason.starts_with("CROSS_ACCOUNT_REFERENCE:") => {
+                ApiError::coded(StatusCode::CONFLICT, "CROSS_ACCOUNT_REFERENCE", reason, None)
+            }
             ConversationError::Busy { reason } => ApiError::Conflict(reason),
             ConversationError::Forbidden { reason } => ApiError::Forbidden(reason),
             ConversationError::NotFoundReason { reason } => ApiError::NotFound(reason),
@@ -114,6 +118,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/owner", post(transfer_owner))
         .route("/api/conversations/{id}/reset", post(reset))
+        .route("/api/conversations/{id}/fork", post(fork))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
@@ -232,6 +237,17 @@ async fn reset(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.service.reset(&user.id, &id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
+}
+
+async fn fork(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<ForkConversationRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let conversation = state.service.fork(&user.id, &id, req).await.map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
 }
 
 async fn associated(
@@ -470,9 +486,9 @@ async fn check_approval(
 
 async fn active_count(
     State(state): State<ConversationRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<ActiveCountResponse>>, ApiError> {
-    let count = state.task_manager.active_count();
+    let count = state.service.active_count_for_user(&user.id).await?;
     Ok(Json(ApiResponse::ok(ActiveCountResponse { count })))
 }
 
@@ -484,6 +500,16 @@ mod error_mapping_tests {
     fn conversation_not_found_maps_to_app_not_found() {
         let app = ApiError::from(ConversationError::NotFound { id: "conv_1".into() });
         assert!(matches!(app, ApiError::NotFound(message) if message == "Conversation conv_1 not found"));
+    }
+
+    #[test]
+    fn cross_account_reference_maps_to_stable_conflict_code() {
+        let app = ApiError::from(ConversationError::Busy {
+            reason: "CROSS_ACCOUNT_REFERENCE: acp_session conversation 'conv-1' belongs to another user".into(),
+        });
+
+        assert_eq!(app.status_code(), StatusCode::CONFLICT);
+        assert_eq!(app.error_code(), "CROSS_ACCOUNT_REFERENCE");
     }
 
     #[test]
