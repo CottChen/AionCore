@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+use aionui_db::init_database_memory;
 use sqlx::Row;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -63,9 +64,10 @@ async fn codex_yolo_id(pool: &sqlx::SqlitePool) -> String {
 
 #[tokio::test]
 async fn new_install_seeds_codex_yolo_id_as_agent_full_access() {
-    let pool = memory_pool().await;
-
-    run_migrations_through(&pool, 900021).await;
+    // Exercise the production migration path, including the SQLite pragmas
+    // required by legacy table rebuilds before migration 030.
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool().clone();
 
     assert_eq!(codex_yolo_id(&pool).await, "agent-full-access");
 }
