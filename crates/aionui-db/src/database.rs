@@ -29,12 +29,10 @@ const STARTUP_FILE_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_millis(800),
 ];
 
-static DB_MIGRATOR: Migrator = sqlx::migrate!();
+pub(crate) static DB_MIGRATOR: Migrator = sqlx::migrate!();
 // Historical special-case for the MCP schema reconciliation fallback.
 // Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
-const CODEX_FULL_ACCESS_MIGRATION_VERSION: i64 = 21;
-const ASSISTANT_WORKSPACE_OVERLAY_MIGRATION_VERSION: i64 = 900023;
 const RECOVERABLE_DATABASE_CORRUPTION_STAGE: &str = "database.recoverable_corruption";
 
 /// Wraps a SQLite connection pool with lifecycle management.
@@ -420,7 +418,7 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
         .await
         .map_err(|e| DatabaseInitError::new("database.migration", e))?;
 
-    let result = run_migrations_with_retry(&mut conn)
+    let migration_result = run_migrations_with_retry(&mut conn)
         .await
         .map_err(|e| DatabaseInitError::new("database.migration", e));
 
@@ -428,7 +426,13 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
         .execute(&mut *conn)
         .await
         .map_err(|e| DatabaseInitError::new("database.migration", DbError::Query(e)))?;
-    result
+    drop(conn);
+
+    migration_result?;
+    crate::assistant_workspace_migrate_repair::finalize(pool)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.schema_repair", e))?;
+    Ok(())
 }
 
 /// Run sqlx migrations with one retry on `_sqlx_migrations` UNIQUE conflict.
@@ -518,61 +522,9 @@ impl Drop for MigrateLockGuard {
 /// safely adds any missing columns via `ALTER TABLE ADD COLUMN`.
 async fn ensure_schema_columns(pool: &SqlitePool) -> Result<(), DbError> {
     reconcile_mcp_server_schema(pool).await?;
-    reconcile_assistant_workspace_overlay_migration(pool).await?;
+    crate::assistant_workspace_migrate_repair::prepare(pool, &DB_MIGRATOR).await?;
     crate::legacy_handoff::ensure_legacy_handoff_schema(pool).await?;
     Ok(())
-}
-
-async fn reconcile_assistant_workspace_overlay_migration(pool: &SqlitePool) -> Result<(), DbError> {
-    let assistant_columns_exist = assistant_workspace_columns_exist(pool).await?;
-    let overlay_table_exists: bool = sqlx::query_scalar(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='assistant_user_overlays'",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::Query)?;
-    let preferences_table_exists: bool = sqlx::query_scalar(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='user_client_preferences'",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::Query)?;
-
-    if !assistant_columns_exist || !overlay_table_exists || !preferences_table_exists {
-        return Ok(());
-    }
-
-    ensure_migrations_table(pool).await?;
-    align_migration_checksum(pool, CODEX_FULL_ACCESS_MIGRATION_VERSION).await?;
-    record_migration_if_missing(pool, ASSISTANT_WORKSPACE_OVERLAY_MIGRATION_VERSION).await?;
-    Ok(())
-}
-
-async fn assistant_workspace_columns_exist(pool: &SqlitePool) -> Result<bool, DbError> {
-    let table_exists: bool = sqlx::query_scalar(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='assistant_definitions'",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::Query)?;
-    if !table_exists {
-        return Ok(false);
-    }
-
-    let has_mode: bool = sqlx::query_scalar(
-        "SELECT COUNT(*) > 0 FROM pragma_table_info('assistant_definitions') WHERE name = 'default_workspace_mode'",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::Query)?;
-    let has_value: bool = sqlx::query_scalar(
-        "SELECT COUNT(*) > 0 FROM pragma_table_info('assistant_definitions') WHERE name = 'default_workspace_value'",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::Query)?;
-
-    Ok(has_mode && has_value)
 }
 
 async fn reconcile_mcp_server_schema(pool: &SqlitePool) -> Result<(), DbError> {
@@ -693,25 +645,6 @@ VALUES (?, ?, TRUE, ?, 0)
     .map_err(DbError::Query)?;
     info!("Recorded reconciled schema migration {}", migration.version);
     Ok(())
-}
-
-async fn align_migration_checksum(pool: &SqlitePool, version: i64) -> Result<bool, DbError> {
-    let Some(migration) = DB_MIGRATOR.iter().find(|migration| migration.version == version) else {
-        return Ok(false);
-    };
-
-    ensure_migrations_table(pool).await?;
-    let updated = sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ? AND success = 1")
-        .bind(&*migration.checksum)
-        .bind(version)
-        .execute(pool)
-        .await
-        .map_err(DbError::Query)?;
-
-    if updated.rows_affected() > 0 {
-        info!("Aligned checksum for reconciled schema migration {}", version);
-    }
-    Ok(updated.rows_affected() > 0)
 }
 
 async fn align_reconciled_mcp_migration_checksum(conn: &mut sqlx::SqliteConnection) -> Result<bool, DbError> {
@@ -898,71 +831,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(fk_table, "conversations");
-    }
-
-    #[tokio::test]
-    async fn reconciles_bad_fork_assistant_overlay_migration_21() {
-        let pool = PoolOptions::<Sqlite>::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-
-        sqlx::query(
-            r#"
-CREATE TABLE assistant_definitions (
-    id TEXT PRIMARY KEY,
-    default_workspace_mode TEXT NOT NULL DEFAULT 'auto',
-    default_workspace_value TEXT
-);
-CREATE TABLE assistant_user_overlays (
-    user_id TEXT NOT NULL,
-    assistant_definition_id TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (user_id, assistant_definition_id)
-);
-CREATE TABLE user_client_preferences (
-    user_id TEXT NOT NULL,
-    key TEXT NOT NULL,
-    value TEXT NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY (user_id, key)
-);
-CREATE TABLE _sqlx_migrations (
-    version BIGINT PRIMARY KEY,
-    description TEXT NOT NULL,
-    installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    success BOOLEAN NOT NULL,
-    checksum BLOB NOT NULL,
-    execution_time BIGINT NOT NULL
-);
-INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
-VALUES (21, 'assistant workspace and user overlays', TRUE, x'626164', 0);
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        reconcile_assistant_workspace_overlay_migration(&pool).await.unwrap();
-
-        let migration_21 = DB_MIGRATOR
-            .iter()
-            .find(|migration| migration.version == CODEX_FULL_ACCESS_MIGRATION_VERSION)
-            .unwrap();
-        let checksum_21: Vec<u8> = sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 21")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(checksum_21, &*migration_21.checksum);
-
-        let overlay_recorded: bool =
-            sqlx::query_scalar("SELECT COUNT(*) > 0 FROM _sqlx_migrations WHERE version = 900023 AND success = 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(overlay_recorded);
     }
 
     #[test]

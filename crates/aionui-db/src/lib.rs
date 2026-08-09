@@ -2,6 +2,7 @@
 
 //! SQLite database layer: init, migrations, repository traits, and implementations.
 mod agent_binding;
+mod assistant_workspace_migrate_repair;
 mod database;
 mod error;
 mod instance_lock;
