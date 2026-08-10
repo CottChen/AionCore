@@ -189,11 +189,16 @@ fn search_params_parse_roots_query_and_default_limit() {
     let p: SearchParams = serde_json::from_value(v).unwrap();
     assert_eq!(p.roots.len(), 1);
     assert_eq!(p.query, "button");
+    assert_eq!(p.mode, SearchMode::Name);
     assert_eq!(p.limit, Some(200));
 
     // limit is optional (server picks a default when omitted).
     let p2: SearchParams = serde_json::from_value(json!({"roots":[],"query":""})).unwrap();
+    assert_eq!(p2.mode, SearchMode::Name);
     assert_eq!(p2.limit, None);
+
+    let content: SearchParams = serde_json::from_value(json!({"roots":[],"query":"design","mode":"content"})).unwrap();
+    assert_eq!(content.mode, SearchMode::Content);
 }
 
 #[test]
@@ -208,11 +213,14 @@ fn search_hit_serializes_project_identity() {
         pe_id: "pe1".to_owned(),
         relative_path: "src/components/Button.tsx".to_owned(),
         name: "Button.tsx".to_owned(),
+        match_kind: SearchMatchKind::Name,
+        content_match_count: None,
+        content_preview: None,
     };
     let v = serde_json::to_value(&hit).unwrap();
     assert_eq!(
         v,
-        json!({"pe_id":"pe1","relative_path":"src/components/Button.tsx","name":"Button.tsx"})
+        json!({"pe_id":"pe1","relative_path":"src/components/Button.tsx","name":"Button.tsx","match_kind":"name"})
     );
 }
 
@@ -222,6 +230,9 @@ fn search_match_params_batches_hits_under_search_id() {
         pe_id: "pe2".to_owned(),
         relative_path: "widgets/iconButton.ts".to_owned(),
         name: "iconButton.ts".to_owned(),
+        match_kind: SearchMatchKind::Content,
+        content_match_count: Some(2),
+        content_preview: Some("button content".to_owned()),
     }];
     let v = search_match_params(&json!(7), &hits);
     assert_eq!(v["search_id"], 7);

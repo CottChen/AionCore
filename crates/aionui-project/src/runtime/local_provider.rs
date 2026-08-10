@@ -21,11 +21,16 @@ use crate::canonical;
 use super::error::FsError;
 use super::noise::should_hide;
 use super::provider::{EntryFact, IFsProvider, Kind};
-use super::search::{Budget, CancellationToken, IFsSearchProvider, NameMatcher, SearchSink};
+use super::search::{
+    Budget, CancellationToken, IFsSearchProvider, ProviderSearchHit, SearchMatchKind, SearchQuery, SearchSink,
+};
 
 /// How often, in walked entries, the blocking walk re-checks the cancel token
 /// (checking every entry would be needless overhead on a large tree).
 const CANCEL_CHECK_STRIDE: usize = 128;
+const MAX_SEARCH_SCANNED_FILES: usize = 5000;
+const MAX_SEARCH_FILE_BYTES: u64 = 512 * 1024;
+const CONTENT_PREVIEW_CHARS: usize = 240;
 
 /// Local-disk provider for the `file:` scheme.
 #[derive(Debug, Default, Clone)]
@@ -219,10 +224,10 @@ impl IFsProvider for LocalFsProvider {
 
 #[async_trait]
 impl IFsSearchProvider for LocalFsProvider {
-    async fn search_names(
+    async fn search(
         &self,
         root_uri: &str,
-        matcher: &NameMatcher,
+        query: &SearchQuery,
         sink: &Arc<dyn SearchSink>,
         budget: &Budget,
         cancel: &CancellationToken,
@@ -231,8 +236,8 @@ impl IFsSearchProvider for LocalFsProvider {
         // The `ignore` walk is synchronous and CPU/IO-bound; run it off the async
         // worker so it never blocks the actor's event loop. Shared budget/cancel
         // are cheap Arc handles moved into the blocking task.
-        let (matcher, sink, budget, cancel) = (matcher.clone(), Arc::clone(sink), budget.clone(), cancel.clone());
-        tokio::task::spawn_blocking(move || walk_names(&root, &matcher, &sink, &budget, &cancel))
+        let (query, sink, budget, cancel) = (query.clone(), Arc::clone(sink), budget.clone(), cancel.clone());
+        tokio::task::spawn_blocking(move || walk_search(&root, &query, &sink, &budget, &cancel))
             .await
             .map_err(|e| FsError::Io {
                 uri: root_uri.to_owned(),
@@ -241,12 +246,12 @@ impl IFsSearchProvider for LocalFsProvider {
     }
 }
 
-/// The blocking `ignore` tree walk backing [`LocalFsProvider::search_names`].
-/// Honors `.gitignore` / git excludes (same walker ripgrep uses); emits only
-/// files whose name matches, stopping on budget exhaustion or cancellation.
-fn walk_names(
+/// The blocking `ignore` tree walk backing [`LocalFsProvider::search`].
+/// Honors `.gitignore` / git excludes (same walker ripgrep uses); emits matching
+/// files, stopping on budget exhaustion, scan bounds, or cancellation.
+fn walk_search(
     root: &Path,
-    matcher: &NameMatcher,
+    query: &SearchQuery,
     sink: &Arc<dyn SearchSink>,
     budget: &Budget,
     cancel: &CancellationToken,
@@ -263,6 +268,7 @@ fn walk_names(
         .filter_entry(|entry| entry.file_name().to_str().map(|n| !should_hide(n)).unwrap_or(true))
         .build();
 
+    let mut scanned_files = 0usize;
     for (seen, entry) in walker.enumerate() {
         // Periodic cancel check so a large no-hit subtree still bails promptly.
         if seen.is_multiple_of(CANCEL_CHECK_STRIDE) && cancel.is_cancelled() {
@@ -276,16 +282,27 @@ fn walk_names(
                 continue;
             }
         };
-        // Filename search returns files only (SearchHit is files-only); the root
+        // Project search returns files only (SearchHit is files-only); the root
         // dir itself and every subdirectory are traversed but never emitted.
         if entry.file_type().is_none_or(|ft| ft.is_dir()) {
             continue;
+        }
+        scanned_files += 1;
+        if scanned_files > MAX_SEARCH_SCANNED_FILES {
+            budget.mark_limit_reached();
+            return;
         }
         let path = entry.path();
         let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             continue;
         };
-        if !matcher.matches(&name) {
+        let name_matches = query.matches_name(&name);
+        let content_match = if query.searches_content() {
+            search_file_content(path, query.needle())
+        } else {
+            None
+        };
+        if !name_matches && content_match.is_none() {
             continue;
         }
         if cancel.is_cancelled() {
@@ -296,8 +313,46 @@ fn walk_names(
         if !budget.try_take() {
             return;
         }
-        sink.emit(rel_path(root, path), name);
+        let (content_match_count, content_preview) = content_match
+            .map(|(count, preview)| (Some(count), preview))
+            .unwrap_or((None, None));
+        let match_kind = match (name_matches, content_match_count.is_some()) {
+            (true, true) => SearchMatchKind::Both,
+            (true, false) => SearchMatchKind::Name,
+            (false, true) => SearchMatchKind::Content,
+            (false, false) => continue,
+        };
+        sink.emit(ProviderSearchHit {
+            relative_path: rel_path(root, path),
+            name,
+            match_kind,
+            content_match_count,
+            content_preview,
+        });
     }
+}
+
+fn search_file_content(path: &Path, needle: &str) -> Option<(usize, Option<String>)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_SEARCH_FILE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.iter().take(8192).any(|byte| *byte == 0) {
+        return None;
+    }
+    let content = String::from_utf8(bytes).ok()?;
+    let lowered = content.to_lowercase();
+    let count = lowered.matches(needle).count();
+    if count == 0 {
+        return None;
+    }
+    let preview = content
+        .lines()
+        .find(|line| line.to_lowercase().contains(needle))
+        .map(|line| line.trim().chars().take(CONTENT_PREVIEW_CHARS).collect::<String>())
+        .filter(|line| !line.is_empty());
+    Some((count, preview))
 }
 
 /// Root-relative path, forward-slash normalized, no leading slash (wire form).

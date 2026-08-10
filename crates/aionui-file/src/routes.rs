@@ -450,6 +450,8 @@ struct UploadMultipartFields {
     dispo_file_name: Option<String>,
     conversation_id: Option<String>,
     workspace_relative_path: Option<String>,
+    project_pe_id: Option<String>,
+    project_relative_path: Option<String>,
 }
 
 /// Strip any directory component from a file name and reject empty results.
@@ -471,6 +473,8 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
     let mut dispo_file_name: Option<String> = None;
     let mut conversation_id: Option<String> = None;
     let mut workspace_relative_path: Option<String> = None;
+    let mut project_pe_id: Option<String> = None;
+    let mut project_relative_path: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -518,6 +522,23 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
                     .map_err(|e| ApiError::BadRequest(format!("failed to read workspace_relative_path: {e}")))?;
                 workspace_relative_path = Some(text);
             }
+            "project_pe_id" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("failed to read project_pe_id: {e}")))?;
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    project_pe_id = Some(trimmed.to_owned());
+                }
+            }
+            "project_relative_path" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("failed to read project_relative_path: {e}")))?;
+                project_relative_path = Some(text);
+            }
             _ => {}
         }
     }
@@ -530,6 +551,8 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
         dispo_file_name,
         conversation_id,
         workspace_relative_path,
+        project_pe_id,
+        project_relative_path,
     })
 }
 
@@ -543,6 +566,40 @@ async fn upload_file(
     let file_name = fields.file_name.or(fields.dispo_file_name).ok_or_else(|| {
         ApiError::BadRequest("missing file name: provide 'file_name' or a multipart filename".to_owned())
     })?;
+
+    if fields.project_pe_id.is_some() && fields.workspace_relative_path.is_some() {
+        return Err(ApiError::BadRequest(
+            "upload cannot target both a project entry and a conversation workspace".to_owned(),
+        ));
+    }
+    if fields.project_pe_id.is_none() && fields.project_relative_path.is_some() {
+        return Err(ApiError::BadRequest(
+            "project_relative_path requires project_pe_id".to_owned(),
+        ));
+    }
+
+    if let Some(pe_id) = fields.project_pe_id {
+        let resolved = state
+            .project
+            .resolve_reference(
+                &user.id,
+                aionui_project::ReferenceInput {
+                    pe_id,
+                    relative_path: fields.project_relative_path.unwrap_or_default(),
+                    op: aionui_project::FileOp::Write,
+                },
+            )
+            .await
+            .map_err(ApiError::from)?;
+        let dir = resolved
+            .absolute_path
+            .ok_or_else(|| ApiError::BadRequest("upload target is not a local path".to_owned()))?;
+        let path = state
+            .file_service
+            .create_workspace_upload_file(&file_name, &fields.file_data, Path::new(&dir), Path::new(""))
+            .await?;
+        return Ok(Json(ApiResponse::ok(path)));
+    }
 
     let force_workspace = fields.workspace_relative_path.is_some();
     let workspace = match fields.conversation_id.as_deref() {

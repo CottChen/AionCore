@@ -1006,6 +1006,72 @@ async fn explicit_workspace_upload_uses_selected_directory_when_preference_is_di
 }
 
 #[tokio::test]
+async fn project_upload_uses_the_pe_addressed_directory() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project_dir.path().join("docs/specs")).unwrap();
+    let (mut app, services) = build_app_with_data_dir(data_dir.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let created = services
+        .project_service
+        .create_standard(
+            "system_default_user",
+            aionui_project::canonical::to_file_uri(project_dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "project-target.txt", "text/plain", b"project target")
+        .add_text("project_pe_id", &created.project_explorer.pe_id)
+        .add_text("project_relative_path", "docs/specs")
+        .build();
+    let resp = app
+        .oneshot(upload_request(&content_type, body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let uploaded = std::path::PathBuf::from(json["data"].as_str().unwrap());
+    assert_eq!(
+        std::fs::canonicalize(uploaded.parent().unwrap()).unwrap(),
+        std::fs::canonicalize(project_dir.path().join("docs/specs")).unwrap()
+    );
+    assert_eq!(std::fs::read(uploaded).unwrap(), b"project target");
+}
+
+#[tokio::test]
+async fn project_upload_rejects_a_project_owned_by_another_user() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(data_dir.path()).await;
+    let (_admin_token, _admin_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let created = services
+        .project_service
+        .create_standard(
+            "system_default_user",
+            aionui_project::canonical::to_file_uri(project_dir.path()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let (user_token, user_csrf) = setup_and_login(&mut app, &services, "upload-user", "StrongP@ss2").await;
+
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "forbidden.txt", "text/plain", b"forbidden")
+        .add_text("project_pe_id", &created.project_explorer.pe_id)
+        .add_text("project_relative_path", "")
+        .build();
+    let resp = app
+        .oneshot(upload_request(&content_type, body, &user_token, &user_csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "project_explorer_not_found");
+}
+
+#[tokio::test]
 async fn explicit_workspace_upload_rejects_traversal() {
     let data_dir = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();

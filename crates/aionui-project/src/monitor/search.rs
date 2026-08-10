@@ -4,7 +4,7 @@
 //! The actor resolves every root atomically, then hands off to [`run_search`],
 //! spawned as its own task so the walks never block the actor event loop (which
 //! must stay responsive to `fs/searchCancel` and superseding searches). The
-//! coordinator drives every root's [`IFsSearchProvider::search_names`]
+//! coordinator drives every root's [`IFsSearchProvider::search`]
 //! concurrently, all sharing one [`Budget`] + one [`CancellationToken`]; each
 //! root's hits flow through a per-root [`RootSink`] that stamps the folder's
 //! `pe_id` and merges into one [`MatchCollector`], batched onto `fs/searchMatch`.
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::runtime::{Budget, CancellationToken, IFsSearchProvider, NameMatcher, SearchSink};
+use crate::runtime::{Budget, CancellationToken, IFsSearchProvider, ProviderSearchHit, SearchQuery, SearchSink};
 
 use super::port::FsWirePush;
 use super::wire::{self, SearchHit};
@@ -55,7 +55,7 @@ pub(super) struct SearchJob {
     pub(super) session: String,
     pub(super) search_id: Value,
     pub(super) roots: Vec<SearchRoot>,
-    pub(super) matcher: NameMatcher,
+    pub(super) query: SearchQuery,
     pub(super) budget: Budget,
     pub(super) cancel: CancellationToken,
 }
@@ -148,11 +148,14 @@ struct RootSink {
 }
 
 impl SearchSink for RootSink {
-    fn emit(&self, relative_path: String, name: String) {
+    fn emit(&self, hit: ProviderSearchHit) {
         self.collector.push_hit(SearchHit {
             pe_id: self.pe_id.clone(),
-            relative_path,
-            name,
+            relative_path: hit.relative_path,
+            name: hit.name,
+            match_kind: hit.match_kind,
+            content_match_count: hit.content_match_count,
+            content_preview: hit.content_preview,
         });
     }
 }
@@ -171,19 +174,19 @@ pub(super) async fn run_search(
         session,
         search_id,
         roots,
-        matcher,
+        query,
         budget,
         cancel,
     } = job;
     let collector = Arc::new(MatchCollector::new(push, session.clone(), search_id.clone()));
-    let matcher = Arc::new(matcher);
+    let query = Arc::new(query);
 
     // Each root walks concurrently; the walk itself is a `spawn_blocking` inside
-    // `search_names`, so N roots occupy N blocking threads in parallel.
+    // `search`, so N roots occupy N blocking threads in parallel.
     let mut handles = Vec::with_capacity(roots.len());
     for root in roots {
         let provider = Arc::clone(&provider);
-        let matcher = Arc::clone(&matcher);
+        let query = Arc::clone(&query);
         let budget = budget.clone();
         let cancel = cancel.clone();
         let sink: Arc<dyn SearchSink> = Arc::new(RootSink {
@@ -192,9 +195,7 @@ pub(super) async fn run_search(
         });
         let root_uri = root.root_uri;
         handles.push(tokio::spawn(async move {
-            provider
-                .search_names(&root_uri, &matcher, &sink, &budget, &cancel)
-                .await
+            provider.search(&root_uri, &query, &sink, &budget, &cancel).await
         }));
     }
 

@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::runtime::{Change, DeltaBatch, EntryFact, FsError, Kind, Snapshot};
+use crate::runtime::{Change, DeltaBatch, EntryFact, FsError, Kind, SearchMatchKind, SearchMode, Snapshot};
 use crate::types::ProjectError;
 
 /// JSON-RPC version string carried on every frame.
@@ -93,7 +93,7 @@ pub struct RenameParams {
     pub to: ResourceRef,
 }
 
-// ── Filename search (fs/search) ───────────────────────────────────────────
+// ── Project search (fs/search) ────────────────────────────────────────────
 
 /// `fs/search` request params (protocol.md). `roots` = the project's bound
 /// folders (or narrowed subdirs); `query` empty = browse; `limit` is the global
@@ -102,6 +102,8 @@ pub struct RenameParams {
 pub struct SearchParams {
     pub roots: Vec<ResourceRef>,
     pub query: String,
+    #[serde(default)]
+    pub mode: SearchMode,
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -113,13 +115,18 @@ pub struct SearchCancelParams {
     pub search_id: Value,
 }
 
-/// One filename hit — the chat-ref `project` identity (files only). `pe_id` is
+/// One project-search hit — the chat-ref `project` identity (files only). `pe_id` is
 /// stamped by the orchestration layer from the root the hit came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SearchHit {
     pub pe_id: String,
     pub relative_path: String,
     pub name: String,
+    pub match_kind: SearchMatchKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_match_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_preview: Option<String>,
 }
 
 /// Build the `fs/searchMatch` notification params: a batch of hits keyed to the

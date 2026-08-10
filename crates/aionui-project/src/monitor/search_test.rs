@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::unbounded_channel;
 
-use crate::runtime::{FsError, MatchMode};
+use crate::runtime::{FsError, MatchMode, ProviderSearchHit, SearchMatchKind, SearchMode, SearchQuery};
 
 use super::*;
 
@@ -42,10 +42,10 @@ struct ScriptedProvider {
 
 #[async_trait]
 impl IFsSearchProvider for ScriptedProvider {
-    async fn search_names(
+    async fn search(
         &self,
         root_uri: &str,
-        matcher: &NameMatcher,
+        query: &SearchQuery,
         sink: &Arc<dyn SearchSink>,
         budget: &Budget,
         cancel: &CancellationToken,
@@ -58,13 +58,19 @@ impl IFsSearchProvider for ScriptedProvider {
             if cancel.is_cancelled() {
                 return Ok(());
             }
-            if !matcher.matches(name) {
+            if !query.matches_name(name) {
                 continue;
             }
             if !budget.try_take() {
                 return Ok(());
             }
-            sink.emit(rel.clone(), name.clone());
+            sink.emit(ProviderSearchHit {
+                relative_path: rel.clone(),
+                name: name.clone(),
+                match_kind: SearchMatchKind::Name,
+                content_match_count: None,
+                content_preview: None,
+            });
             emitted += 1;
             if self.cancel_after == Some(emitted) {
                 cancel.cancel();
@@ -133,7 +139,7 @@ async fn merges_roots_stamps_pe_id_sends_terminal_and_signals_done() {
             session: "sess".to_owned(),
             search_id: json!(7),
             roots,
-            matcher: NameMatcher::new("button", MatchMode::Substring),
+            query: SearchQuery::new("button", SearchMode::Name, MatchMode::Substring),
             budget: Budget::new(100),
             cancel: CancellationToken::new(),
         },
@@ -193,7 +199,7 @@ async fn multi_root_shares_one_global_budget() {
                     pe_id: "pe2".to_owned(),
                 },
             ],
-            matcher: NameMatcher::new("", MatchMode::Substring),
+            query: SearchQuery::new("", SearchMode::Name, MatchMode::Substring),
             budget: Budget::new(3),
             cancel: CancellationToken::new(),
         },
@@ -229,7 +235,7 @@ async fn cancelled_before_start_sends_no_terminal_and_no_done() {
             session: "sess".to_owned(),
             search_id: json!(2),
             roots: one_root("file:///a", "pe1"),
-            matcher: NameMatcher::new("", MatchMode::Substring),
+            query: SearchQuery::new("", SearchMode::Name, MatchMode::Substring),
             budget: Budget::new(100),
             cancel,
         },
@@ -267,7 +273,7 @@ async fn cancel_during_run_drops_buffered_matches_and_no_terminal() {
             session: "sess".to_owned(),
             search_id: json!(3),
             roots: one_root("file:///a", "pe1"),
-            matcher: NameMatcher::new("", MatchMode::Substring),
+            query: SearchQuery::new("", SearchMode::Name, MatchMode::Substring),
             budget: Budget::new(100),
             cancel: CancellationToken::new(),
         },

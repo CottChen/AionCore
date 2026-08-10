@@ -15,7 +15,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::canonical;
-use crate::runtime::{Budget, CancellationToken, Command, MatchMode, NameMatcher, ShardOutput, Subscriber};
+use crate::runtime::{Budget, CancellationToken, Command, MatchMode, SearchQuery, ShardOutput, Subscriber};
 use crate::types::{FileOp, ReferenceInput, ResolvedResource};
 
 use super::actor::FsMonitorActor;
@@ -309,7 +309,7 @@ impl FsMonitorActor {
             return;
         };
 
-        let matcher = NameMatcher::new(&p.query, MatchMode::Substring);
+        let query = SearchQuery::new(&p.query, p.mode, MatchMode::Substring);
         let budget = Budget::new(p.limit.unwrap_or(search::DEFAULT_SEARCH_LIMIT));
         let cancel = CancellationToken::new();
         // Supersede any prior in-flight search on this connection (cancels it).
@@ -334,7 +334,7 @@ impl FsMonitorActor {
                 session: session.to_owned(),
                 search_id,
                 roots,
-                matcher,
+                query,
                 budget,
                 cancel,
             },

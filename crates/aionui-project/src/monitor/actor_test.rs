@@ -13,7 +13,8 @@ use crate::canonical::to_file_uri;
 use crate::monitor::{FsInbound, FsMonitorActor, FsWirePush};
 use crate::runtime::{
     Budget, CancellationToken, EntryFact, FsError, IFsRuntime, IFsSearchProvider, Kind, LocalFsRuntime, MatchMode,
-    NameMatcher, RawEvent, SearchSink, ShardOutput, Snapshot, Subscriber,
+    ProviderSearchHit, RawEvent, SearchMatchKind, SearchMode, SearchQuery, SearchSink, ShardOutput, Snapshot,
+    Subscriber,
 };
 
 use super::super::search::{ActiveSearch, SearchDone, SearchJob, SearchRoot, run_search};
@@ -747,7 +748,7 @@ async fn search_unknown_pe_is_out_of_scope() {
     assert_eq!(reply["error"]["data"]["pe_id"], "pe-nope");
 }
 
-/// A search provider that parks in `search_names` until released, so a test can
+/// A search provider that parks in `search` until released, so a test can
 /// hold a search provably in-flight. `entered` fires when the walk begins;
 /// `release` unblocks it.
 struct BarrierSearchProvider {
@@ -757,10 +758,10 @@ struct BarrierSearchProvider {
 
 #[async_trait]
 impl IFsSearchProvider for BarrierSearchProvider {
-    async fn search_names(
+    async fn search(
         &self,
         _root_uri: &str,
-        _matcher: &NameMatcher,
+        _query: &SearchQuery,
         sink: &Arc<dyn SearchSink>,
         budget: &Budget,
         _cancel: &CancellationToken,
@@ -768,7 +769,13 @@ impl IFsSearchProvider for BarrierSearchProvider {
         self.entered.notify_one(); // tell the test the search is in-flight
         self.release.notified().await; // park until released
         if budget.try_take() {
-            sink.emit("hit.txt".to_owned(), "hit.txt".to_owned());
+            sink.emit(ProviderSearchHit {
+                relative_path: "hit.txt".to_owned(),
+                name: "hit.txt".to_owned(),
+                match_kind: SearchMatchKind::Name,
+                content_match_count: None,
+                content_preview: None,
+            });
         }
         Ok(())
     }
@@ -865,7 +872,7 @@ async fn completion_signals_done_actor_clears_and_later_cancel_is_noop() {
                 root_uri: to_file_uri(dir.path()).unwrap(),
                 pe_id: pe.clone(),
             }],
-            matcher: NameMatcher::new("", MatchMode::Substring),
+            query: SearchQuery::new("", SearchMode::Name, MatchMode::Substring),
             budget: Budget::new(100),
             cancel: CancellationToken::new(),
         },

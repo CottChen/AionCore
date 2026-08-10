@@ -6,7 +6,10 @@ use tempfile::tempdir;
 use crate::canonical::{self, Canonical};
 use crate::runtime::error::FsError;
 use crate::runtime::provider::{IFsProvider, Kind};
-use crate::runtime::search::{Budget, CancellationToken, IFsSearchProvider, MatchMode, NameMatcher, SearchSink};
+use crate::runtime::search::{
+    Budget, CancellationToken, IFsSearchProvider, MatchMode, ProviderSearchHit, SearchMatchKind, SearchMode,
+    SearchQuery, SearchSink,
+};
 
 use super::LocalFsProvider;
 
@@ -247,34 +250,49 @@ async fn read_dir_hides_os_junk_and_vcs_but_keeps_real_dotfiles() {
 
 /// Test sink: collects `(relative_path, name)` hits under a mutex.
 #[derive(Default)]
-struct CollectSink(Mutex<Vec<(String, String)>>);
+struct CollectSink(Mutex<Vec<ProviderSearchHit>>);
 
 impl SearchSink for CollectSink {
-    fn emit(&self, relative_path: String, name: String) {
-        self.0.lock().unwrap().push((relative_path, name));
+    fn emit(&self, hit: ProviderSearchHit) {
+        self.0.lock().unwrap().push(hit);
     }
 }
 
 impl CollectSink {
-    fn hits(&self) -> Vec<(String, String)> {
+    fn hits(&self) -> Vec<ProviderSearchHit> {
         self.0.lock().unwrap().clone()
     }
 }
 
 /// Search helper that keeps the concrete sink so hits can be read back.
-async fn search_collect(root: &Path, query: &str, mode: MatchMode, limit: usize) -> (Vec<(String, String)>, bool) {
+async fn search_collect(
+    root: &Path,
+    query: &str,
+    match_mode: MatchMode,
+    limit: usize,
+) -> (Vec<ProviderSearchHit>, bool) {
+    search_collect_mode(root, query, match_mode, SearchMode::Name, limit).await
+}
+
+async fn search_collect_mode(
+    root: &Path,
+    query: &str,
+    match_mode: MatchMode,
+    search_mode: SearchMode,
+    limit: usize,
+) -> (Vec<ProviderSearchHit>, bool) {
     let provider = LocalFsProvider::new();
     let collect = Arc::new(CollectSink::default());
     let sink: Arc<dyn SearchSink> = collect.clone();
-    let matcher = NameMatcher::new(query, mode);
+    let query = SearchQuery::new(query, search_mode, match_mode);
     let budget = Budget::new(limit);
     let cancel = CancellationToken::new();
     provider
-        .search_names(canon(root).as_str(), &matcher, &sink, &budget, &cancel)
+        .search(canon(root).as_str(), &query, &sink, &budget, &cancel)
         .await
         .unwrap();
     let mut hits = collect.hits();
-    hits.sort();
+    hits.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     (hits, budget.limit_reached())
 }
 
@@ -288,11 +306,11 @@ async fn search_matches_files_by_name_substring() {
     std::fs::write(root.join("iconButton.ts"), b"x").unwrap();
 
     let (hits, capped) = search_collect(root, "button", MatchMode::Substring, 100).await;
-    let mut names: Vec<&str> = hits.iter().map(|(_, n)| n.as_str()).collect();
+    let mut names: Vec<&str> = hits.iter().map(|hit| hit.name.as_str()).collect();
     names.sort_unstable();
     assert_eq!(names, vec!["Button.tsx", "iconButton.ts"]);
     // Relative paths are forward-slash, root-relative.
-    assert!(hits.iter().any(|(rel, _)| rel == "src/Button.tsx"));
+    assert!(hits.iter().any(|hit| hit.relative_path == "src/Button.tsx"));
     assert!(!capped);
 }
 
@@ -305,7 +323,7 @@ async fn search_empty_query_returns_all_files_not_dirs() {
     std::fs::write(root.join("b.txt"), b"x").unwrap();
 
     let (hits, _) = search_collect(root, "", MatchMode::Substring, 100).await;
-    let mut names: Vec<&str> = hits.iter().map(|(_, n)| n.as_str()).collect();
+    let mut names: Vec<&str> = hits.iter().map(|hit| hit.name.as_str()).collect();
     names.sort_unstable();
     // Files only — directories ("sub") are traversed but never emitted.
     assert_eq!(names, vec!["a.txt", "b.txt"]);
@@ -320,7 +338,7 @@ async fn search_respects_gitignore() {
     std::fs::write(root.join("kept.txt"), b"x").unwrap();
 
     let (hits, _) = search_collect(root, "", MatchMode::Substring, 100).await;
-    let names: Vec<&str> = hits.iter().map(|(_, n)| n.as_str()).collect();
+    let names: Vec<&str> = hits.iter().map(|hit| hit.name.as_str()).collect();
     assert!(names.contains(&"kept.txt"));
     assert!(names.contains(&".gitignore"));
     // The gitignored file is excluded by the walker.
@@ -352,11 +370,11 @@ async fn search_hides_git_internals_and_os_junk() {
     std::fs::write(root.join("main.rs"), b"x").unwrap();
 
     let (hits, _) = search_collect(root, "", MatchMode::Substring, 100).await;
-    let names: Vec<&str> = hits.iter().map(|(_, n)| n.as_str()).collect();
+    let names: Vec<&str> = hits.iter().map(|hit| hit.name.as_str()).collect();
     // Only the real file — no `.git` internals, no `.DS_Store`.
     assert_eq!(names, vec!["main.rs"]);
     assert!(
-        !hits.iter().any(|(rel, _)| rel.contains(".git")),
+        !hits.iter().any(|hit| hit.relative_path.contains(".git")),
         "search must not descend into .git: {hits:?}"
     );
 }
@@ -371,14 +389,57 @@ async fn search_cancelled_before_start_emits_nothing() {
     let provider = LocalFsProvider::new();
     let collect = Arc::new(CollectSink::default());
     let sink: Arc<dyn SearchSink> = collect.clone();
-    let matcher = NameMatcher::new("", MatchMode::Substring);
+    let query = SearchQuery::new("", SearchMode::Name, MatchMode::Substring);
     let budget = Budget::new(10_000);
     let cancel = CancellationToken::new();
     cancel.cancel(); // cancelled up front
     provider
-        .search_names(canon(root).as_str(), &matcher, &sink, &budget, &cancel)
+        .search(canon(root).as_str(), &query, &sink, &budget, &cancel)
         .await
         .unwrap();
     // The very first stride check (index 0) sees the cancel and returns.
     assert!(collect.hits().is_empty());
+}
+
+#[tokio::test]
+async fn content_search_returns_match_count_and_preview() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("notes.txt"), "first line\nDesign search design\n").unwrap();
+    std::fs::write(root.join("other.txt"), "unrelated").unwrap();
+
+    let (hits, capped) = search_collect_mode(root, "design", MatchMode::Substring, SearchMode::Content, 100).await;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].name, "notes.txt");
+    assert_eq!(hits[0].match_kind, SearchMatchKind::Content);
+    assert_eq!(hits[0].content_match_count, Some(2));
+    assert_eq!(hits[0].content_preview.as_deref(), Some("Design search design"));
+    assert!(!capped);
+}
+
+#[tokio::test]
+async fn all_search_marks_files_matching_name_and_content() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("design.txt"), "design body").unwrap();
+
+    let (hits, _) = search_collect_mode(root, "design", MatchMode::Substring, SearchMode::All, 100).await;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].match_kind, SearchMatchKind::Both);
+    assert_eq!(hits[0].content_match_count, Some(1));
+}
+
+#[tokio::test]
+async fn content_search_skips_binary_and_non_utf8_files() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("binary.bin"), b"design\0payload").unwrap();
+    std::fs::write(
+        root.join("invalid.txt"),
+        [0xff, 0xfe, b'd', b'e', b's', b'i', b'g', b'n'],
+    )
+    .unwrap();
+
+    let (hits, _) = search_collect_mode(root, "design", MatchMode::Substring, SearchMode::Content, 100).await;
+    assert!(hits.is_empty());
 }

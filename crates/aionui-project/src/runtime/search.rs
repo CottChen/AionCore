@@ -1,11 +1,11 @@
-//! `IFsSearchProvider` — the filename-search capability of a filesystem runtime.
+//! `IFsSearchProvider` — the recursive project-search capability of a filesystem runtime.
 //!
 //! Kept a separate trait from [`super::provider::IFsProvider`] so the single-level
 //! non-recursive data-op contract is not polluted by the recursive/streaming shape
 //! of search. A provider walks its own subtree the most efficient way it can
 //! (`LocalFsProvider` = in-process `ignore` walk; a future remote provider = one
-//! request + a frame stream), emitting each filename hit through a [`SearchSink`].
-//! The provider only *produces* `(relative_path, name)`; batching, pe-id stamping,
+//! request + a frame stream), emitting each file hit through a [`SearchSink`].
+//! The provider produces pe-relative hits; batching and pe-id stamping,
 //! merging into one `fs/search` stream, and pushing to the wire are the
 //! orchestration layer's job (see `monitor::search`).
 //!
@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use super::error::FsError;
 
@@ -28,6 +29,25 @@ pub enum MatchMode {
     Substring,
     /// Case-insensitive subsequence — `query`'s chars appear in order, gaps ok.
     Subsequence,
+}
+
+/// Which parts of a file participate in a project search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMode {
+    All,
+    #[default]
+    Name,
+    Content,
+}
+
+/// Why one file matched the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMatchKind {
+    Name,
+    Content,
+    Both,
 }
 
 /// A precompiled, cheap filename predicate derived from the search `query`.
@@ -58,6 +78,40 @@ impl NameMatcher {
             MatchMode::Substring => hay.contains(&self.needle),
             MatchMode::Subsequence => is_subsequence(&self.needle, &hay),
         }
+    }
+}
+
+/// Precompiled project-search predicate shared by every root walk.
+#[derive(Debug, Clone)]
+pub struct SearchQuery {
+    needle: String,
+    name_matcher: NameMatcher,
+    mode: SearchMode,
+}
+
+impl SearchQuery {
+    pub fn new(query: &str, mode: SearchMode, match_mode: MatchMode) -> Self {
+        Self {
+            needle: query.to_lowercase(),
+            name_matcher: NameMatcher::new(query, match_mode),
+            mode,
+        }
+    }
+
+    pub fn searches_name(&self) -> bool {
+        matches!(self.mode, SearchMode::All | SearchMode::Name)
+    }
+
+    pub fn searches_content(&self) -> bool {
+        !self.needle.is_empty() && matches!(self.mode, SearchMode::All | SearchMode::Content)
+    }
+
+    pub fn matches_name(&self, name: &str) -> bool {
+        self.searches_name() && self.name_matcher.matches(name)
+    }
+
+    pub fn needle(&self) -> &str {
+        &self.needle
     }
 }
 
@@ -118,6 +172,12 @@ impl Budget {
     pub fn limit_reached(&self) -> bool {
         self.0.hit_cap.load(Ordering::Relaxed)
     }
+
+    /// Record that a non-hit safety bound (for example scanned-file count)
+    /// stopped a walk before it naturally completed.
+    pub fn mark_limit_reached(&self) {
+        self.0.hit_cap.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Cooperative cancel signal, cascaded to every per-root walk of a search.
@@ -146,23 +206,32 @@ impl CancellationToken {
 /// Hit outlet. The provider calls [`SearchSink::emit`] per matching file with the
 /// root-relative path (forward-slash normalized, no leading slash) and file name;
 /// the orchestration layer stamps `pe_id`, batches, and pushes `fs/searchMatch`.
-pub trait SearchSink: Send + Sync {
-    /// Emit one filename hit within the current root.
-    fn emit(&self, relative_path: String, name: String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSearchHit {
+    pub relative_path: String,
+    pub name: String,
+    pub match_kind: SearchMatchKind,
+    pub content_match_count: Option<usize>,
+    pub content_preview: Option<String>,
 }
 
-/// Filename-search capability for one provider scheme. Distinct from
+pub trait SearchSink: Send + Sync {
+    /// Emit one matching file within the current root.
+    fn emit(&self, hit: ProviderSearchHit);
+}
+
+/// Recursive search capability for one provider scheme. Distinct from
 /// [`IFsProvider`](super::provider::IFsProvider): recursive + streaming.
 #[async_trait]
 pub trait IFsSearchProvider: Send + Sync {
-    /// Walk `root_uri`'s subtree, emitting each file whose name satisfies
-    /// `matcher` through `sink`, until the subtree is exhausted, `budget` runs
+    /// Walk `root_uri`'s subtree, emitting each file satisfying `query` through
+    /// `sink`, until the subtree is exhausted, `budget` runs
     /// out, or `cancel` fires. `budget` and `cancel` are shared across all roots
     /// of the search; the sink merges every root into one stream.
-    async fn search_names(
+    async fn search(
         &self,
         root_uri: &str,
-        matcher: &NameMatcher,
+        query: &SearchQuery,
         sink: &Arc<dyn SearchSink>,
         budget: &Budget,
         cancel: &CancellationToken,
