@@ -24,6 +24,8 @@ use aionui_common::ApiError;
 use crate::routes::error_mapping::agent_error_to_api_error;
 use crate::routes::state::AgentRouterState;
 
+const SYSTEM_USER_ID: &str = "system_default_user";
+
 pub fn agent_routes(state: AgentRouterState) -> Router {
     Router::new()
         .route("/api/agents/logos", get(list_agent_logos))
@@ -45,9 +47,10 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
 
 async fn list_agent_sessions(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Query(query): Query<AgentSessionListQuery>,
 ) -> Result<Json<ApiResponse<Vec<AgentSessionSummary>>>, ApiError> {
+    ensure_session_inspection_admin(&user)?;
     Ok(Json(ApiResponse::ok(
         state
             .session_inspection
@@ -59,9 +62,10 @@ async fn list_agent_sessions(
 
 async fn inspect_agent_session(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path((backend, id)): Path<(AgentSessionBackend, String)>,
 ) -> Result<Json<ApiResponse<AgentSessionSnapshot>>, ApiError> {
+    ensure_session_inspection_admin(&user)?;
     Ok(Json(ApiResponse::ok(
         state
             .session_inspection
@@ -69,6 +73,14 @@ async fn inspect_agent_session(
             .await
             .map_err(agent_error_to_api_error)?,
     )))
+}
+
+fn ensure_session_inspection_admin(user: &CurrentUser) -> Result<(), ApiError> {
+    if user.id == SYSTEM_USER_ID {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden("Administrator access required".into()))
+    }
 }
 
 async fn list_agent_logos(
@@ -229,4 +241,32 @@ async fn set_agent_overrides(
             .await
             .map_err(agent_error_to_api_error)?,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use aionui_db::{UserStatus, UserType};
+
+    use super::*;
+
+    fn user(id: &str) -> CurrentUser {
+        CurrentUser {
+            id: id.to_owned(),
+            username: id.to_owned(),
+            user_type: UserType::Local,
+            status: UserStatus::Active,
+        }
+    }
+
+    #[test]
+    fn session_inspection_allows_the_system_admin() {
+        assert!(ensure_session_inspection_admin(&user(SYSTEM_USER_ID)).is_ok());
+    }
+
+    #[test]
+    fn session_inspection_rejects_non_admin_users() {
+        let error = ensure_session_inspection_admin(&user("user-1")).expect_err("non-admin must be rejected");
+        assert_eq!(error.status_code(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(error.to_string(), "Forbidden: Administrator access required");
+    }
 }
