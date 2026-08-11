@@ -1194,12 +1194,18 @@ mod tests {
             .unwrap();
         let ws_state = build_ws_state(&services, std::sync::Arc::new(aionui_realtime::NoopMessageRouter));
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert(axum::http::header::COOKIE, format!("aionui-session={token}").parse().unwrap());
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("aionui-session={token}").parse().unwrap(),
+        );
         let extracted = (ws_state.token_extractor)(&headers).expect("authenticated token");
 
         assert_eq!(extracted, token);
         assert!((ws_state.token_validator)(&extracted));
-        assert_eq!((ws_state.token_user_resolver)(extracted).await.as_deref(), Some(user.id.as_str()));
+        assert_eq!(
+            (ws_state.token_user_resolver)(extracted).await.as_deref(),
+            Some(user.id.as_str())
+        );
 
         services.database.close().await;
     }
