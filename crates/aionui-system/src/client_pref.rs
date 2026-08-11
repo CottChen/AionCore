@@ -11,7 +11,7 @@ use crate::keep_awake::{DynKeepAwakeController, KEEP_AWAKE_KEY, NoopKeepAwakeCon
 /// Maximum allowed key length for client preferences.
 const MAX_KEY_LENGTH: usize = 255;
 const SYSTEM_USER_ID: &str = "system_default_user";
-const USER_OVERRIDABLE_KEYS: &[&str] = &["theme.activeId", "theme.userThemes"];
+const USER_OVERRIDABLE_KEYS: &[&str] = &["assistants.enabledOrder", "theme.activeId", "theme.userThemes"];
 
 /// Business logic for client preferences (generic key-value store).
 #[derive(Clone)]
