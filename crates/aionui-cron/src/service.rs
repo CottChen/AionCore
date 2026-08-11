@@ -14,8 +14,9 @@ use aionui_common::{
 use aionui_db::{
     ClaimCronRunParams, CronRunClaimResult, DbError, FinishCronRunParams, IAgentMetadataRepository,
     IAssistantDefinitionRepository, IAssistantOverlayRepository, ICronRepository, ISkillRepository,
-    UpdateCronJobParams, UpsertSkillParams, models::AgentMetadataRow, resolve_agent_binding_from_rows,
-    runtime_backend_for_agent,
+    UpdateCronJobParams, UpsertSkillParams,
+    models::{AgentMetadataRow, AssistantDefinitionRow},
+    resolve_agent_binding_from_rows, runtime_backend_for_agent,
 };
 use tracing::{debug, error, info, warn};
 
@@ -1058,14 +1059,13 @@ impl CronService {
         user_id: &str,
         assistant_id: &str,
     ) -> Result<String, CronError> {
-        let definition = self
-            .assistant_definition_repo
-            .get_by_assistant_id_for_user(SYSTEM_USER_ID, assistant_id)
+        let (owner_id, definition) = self
+            .resolve_assistant_definition(user_id, assistant_id)
             .await?
             .ok_or_else(|| CronError::InvalidAgentConfig(format!("assistant '{assistant_id}' not found")))?;
         let overlay = self
             .assistant_overlay_repo
-            .get_for_user(SYSTEM_USER_ID, &definition.id)
+            .get_for_user(&owner_id, &definition.id)
             .await?;
         let effective_agent_id = overlay
             .as_ref()
@@ -1930,16 +1930,12 @@ impl CronService {
             return Ok(None);
         };
 
-        let Some(definition) = self
-            .assistant_definition_repo
-            .get_by_assistant_id_for_user(SYSTEM_USER_ID, assistant_id)
-            .await?
-        else {
+        let Some((owner_id, definition)) = self.resolve_assistant_definition(user_id, assistant_id).await? else {
             return Ok(None);
         };
         let overlay = self
             .assistant_overlay_repo
-            .get_for_user(SYSTEM_USER_ID, &definition.id)
+            .get_for_user(&owner_id, &definition.id)
             .await?;
         let effective_agent_id = overlay
             .as_ref()
@@ -1953,7 +1949,7 @@ impl CronService {
 
     async fn resolve_assistant_name(
         &self,
-        _user_id: &str,
+        user_id: &str,
         assistant_id: Option<&str>,
     ) -> Result<Option<String>, CronError> {
         let Some(assistant_id) = assistant_id.filter(|value| !value.is_empty()) else {
@@ -1961,9 +1957,9 @@ impl CronService {
         };
 
         Ok(self
-            .assistant_definition_repo
-            .get_by_assistant_id_for_user(SYSTEM_USER_ID, assistant_id)
+            .resolve_assistant_definition(user_id, assistant_id)
             .await?
+            .map(|(_, definition)| definition)
             .map(|definition| definition.name.trim().to_owned())
             .filter(|value| !value.is_empty()))
     }
@@ -1971,8 +1967,7 @@ impl CronService {
     async fn resolve_assistant_id_for_agent_label(&self, user_id: &str, agent_label: &str) -> Option<String> {
         let rows = self.agent_metadata_repo.list_all_for_user(user_id).await.ok()?;
         let binding = resolve_agent_binding_from_rows(&rows, agent_label)?;
-        self.assistant_definition_repo
-            .list_for_user(SYSTEM_USER_ID)
+        self.list_assistant_definitions(user_id)
             .await
             .ok()?
             .into_iter()
@@ -1989,9 +1984,8 @@ impl CronService {
             .map(|definition| definition.assistant_id)
     }
 
-    async fn resolve_default_assistant_id(&self, _user_id: &str) -> Option<String> {
-        self.assistant_definition_repo
-            .list_for_user(SYSTEM_USER_ID)
+    async fn resolve_default_assistant_id(&self, user_id: &str) -> Option<String> {
+        self.list_assistant_definitions(user_id)
             .await
             .ok()?
             .into_iter()
@@ -2047,16 +2041,12 @@ impl CronService {
             return Ok(None);
         };
 
-        let Some(definition) = self
-            .assistant_definition_repo
-            .get_by_assistant_id_for_user(SYSTEM_USER_ID, assistant_id)
-            .await?
-        else {
+        let Some((owner_id, definition)) = self.resolve_assistant_definition(user_id, assistant_id).await? else {
             return Ok(None);
         };
         let overlay = self
             .assistant_overlay_repo
-            .get_for_user(SYSTEM_USER_ID, &definition.id)
+            .get_for_user(&owner_id, &definition.id)
             .await?;
         let effective_agent_id = overlay
             .as_ref()
@@ -2065,6 +2055,36 @@ impl CronService {
 
         self.resolve_agent_metadata_for_value(user_id, Some(effective_agent_id))
             .await
+    }
+
+    async fn resolve_assistant_definition(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<(String, AssistantDefinitionRow)>, CronError> {
+        if let Some(definition) = self
+            .assistant_definition_repo
+            .get_by_assistant_id_for_user(SYSTEM_USER_ID, assistant_id)
+            .await?
+        {
+            return Ok(Some((SYSTEM_USER_ID.to_owned(), definition)));
+        }
+        if user_id == SYSTEM_USER_ID {
+            return Ok(None);
+        }
+        Ok(self
+            .assistant_definition_repo
+            .get_by_assistant_id_for_user(user_id, assistant_id)
+            .await?
+            .map(|definition| (user_id.to_owned(), definition)))
+    }
+
+    async fn list_assistant_definitions(&self, user_id: &str) -> Result<Vec<AssistantDefinitionRow>, CronError> {
+        let administered = self.assistant_definition_repo.list_for_user(SYSTEM_USER_ID).await?;
+        if !administered.is_empty() || user_id == SYSTEM_USER_ID {
+            return Ok(administered);
+        }
+        Ok(self.assistant_definition_repo.list_for_user(user_id).await?)
     }
 
     async fn resolve_agent_metadata_for_value(
