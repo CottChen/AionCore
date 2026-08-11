@@ -6997,6 +6997,7 @@ fn make_test_confirmations() -> Vec<Confirmation> {
             action: Some("edit_file".into()),
             description: "Edit main.rs".into(),
             command_type: Some("bash".into()),
+            questions: None,
             options: vec![],
         },
         Confirmation {
@@ -7006,6 +7007,7 @@ fn make_test_confirmations() -> Vec<Confirmation> {
             action: Some("read_file".into()),
             description: "Read config.toml".into(),
             command_type: None,
+            questions: None,
             options: vec![],
         },
     ]
