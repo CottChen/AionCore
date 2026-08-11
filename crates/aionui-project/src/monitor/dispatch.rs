@@ -103,7 +103,7 @@ impl FsMonitorActor {
             let resolved = match self.resolve(user_id, &target, FileOp::Browse).await {
                 Ok(r) => r,
                 Err((code, message)) => {
-                    tracing::warn!(session, code = message, pe_id = %target.pe_id, "fs subscribe rejected");
+                    tracing::warn!(session, user_id, code = message, pe_id = %target.pe_id, "fs subscribe rejected");
                     self.push(session, wire::error(id.clone(), code, message, ref_data(&target)));
                     return;
                 }
@@ -113,7 +113,7 @@ impl FsMonitorActor {
             let canonical = match canonical::canonicalize(&resolved.resource_uri) {
                 Ok(c) => c.as_str().to_owned(),
                 Err(_) => {
-                    tracing::warn!(session, code = "provider_unavailable", pe_id = %target.pe_id, "fs subscribe rejected");
+                    tracing::warn!(session, user_id, code = "provider_unavailable", pe_id = %target.pe_id, "fs subscribe rejected");
                     self.push(
                         session,
                         wire::error(
@@ -148,7 +148,7 @@ impl FsMonitorActor {
                 }
                 Err(err) => {
                     let (code, message) = wire::fs_error_to_rpc(&err);
-                    tracing::warn!(session, code = message, pe_id = %target.pe_id, "fs subscribe rejected");
+                    tracing::warn!(session, user_id, code = message, pe_id = %target.pe_id, "fs subscribe rejected");
                     self.push(session, wire::error(id.clone(), code, message, ref_data(&target)));
                     return;
                 }
@@ -289,7 +289,7 @@ impl FsMonitorActor {
                     pe_id: root.pe_id.clone(),
                 }),
                 Err((code, message)) => {
-                    tracing::warn!(session, code = message, pe_id = %root.pe_id, "fs search rejected");
+                    tracing::warn!(session, user_id, code = message, pe_id = %root.pe_id, "fs search rejected");
                     self.push(session, wire::error(Some(search_id), code, message, ref_data(root)));
                     return;
                 }

@@ -949,18 +949,12 @@ pub async fn build_extension_states(
 /// `router`. Callers supply the filesystem-monitor router in production and a
 /// no-op router for router-only/test assembly.
 pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) -> WsHandlerState {
-    if services.local {
-        return WsHandlerState {
-            manager: services.ws_manager.clone(),
-            router,
-            token_validator: Arc::new(|_| true),
-            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".to_owned()) })),
-            token_extractor: Arc::new(|_| Some("local".into())),
-        };
-    }
-
+    const LOCAL_WS_TOKEN: &str = "__aionui_local_ws__";
+    let allow_local_fallback = services.local;
     let jwt_service = services.jwt_service.clone();
-    let token_validator = Arc::new(move |token: &str| jwt_service.verify(token).is_ok());
+    let token_validator = Arc::new(move |token: &str| {
+        (allow_local_fallback && token == LOCAL_WS_TOKEN) || jwt_service.verify(token).is_ok()
+    });
     let jwt_service = services.jwt_service.clone();
     let user_repo = services.user_repo.clone();
     let identity_mode = services.identity_mode;
@@ -968,6 +962,9 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
         let jwt_service = jwt_service.clone();
         let user_repo = user_repo.clone();
         Box::pin(async move {
+            if allow_local_fallback && token == LOCAL_WS_TOKEN {
+                return Some("system_default_user".to_owned());
+            }
             let payload = jwt_service.verify(&token).ok()?;
             let user = user_repo.find_active_by_id(&payload.user_id).await.ok()??;
             if identity_mode == IdentityMode::AionPro && user.user_type != aionui_db::UserType::Aionpro {
@@ -977,7 +974,9 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
         })
     });
 
-    let token_extractor = Arc::new(|headers: &axum::http::HeaderMap| extract_token_from_ws_headers(headers));
+    let token_extractor = Arc::new(move |headers: &axum::http::HeaderMap| {
+        extract_token_from_ws_headers(headers).or_else(|| allow_local_fallback.then(|| LOCAL_WS_TOKEN.to_owned()))
+    });
 
     WsHandlerState {
         manager: services.ws_manager.clone(),
@@ -1175,6 +1174,54 @@ mod tests {
 
         let resolved = (ws_state.token_user_resolver)(token).await;
         assert_eq!(resolved, None);
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_ws_state_local_mode_honors_authenticated_user_token() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let config = AppConfig {
+            local: true,
+            identity_mode: IdentityMode::Local,
+            ..AppConfig::default()
+        };
+        let services = AppServices::from_config(db, &config).await.unwrap();
+        let user = services.user_repo.create_user("web-user", "hash").await.unwrap();
+        let token = services
+            .jwt_service
+            .sign_with_session_generation(&user.id, "web-user", user.session_generation)
+            .unwrap();
+        let ws_state = build_ws_state(&services, std::sync::Arc::new(aionui_realtime::NoopMessageRouter));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::COOKIE, format!("aionui-session={token}").parse().unwrap());
+        let extracted = (ws_state.token_extractor)(&headers).expect("authenticated token");
+
+        assert_eq!(extracted, token);
+        assert!((ws_state.token_validator)(&extracted));
+        assert_eq!((ws_state.token_user_resolver)(extracted).await.as_deref(), Some(user.id.as_str()));
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
+    async fn build_ws_state_local_mode_keeps_credentialless_desktop_fallback() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let config = AppConfig {
+            local: true,
+            identity_mode: IdentityMode::Local,
+            ..AppConfig::default()
+        };
+        let services = AppServices::from_config(db, &config).await.unwrap();
+        let ws_state = build_ws_state(&services, std::sync::Arc::new(aionui_realtime::NoopMessageRouter));
+        let headers = axum::http::HeaderMap::new();
+        let token = (ws_state.token_extractor)(&headers).expect("local fallback token");
+
+        assert!((ws_state.token_validator)(&token));
+        assert_eq!(
+            (ws_state.token_user_resolver)(token).await.as_deref(),
+            Some("system_default_user")
+        );
 
         services.database.close().await;
     }
