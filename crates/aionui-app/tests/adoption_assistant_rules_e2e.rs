@@ -16,10 +16,11 @@ use aionui_assistant::service::AssistantServiceDeps;
 use aionui_assistant::{AssistantService, BuiltinAssistantRegistry};
 use aionui_db::{
     Database, ExternalUserProjection, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IProviderRepository,
-    IUserRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteProviderRepository, SqliteSkillRepository, SqliteUserRepository, UserType, init_database_memory,
+    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
+    IAssistantUserOverlayRepository, IProviderRepository, IUserRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
+    SqliteAssistantRepository, SqliteAssistantUserOverlayRepository, SqliteProviderRepository, SqliteSkillRepository,
+    SqliteUserRepository, UserType, init_database_memory,
 };
 use aionui_extension::{SkillPaths, fs_adopt};
 use tempfile::TempDir;
@@ -47,6 +48,8 @@ fn assistant_service(db: &Database, data_dir: &Path) -> AssistantService {
             as Arc<dyn IAssistantDefinitionRepository>,
         state_repo: Arc::new(SqliteAssistantOverlayRepository::new(pool.clone()))
             as Arc<dyn IAssistantOverlayRepository>,
+        user_state_repo: Arc::new(SqliteAssistantUserOverlayRepository::new(pool.clone()))
+            as Arc<dyn IAssistantUserOverlayRepository>,
         preference_repo: Arc::new(SqliteAssistantPreferenceRepository::new(pool.clone()))
             as Arc<dyn IAssistantPreferenceRepository>,
         repo: Arc::new(SqliteAssistantRepository::new(pool.clone())) as Arc<dyn IAssistantRepository>,
