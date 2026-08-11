@@ -1151,7 +1151,7 @@ async fn cross_account_conversation_reference_returns_409_over_http() {
     let (mut app, services) = build_app().await;
 
     // User A owns a conversation.
-    let (_token_a, _csrf_a) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token_a, csrf_a) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let user_a = services
         .user_repo
         .find_by_username("admin")
@@ -1160,9 +1160,8 @@ async fn cross_account_conversation_reference_returns_409_over_http() {
         .expect("admin user should exist");
     ensure_conversation(&services, &user_a.id, "conv_cross_acct", "A's Conversation").await;
 
-    // User B (their own assistant, so agent resolution succeeds and the
-    // request reaches the conversation ownership check).
-    let (token_b, csrf_b) = setup_and_login(&mut app, &services, "mallory", "StrongP@ss2").await;
+    // Seed an administered assistant so user B's request reaches the
+    // conversation ownership check instead of failing agent resolution.
     let req = json_with_token(
         "POST",
         "/api/assistants",
@@ -1171,8 +1170,8 @@ async fn cross_account_conversation_reference_returns_409_over_http() {
             "name": "Mallory Assistant",
             "agent_id": "2d23ff1c"
         }),
-        &token_b,
-        &csrf_b,
+        &token_a,
+        &csrf_a,
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     assert!(
@@ -1180,6 +1179,8 @@ async fn cross_account_conversation_reference_returns_409_over_http() {
         "assistant seed for B failed: {}",
         resp.status()
     );
+
+    let (token_b, csrf_b) = setup_and_login(&mut app, &services, "mallory", "StrongP@ss2").await;
 
     let body = json!({
         "name": "Steal A's Conversation",
@@ -1191,8 +1192,13 @@ async fn cross_account_conversation_reference_returns_409_over_http() {
     });
     let req = json_with_token("POST", "/api/cron/jobs", body, &token_b, &csrf_b);
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT, "cross-account bind must be 409");
+    let status = resp.status();
     let json = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "cross-account bind must be 409, got: {json}"
+    );
     assert_eq!(
         json["code"], "CROSS_ACCOUNT_REFERENCE",
         "must surface the exact contract code, got: {json}"
