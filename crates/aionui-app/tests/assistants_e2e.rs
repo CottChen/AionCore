@@ -958,32 +958,43 @@ async fn update_extension_registry_id_without_user_row_returns_404() {
 }
 
 #[tokio::test]
-async fn assistant_routes_hide_other_users_rows() {
+async fn regular_users_can_read_admin_assistants_but_cannot_mutate_them() {
     let fx = fixture().await;
     create_user(&fx, "private-a", "Private A").await;
 
     let mut app = fx.app.clone();
     let (token_b, csrf_b) = setup_and_login(&mut app, &fx.services, "other-user", "OtherP@ss1").await;
 
-    let requests = [
-        get_with_token("/api/assistants/private-a", &token_b),
-        json_with_token(
+    let read_resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants/private-a", &token_b))
+        .await
+        .unwrap();
+    assert_eq!(read_resp.status(), StatusCode::OK);
+    assert_eq!(body_json(read_resp).await["data"]["profile"]["name"], "Private A");
+
+    let update_resp = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
             "PUT",
             "/api/assistants/private-a",
             json!({ "name": "hijacked" }),
             &token_b,
             &csrf_b,
-        ),
-        delete_with_token("/api/assistants/private-a", &token_b, &csrf_b),
-    ];
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update_resp.status(), StatusCode::FORBIDDEN);
 
-    for request in requests {
-        let resp = fx.app.clone().oneshot(request).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let body = body_json(resp).await;
-        assert_eq!(body["success"], false);
-        assert_eq!(body["code"], "NOT_FOUND");
-    }
+    let delete_resp = fx
+        .app
+        .clone()
+        .oneshot(delete_with_token("/api/assistants/private-a", &token_b, &csrf_b))
+        .await
+        .unwrap();
+    assert_eq!(delete_resp.status(), StatusCode::FORBIDDEN);
 
     let resp = fx
         .app

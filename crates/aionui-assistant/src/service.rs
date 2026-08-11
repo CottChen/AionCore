@@ -880,24 +880,34 @@ impl AssistantService {
     }
 
     async fn list_with_user_overlay(&self, user_id: Option<&str>) -> Result<Vec<AssistantResponse>, AssistantError> {
-        let effective_user_id = user_id.unwrap_or(DEFAULT_USER_ID);
-        let projections = self.reconcile_generated_assistants_for_user(effective_user_id).await?;
-        let agent_metadata_rows = self.list_agent_metadata_rows_for_user(effective_user_id).await?;
+        // The WebUI assistant catalog is administered centrally by the system
+        // user. Regular users inherit that catalog and its base state, then
+        // apply their own display overlay (enabled/order/last-used).
+        let projections = self.reconcile_generated_assistants_for_user(DEFAULT_USER_ID).await?;
+        let agent_metadata_rows = self.list_agent_metadata_rows_for_user(DEFAULT_USER_ID).await?;
         let projection_context = AssistantProjectionContext {
             agent_rows: &projections,
             agent_metadata_rows: &agent_metadata_rows,
         };
         let definitions = self
             .definition_repo
-            .list_for_user(effective_user_id)
+            .list_for_user(DEFAULT_USER_ID)
             .await
             .map_err(|e| AssistantError::Internal(format!("list assistant definitions: {e}")))?;
         let states = self
             .state_repo
-            .list_for_user(effective_user_id)
+            .list_for_user(DEFAULT_USER_ID)
             .await
             .map_err(|e| AssistantError::Internal(format!("list assistant overlays: {e}")))?;
         let state_map: HashMap<String, AssistantOverlayRow> = states
+            .into_iter()
+            .map(|state| (state.assistant_definition_id.clone(), state))
+            .collect();
+        let admin_user_state_map: HashMap<String, AssistantUserOverlayRow> = self
+            .user_state_repo
+            .list_by_user(DEFAULT_USER_ID)
+            .await
+            .map_err(|e| AssistantError::Internal(format!("list admin assistant overlays: {e}")))?
             .into_iter()
             .map(|state| (state.assistant_definition_id.clone(), state))
             .collect();
@@ -919,21 +929,26 @@ impl AssistantService {
             if generated_definition_is_uninstalled(definition, &projections) {
                 continue;
             }
-            let effective_state = self.effective_state(
+            let administered_state = self.effective_state(
                 definition,
                 state_map.get(&definition.id),
+                admin_user_state_map.get(&definition.id),
+            );
+            let effective_state = self.effective_state(
+                definition,
+                administered_state.as_ref(),
                 user_state_map.get(&definition.id),
             );
             let projection = self
                 .project_definition(
-                    effective_user_id,
+                    DEFAULT_USER_ID,
                     definition,
                     effective_state.as_ref(),
                     &projection_context,
                 )
                 .await?;
             result.push(self.definition_to_response(
-                effective_user_id,
+                DEFAULT_USER_ID,
                 definition,
                 effective_state.as_ref(),
                 &projection,
@@ -952,7 +967,7 @@ impl AssistantService {
         let valid_ids: Vec<&str> = result.iter().map(|a| a.id.as_str()).collect();
         if let Err(e) = self
             .override_repo
-            .delete_orphans_for_user(effective_user_id, &valid_ids)
+            .delete_orphans_for_user(DEFAULT_USER_ID, &valid_ids)
             .await
         {
             warn!("override orphan cleanup failed: {e}");
@@ -974,36 +989,37 @@ impl AssistantService {
         id: &str,
         user_id: Option<&str>,
     ) -> Result<AssistantResponse, AssistantError> {
-        let effective_user_id = user_id.unwrap_or(DEFAULT_USER_ID);
-        let projections = self.reconcile_generated_assistants_for_user(effective_user_id).await?;
-        let agent_metadata_rows = self.list_agent_metadata_rows_for_user(effective_user_id).await?;
+        let projections = self.reconcile_generated_assistants_for_user(DEFAULT_USER_ID).await?;
+        let agent_metadata_rows = self.list_agent_metadata_rows_for_user(DEFAULT_USER_ID).await?;
         let projection_context = AssistantProjectionContext {
             agent_rows: &projections,
             agent_metadata_rows: &agent_metadata_rows,
         };
         if let Some(definition) = self
             .definition_repo
-            .get_by_assistant_id_for_user(effective_user_id, id)
+            .get_by_assistant_id_for_user(DEFAULT_USER_ID, id)
             .await?
         {
             if generated_definition_is_uninstalled(&definition, &projections) {
                 return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
             }
-            let state = self.state_repo.get_for_user(effective_user_id, &definition.id).await?;
+            let state = self.state_repo.get_for_user(DEFAULT_USER_ID, &definition.id).await?;
+            let admin_user_state = self.user_state_repo.get(DEFAULT_USER_ID, &definition.id).await?;
+            let administered_state = self.effective_state(&definition, state.as_ref(), admin_user_state.as_ref());
             let user_state = match user_id {
                 Some(user_id) => self.user_state_repo.get(user_id, &definition.id).await?,
                 None => None,
             };
-            let effective_state = self.effective_state(&definition, state.as_ref(), user_state.as_ref());
+            let effective_state = self.effective_state(&definition, administered_state.as_ref(), user_state.as_ref());
             let projection = self
                 .project_definition(
-                    effective_user_id,
+                    DEFAULT_USER_ID,
                     &definition,
                     effective_state.as_ref(),
                     &projection_context,
                 )
                 .await?;
-            return self.definition_to_response(effective_user_id, &definition, effective_state.as_ref(), &projection);
+            return self.definition_to_response(DEFAULT_USER_ID, &definition, effective_state.as_ref(), &projection);
         }
 
         Err(AssistantError::NotFound(format!("assistant '{id}' not found")))
@@ -1028,42 +1044,43 @@ impl AssistantService {
         locale: Option<&str>,
         user_id: Option<&str>,
     ) -> Result<AssistantDetailResponse, AssistantError> {
-        let effective_user_id = user_id.unwrap_or(DEFAULT_USER_ID);
-        let projections = self.reconcile_generated_assistants_for_user(effective_user_id).await?;
-        let agent_metadata_rows = self.list_agent_metadata_rows_for_user(effective_user_id).await?;
+        let projections = self.reconcile_generated_assistants_for_user(DEFAULT_USER_ID).await?;
+        let agent_metadata_rows = self.list_agent_metadata_rows_for_user(DEFAULT_USER_ID).await?;
         let projection_context = AssistantProjectionContext {
             agent_rows: &projections,
             agent_metadata_rows: &agent_metadata_rows,
         };
         if let Some(definition) = self
             .definition_repo
-            .get_by_assistant_id_for_user(effective_user_id, id)
+            .get_by_assistant_id_for_user(DEFAULT_USER_ID, id)
             .await?
         {
             if generated_definition_is_uninstalled(&definition, &projections) {
                 return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
             }
-            let state = self.state_repo.get_for_user(effective_user_id, &definition.id).await?;
+            let state = self.state_repo.get_for_user(DEFAULT_USER_ID, &definition.id).await?;
+            let admin_user_state = self.user_state_repo.get(DEFAULT_USER_ID, &definition.id).await?;
+            let administered_state = self.effective_state(&definition, state.as_ref(), admin_user_state.as_ref());
             let user_state = match user_id {
                 Some(user_id) => self.user_state_repo.get(user_id, &definition.id).await?,
                 None => None,
             };
-            let effective_state = self.effective_state(&definition, state.as_ref(), user_state.as_ref());
+            let effective_state = self.effective_state(&definition, administered_state.as_ref(), user_state.as_ref());
             let preference = self
                 .preference_repo
-                .get_for_user(effective_user_id, &definition.id)
+                .get_for_user(DEFAULT_USER_ID, &definition.id)
                 .await?;
-            let rules_content = self.read_rule_for_user(effective_user_id, id, locale).await?;
+            let rules_content = self.read_rule_for_user(DEFAULT_USER_ID, id, locale).await?;
             let projection = self
                 .project_definition(
-                    effective_user_id,
+                    DEFAULT_USER_ID,
                     &definition,
                     effective_state.as_ref(),
                     &projection_context,
                 )
                 .await?;
             return self.definition_to_detail_response(
-                effective_user_id,
+                DEFAULT_USER_ID,
                 &definition,
                 effective_state.as_ref(),
                 preference.as_ref(),
@@ -1687,7 +1704,34 @@ impl AssistantService {
         id: &str,
         req: SetAssistantStateRequest,
     ) -> Result<AssistantResponse, AssistantError> {
-        self.set_state_for_user(DEFAULT_USER_ID, id, req).await
+        self.set_state_for_user(DEFAULT_USER_ID, id, req).await?;
+
+        let definition = self
+            .definition_repo
+            .get_by_assistant_id_for_user(DEFAULT_USER_ID, id)
+            .await?
+            .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
+        let user_state = self
+            .user_state_repo
+            .get(DEFAULT_USER_ID, &definition.id)
+            .await?
+            .ok_or_else(|| AssistantError::Internal(format!("assistant '{id}' state was not persisted")))?;
+
+        self.state_repo
+            .upsert_for_user(
+                DEFAULT_USER_ID,
+                &UpsertAssistantOverlayParams {
+                    assistant_definition_id: &definition.id,
+                    enabled: user_state.enabled.unwrap_or(true),
+                    sort_order: user_state.sort_order.unwrap_or_default(),
+                    agent_id_override: user_state.agent_id_override.as_deref(),
+                    last_used_at: user_state.last_used_at,
+                },
+            )
+            .await
+            .map_err(|e| AssistantError::Internal(format!("upsert assistant overlay: {e}")))?;
+
+        self.get(id).await
     }
 
     pub async fn set_state_for_user(
@@ -1696,10 +1740,10 @@ impl AssistantService {
         id: &str,
         req: SetAssistantStateRequest,
     ) -> Result<AssistantResponse, AssistantError> {
-        match self.classify_source_for_user(user_id, id).await {
+        match self.classify_source_for_user(DEFAULT_USER_ID, id).await {
             AssistantSource::Builtin | AssistantSource::Generated => {}
             AssistantSource::User => {
-                if self.repo.get_for_user(user_id, id).await?.is_none() {
+                if self.repo.get_for_user(DEFAULT_USER_ID, id).await?.is_none() {
                     return Err(AssistantError::NotFound(format!("assistant '{id}' not found")));
                 }
             }
@@ -1707,48 +1751,36 @@ impl AssistantService {
 
         let definition = self
             .definition_repo
-            .get_by_assistant_id_for_user(user_id, id)
+            .get_by_assistant_id_for_user(DEFAULT_USER_ID, id)
             .await?
             .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
-        let existing_state = self.state_repo.get_for_user(user_id, &definition.id).await?;
+        let existing_state = self.state_repo.get_for_user(DEFAULT_USER_ID, &definition.id).await?;
+        let admin_user_state = self.user_state_repo.get(DEFAULT_USER_ID, &definition.id).await?;
+        let administered_state = self.effective_state(&definition, existing_state.as_ref(), admin_user_state.as_ref());
         let existing_user_state = self.user_state_repo.get(user_id, &definition.id).await?;
         let builtin_default = self.builtin_listing_default(&definition);
         let enabled = req
             .enabled
             .or_else(|| existing_user_state.as_ref().and_then(|state| state.enabled))
-            .or_else(|| existing_state.as_ref().map(|state| state.enabled))
+            .or_else(|| administered_state.as_ref().map(|state| state.enabled))
             .unwrap_or_else(|| builtin_default.map(|(_, enabled)| enabled).unwrap_or(true));
         let sort_order = req
             .sort_order
             .or_else(|| existing_user_state.as_ref().and_then(|state| state.sort_order))
-            .or_else(|| existing_state.as_ref().map(|state| state.sort_order))
+            .or_else(|| administered_state.as_ref().map(|state| state.sort_order))
             .unwrap_or_else(|| builtin_default.map(|(sort_order, _)| sort_order).unwrap_or_default());
         let last_used_at = req
             .last_used_at
             .or_else(|| existing_user_state.as_ref().and_then(|state| state.last_used_at))
-            .or_else(|| existing_state.as_ref().and_then(|state| state.last_used_at));
+            .or_else(|| administered_state.as_ref().and_then(|state| state.last_used_at));
         let agent_id_override = existing_user_state
             .as_ref()
             .and_then(|state| state.agent_id_override.clone())
             .or_else(|| {
-                existing_state
+                administered_state
                     .as_ref()
                     .and_then(|state| state.agent_id_override.clone())
             });
-
-        self.state_repo
-            .upsert_for_user(
-                user_id,
-                &UpsertAssistantOverlayParams {
-                    assistant_definition_id: &definition.id,
-                    enabled,
-                    sort_order,
-                    agent_id_override: agent_id_override.as_deref(),
-                    last_used_at,
-                },
-            )
-            .await
-            .map_err(|e| AssistantError::Internal(format!("upsert assistant overlay: {e}")))?;
 
         self.user_state_repo
             .upsert(&UpsertAssistantUserOverlayParams {
@@ -1946,12 +1978,36 @@ impl AssistantService {
         id: &str,
         locale: Option<&str>,
     ) -> Result<String, AssistantError> {
-        match self.classify_source_for_user(user_id, id).await {
+        let owner_user_id = self.catalog_owner_user_id(user_id, id).await?;
+        match self.classify_source_for_user(&owner_user_id, id).await {
             AssistantSource::Builtin => Ok(self.read_builtin_rule_with_fallback(id, locale)),
             AssistantSource::Generated | AssistantSource::User => {
-                Ok(self.read_user_rule_with_fallback(user_id, id, locale))
+                Ok(self.read_user_rule_with_fallback(&owner_user_id, id, locale))
             }
         }
+    }
+
+    async fn catalog_owner_user_id(&self, user_id: &str, id: &str) -> Result<String, AssistantError> {
+        if user_id == DEFAULT_USER_ID
+            || self
+                .definition_repo
+                .get_by_assistant_id_for_user(user_id, id)
+                .await?
+                .is_some()
+        {
+            return Ok(user_id.to_string());
+        }
+
+        if self
+            .definition_repo
+            .get_by_assistant_id_for_user(DEFAULT_USER_ID, id)
+            .await?
+            .is_some()
+        {
+            return Ok(DEFAULT_USER_ID.to_string());
+        }
+
+        Ok(user_id.to_string())
     }
 
     fn read_builtin_rule_with_fallback(&self, id: &str, locale: Option<&str>) -> String {
@@ -2077,11 +2133,12 @@ impl AssistantService {
         id: &str,
         locale: Option<&str>,
     ) -> Result<String, AssistantError> {
-        match self.classify_source_for_user(user_id, id).await {
+        let owner_user_id = self.catalog_owner_user_id(user_id, id).await?;
+        match self.classify_source_for_user(&owner_user_id, id).await {
             AssistantSource::Builtin => Ok(String::new()),
             AssistantSource::Generated | AssistantSource::User => {
-                let content = read_assistant_md_with_legacy(&self.user_skills_dir_for_user(user_id), id, locale);
-                if !content.is_empty() || user_id != DEFAULT_USER_ID {
+                let content = read_assistant_md_with_legacy(&self.user_skills_dir_for_user(&owner_user_id), id, locale);
+                if !content.is_empty() || owner_user_id != DEFAULT_USER_ID {
                     return Ok(content);
                 }
                 Ok(read_assistant_md_with_legacy(&self.user_skills_root_dir(), id, locale))
@@ -4378,11 +4435,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_for_user_isolates_user_authored_assistants() {
+    async fn list_for_user_inherits_the_administered_catalog() {
         let fx = fixture_with_builtins(vec![mk_builtin("builtin-office", "Office")]).await;
         let user_b = create_test_user(&fx._db, "assistant_user_b").await;
-        seed_provider_for_user(&*fx.provider_repo, &user_b, "openai").await;
-
         fx.service
             .create_for_user(
                 DEFAULT_USER_ID,
@@ -4394,27 +4449,13 @@ mod tests {
             )
             .await
             .unwrap();
-        fx.service
-            .create_for_user(
-                &user_b,
-                CreateAssistantRequest {
-                    id: Some("u-b".into()),
-                    name: "User B Assistant".into(),
-                    ..req_default()
-                },
-            )
-            .await
-            .unwrap();
-
         let default_list = fx.service.list_for_user(DEFAULT_USER_ID).await.unwrap();
         let user_b_list = fx.service.list_for_user(&user_b).await.unwrap();
 
         assert!(default_list.iter().any(|assistant| assistant.id == "builtin-office"));
         assert!(user_b_list.iter().any(|assistant| assistant.id == "builtin-office"));
         assert!(default_list.iter().any(|assistant| assistant.id == "u-default"));
-        assert!(!default_list.iter().any(|assistant| assistant.id == "u-b"));
-        assert!(user_b_list.iter().any(|assistant| assistant.id == "u-b"));
-        assert!(!user_b_list.iter().any(|assistant| assistant.id == "u-default"));
+        assert!(user_b_list.iter().any(|assistant| assistant.id == "u-default"));
     }
 
     #[tokio::test]
@@ -6318,6 +6359,97 @@ mod tests {
             user_b_list.first().map(|assistant| assistant.id.as_str()),
             Some("builtin-first")
         );
+    }
+
+    #[tokio::test]
+    async fn admin_state_is_shared_while_user_override_remains_personal() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("shared-custom".into()),
+                name: "Shared Custom".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        fx.service
+            .set_state(
+                "shared-custom",
+                SetAssistantStateRequest {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let user_repo = SqliteUserRepository::new(fx._db.pool().clone());
+        let user_a = user_repo.create_user("user-a", "hash").await.unwrap();
+        let user_b = user_repo.create_user("user-b", "hash").await.unwrap();
+
+        fx.service
+            .set_state_for_user(
+                &user_a.id,
+                "shared-custom",
+                SetAssistantStateRequest {
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let user_a_list = fx.service.list_for_user(&user_a.id).await.unwrap();
+        let user_b_list = fx.service.list_for_user(&user_b.id).await.unwrap();
+        let user_a_custom = user_a_list
+            .iter()
+            .find(|assistant| assistant.id == "shared-custom")
+            .unwrap();
+        let user_b_custom = user_b_list
+            .iter()
+            .find(|assistant| assistant.id == "shared-custom")
+            .unwrap();
+
+        assert!(user_a_custom.enabled);
+        assert!(!user_b_custom.enabled);
+    }
+
+    #[tokio::test]
+    async fn legacy_admin_user_overlay_is_inherited_as_shared_state() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("legacy-shared".into()),
+                name: "Legacy Shared".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let definition = fx
+            .definition_repo
+            .get_by_assistant_id("legacy-shared")
+            .await
+            .unwrap()
+            .unwrap();
+        fx.service
+            .user_state_repo
+            .upsert(&UpsertAssistantUserOverlayParams {
+                user_id: DEFAULT_USER_ID,
+                assistant_definition_id: &definition.id,
+                enabled: Some(false),
+                sort_order: Some(42),
+                agent_id_override: None,
+                last_used_at: None,
+            })
+            .await
+            .unwrap();
+
+        let regular_user = create_test_user(&fx._db, "legacy_overlay_reader").await;
+        let list = fx.service.list_for_user(&regular_user).await.unwrap();
+        let shared = list.iter().find(|assistant| assistant.id == "legacy-shared").unwrap();
+
+        assert!(!shared.enabled);
+        assert_eq!(shared.sort_order, 42);
     }
 
     #[tokio::test]

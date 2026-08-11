@@ -20,6 +20,8 @@ use aionui_common::ApiError;
 use crate::error::AssistantError;
 pub use crate::state::AssistantRouterState;
 
+const SYSTEM_USER_ID: &str = "system_default_user";
+
 /// Build the router for `/api/assistants/*`.
 pub fn assistant_routes(state: AssistantRouterState) -> Router {
     Router::new()
@@ -65,8 +67,9 @@ async fn create(
     Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<CreateAssistantRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<AssistantResponse>>), ApiError> {
+    ensure_admin(&current_user)?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let created = state.service.create_for_user(&current_user.id, req).await?;
+    let created = state.service.create(req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
 }
 
@@ -89,8 +92,9 @@ async fn update(
     Path(id): Path<String>,
     body: Result<Json<UpdateAssistantRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
+    ensure_admin(&current_user)?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let updated = state.service.update_for_user(&current_user.id, &id, req).await?;
+    let updated = state.service.update(&id, req).await?;
     Ok(Json(ApiResponse::ok(updated)))
 }
 
@@ -99,7 +103,8 @@ async fn delete_one(
     Extension(current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    state.service.delete_for_user(&current_user.id, &id).await?;
+    ensure_admin(&current_user)?;
+    state.service.delete(&id).await?;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -110,7 +115,11 @@ async fn set_state(
     body: Result<Json<SetAssistantStateRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let resp = state.service.set_state_for_user(&current_user.id, &id, req).await?;
+    let resp = if current_user.id == SYSTEM_USER_ID {
+        state.service.set_state(&id, req).await?
+    } else {
+        state.service.set_state_for_user(&current_user.id, &id, req).await?
+    };
     Ok(Json(ApiResponse::ok(resp)))
 }
 
@@ -119,9 +128,18 @@ async fn import(
     Extension(current_user): Extension<CurrentUser>,
     body: Result<Json<ImportAssistantsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportAssistantsResult>>, ApiError> {
+    ensure_admin(&current_user)?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let result = state.service.import_for_user(&current_user.id, req).await?;
+    let result = state.service.import(req).await?;
     Ok(Json(ApiResponse::ok(result)))
+}
+
+fn ensure_admin(user: &CurrentUser) -> Result<(), ApiError> {
+    if user.id == SYSTEM_USER_ID {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden("Administrator access required".into()))
+    }
 }
 
 /// Serve the raw avatar bytes for an assistant. Content-Type inferred from the
@@ -129,12 +147,12 @@ async fn import(
 /// serves those via `aion-asset://`.
 async fn get_avatar(
     State(state): State<AssistantRouterState>,
-    Extension(current_user): Extension<CurrentUser>,
+    Extension(_current_user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let asset = state
         .service
-        .avatar_asset_for_user(&current_user.id, &id)
+        .avatar_asset(&id)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("avatar '{id}' not found")))?;
 
