@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
@@ -219,14 +219,35 @@ impl AgentSessionInspectionService {
             return Ok(Vec::new());
         };
         let connection = open_read_only(&db_path)?;
-        let scope_clause = match scope {
-            AgentSessionScope::All => "",
-            AgentSessionScope::Main => "WHERE parent_id IS NULL",
-            AgentSessionScope::Child => "WHERE parent_id IS NOT NULL",
+        let columns = sqlite_table_columns(&connection, "session")?;
+        if !columns.contains("id") {
+            return Ok(Vec::new());
+        }
+        let scope_clause = match (scope, columns.contains("parent_id")) {
+            (AgentSessionScope::All, _) | (AgentSessionScope::Main, false) => "",
+            (AgentSessionScope::Main, true) => "WHERE parent_id IS NULL",
+            (AgentSessionScope::Child, true) => "WHERE parent_id IS NOT NULL",
+            (AgentSessionScope::Child, false) => return Ok(Vec::new()),
+        };
+        let optional_column = |name: &'static str| columns.contains(name).then_some(name).unwrap_or("NULL");
+        let order_column = if columns.contains("time_updated") {
+            "time_updated"
+        } else if columns.contains("time_created") {
+            "time_created"
+        } else {
+            "id"
         };
         let sql = format!(
-            "SELECT id, title, directory, model, agent, time_archived, parent_id, time_created, time_updated \
-             FROM session {scope_clause} ORDER BY time_updated DESC LIMIT ?1"
+            "SELECT id, {}, {}, {}, {}, {}, {}, {}, {} \
+             FROM session {scope_clause} ORDER BY {order_column} DESC LIMIT ?1",
+            optional_column("title"),
+            optional_column("directory"),
+            optional_column("model"),
+            optional_column("agent"),
+            optional_column("time_archived"),
+            optional_column("parent_id"),
+            optional_column("time_created"),
+            optional_column("time_updated"),
         );
         let mut statement = connection.prepare(&sql).map_err(sql_error)?;
         let rows = statement
@@ -359,14 +380,26 @@ fn opencode_db_path(data_dir: &Path) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+fn sqlite_table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>, AgentError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(sql_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sql_error)?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(sql_error)?;
+    Ok(columns)
+}
+
 fn opencode_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSessionSummary> {
     let raw_model = row.get::<_, Option<String>>(3)?;
     let agent = row.get::<_, Option<String>>(4)?;
     Ok(AgentSessionSummary {
         id: row.get(0)?,
         backend: AgentSessionBackend::Opencode,
-        title: non_empty(row.get(1)?),
-        cwd: non_empty(row.get(2)?),
+        title: row.get::<_, Option<String>>(1)?.and_then(non_empty),
+        cwd: row.get::<_, Option<String>>(2)?.and_then(non_empty),
         model: raw_model.and_then(|value| opencode_model_name(&value)),
         source: agent
             .map(|agent| format!("opencode/{agent}"))
@@ -1055,6 +1088,16 @@ mod tests {
         (parent_id, child_id)
     }
 
+    fn create_legacy_opencode_fixture(root: &Path) {
+        let connection = Connection::open(root.join("opencode.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT); \
+                 INSERT INTO session VALUES ('ses-legacy', 'Legacy', '/tmp/legacy');",
+            )
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn reads_codex_thread_tools_and_children() {
         let codex = TempDir::new().unwrap();
@@ -1118,6 +1161,46 @@ mod tests {
             .unwrap();
         assert_eq!(tool.name.as_deref(), Some("bash"));
         assert_eq!(tool.output, Some(Value::String("/tmp/project".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn lists_legacy_opencode_sessions_without_optional_columns() {
+        let codex = TempDir::new().unwrap();
+        let opencode = TempDir::new().unwrap();
+        let pi = TempDir::new().unwrap();
+        create_legacy_opencode_fixture(opencode.path());
+        let service = AgentSessionInspectionService::with_roots(
+            codex.path().to_owned(),
+            opencode.path().to_owned(),
+            pi.path().to_owned(),
+        );
+
+        let sessions = service
+            .list(AgentSessionBackend::Opencode, AgentSessionScope::All, None)
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "ses-legacy");
+        assert_eq!(sessions[0].model, None);
+    }
+
+    #[tokio::test]
+    async fn treats_an_opencode_database_without_a_session_table_as_empty() {
+        let codex = TempDir::new().unwrap();
+        let opencode = TempDir::new().unwrap();
+        let pi = TempDir::new().unwrap();
+        Connection::open(opencode.path().join("opencode.db")).unwrap();
+        let service = AgentSessionInspectionService::with_roots(
+            codex.path().to_owned(),
+            opencode.path().to_owned(),
+            pi.path().to_owned(),
+        );
+
+        let sessions = service
+            .list(AgentSessionBackend::Opencode, AgentSessionScope::All, None)
+            .await
+            .unwrap();
+        assert!(sessions.is_empty());
     }
 
     #[tokio::test]
