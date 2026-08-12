@@ -229,7 +229,7 @@ impl AgentSessionInspectionService {
             (AgentSessionScope::Child, true) => "WHERE parent_id IS NOT NULL",
             (AgentSessionScope::Child, false) => return Ok(Vec::new()),
         };
-        let optional_column = |name: &'static str| columns.contains(name).then_some(name).unwrap_or("NULL");
+        let optional_column = |name: &'static str| if columns.contains(name) { name } else { "NULL" };
         let order_column = if columns.contains("time_updated") {
             "time_updated"
         } else if columns.contains("time_created") {
