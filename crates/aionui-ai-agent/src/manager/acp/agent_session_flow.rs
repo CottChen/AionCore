@@ -1401,6 +1401,7 @@ mod tests {
         tx.send(AgentStreamEvent::Start(StartEventData::default())).unwrap();
         tx.send(AgentStreamEvent::AcpDialectSignal(AcpDialectSignalData {
             kind: AcpDialectSignalKind::SessionEnd,
+            session_id: Some("sess-1".into()),
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -1440,6 +1441,7 @@ mod tests {
         assert!(!super::event_is_user_visible_output(
             &AgentStreamEvent::AcpDialectSignal(AcpDialectSignalData {
                 kind: AcpDialectSignalKind::TokenPressure,
+                session_id: None,
             })
         ));
     }

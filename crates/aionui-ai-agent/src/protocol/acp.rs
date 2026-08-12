@@ -161,6 +161,9 @@ pub struct AcpProtocol {
     /// Shared with the SDK background task's request handlers; torn down
     /// (all processes killed) when the protocol drops.
     terminal_registry: Arc<crate::terminal::TerminalRegistry>,
+    /// Internal copy of the same stream event bus. Used to correlate absorbed
+    /// dialect terminal markers with the prompt RPC that should have returned.
+    event_tx: broadcast::Sender<AgentStreamEvent>,
 }
 
 #[allow(dead_code)] // Full ACP method set; some methods await wiring (fork, close, list, auth, ext).
@@ -199,7 +202,7 @@ impl AcpProtocol {
         tokio::spawn(run_sdk_background(
             stdin,
             stdout,
-            event_tx,
+            event_tx.clone(),
             permission_tx,
             notification_tx,
             init_tx,
@@ -247,6 +250,7 @@ impl AcpProtocol {
             initialize_response: Arc::new(RwLock::new(Some(init_response))),
             replay_suppression,
             terminal_registry,
+            event_tx,
         })
     }
 
@@ -327,7 +331,7 @@ impl AcpProtocol {
     /// Blocks until the agent returns a `PromptResponse` (turn completed).
     /// Streaming events arrive via the `event_tx` broadcast channel.
     pub async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, AcpError> {
-        self.send_request(req, AGENT_METHOD_NAMES.session_prompt).await
+        self.prompt_with_dialect_terminal_fallback(req).await
     }
 
     /// Cancel the current prompt in a session (fire-and-forget notification).
@@ -520,6 +524,50 @@ impl AcpProtocol {
         rsp.map_err(|e| AcpError::from_sdk(e, method))
     }
 
+    /// `session/prompt` normally completes when the agent returns its
+    /// PromptResponse. Some ACP dialects emit a non-standard session_end marker
+    /// that our tolerant transport absorbs before the SDK can parse it; if the
+    /// agent also fails to return PromptResponse, the normal request would wait
+    /// forever and the conversation runtime would stay running.
+    ///
+    /// Race the prompt RPC against the absorbed terminal marker for the same
+    /// session only. The actual SDK request is kept alive in a detached task so
+    /// its response receiver is not dropped; this preserves the connection even
+    /// if the real response arrives later.
+    async fn prompt_with_dialect_terminal_fallback(&self, req: PromptRequest) -> Result<PromptResponse, AcpError> {
+        self.ensure_connected()?;
+        let session_id = req.session_id.to_string();
+        log_client_request(AGENT_METHOD_NAMES.session_prompt, &json_str(&req));
+        let connection = self.connection.clone();
+        let handle = tokio::spawn(async move {
+            let rsp = connection.send_request(req).block_task().await;
+            log_agent_response(AGENT_METHOD_NAMES.session_prompt, &json_or_err(&rsp));
+            rsp
+        });
+        let mut dialect_rx = self.event_tx.subscribe();
+
+        tokio::select! {
+            joined = handle => {
+                match joined {
+                    Ok(rsp) => rsp.map_err(|e| AcpError::from_sdk(e, AGENT_METHOD_NAMES.session_prompt)),
+                    Err(join_err) => Err(AcpError::AgentInternal {
+                        message: format!("{} prompt RPC task panicked: {join_err}", AGENT_METHOD_NAMES.session_prompt),
+                        code: -32603,
+                        data: None,
+                    }),
+                }
+            }
+            _ = wait_for_session_end(&mut dialect_rx, &session_id) => {
+                info!(
+                    session_id = %session_id,
+                    method = AGENT_METHOD_NAMES.session_prompt,
+                    "ACP prompt completed via absorbed session_end marker"
+                );
+                Ok(PromptResponse::new(agent_client_protocol::schema::v1::StopReason::EndTurn))
+            }
+        }
+    }
+
     /// Like [`Self::send_request`], but receives the response untyped so keys
     /// outside the typed schema survive, captures the legacy top-level
     /// `models` value, then parses the typed response from the same raw JSON.
@@ -599,6 +647,20 @@ impl Drop for ReplaySuppressionGuard<'_> {
     }
 }
 
+async fn wait_for_session_end(rx: &mut broadcast::Receiver<AgentStreamEvent>, session_id: &str) {
+    loop {
+        match rx.recv().await {
+            Ok(AgentStreamEvent::AcpDialectSignal(stream_event::AcpDialectSignalData {
+                kind: stream_event::AcpDialectSignalKind::SessionEnd,
+                session_id: Some(event_session_id),
+            })) if event_session_id == session_id => return,
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
 /// Run the SDK `connect_with` future: register notification/request
 /// handlers, execute the initialize handshake, publish the connection
 /// handle, then park on the shutdown signal until [`AcpProtocol`] is dropped.
@@ -636,11 +698,12 @@ async fn run_sdk_background(
                         acp_dialect::LineDisposition::Forward(line) => Some(Ok(line)),
                         acp_dialect::LineDisposition::Absorb(kind) => {
                             log_acp_dialect_absorbed(kind, &line);
+                            let (session_id, _) = acp_dialect::absorbed_log_context(&line);
                             // `broadcast::send` is synchronous and non-blocking; a
                             // send error only means no active subscriber for this
                             // turn (nothing to correlate against), which is fine.
                             let _ = dialect_event_tx.send(AgentStreamEvent::AcpDialectSignal(
-                                stream_event::AcpDialectSignalData { kind },
+                                stream_event::AcpDialectSignalData { kind, session_id },
                             ));
                             None
                         }
@@ -1557,6 +1620,39 @@ mod tests {
             completed.load(Ordering::SeqCst),
             "timed-out config RPC task must survive the timeout (detached, not aborted)"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_session_end_ignores_other_dialect_signals() {
+        let (tx, _) = broadcast::channel::<AgentStreamEvent>(8);
+        let mut rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AcpDialectSignal(stream_event::AcpDialectSignalData {
+            kind: stream_event::AcpDialectSignalKind::TokenPressure,
+            session_id: Some("s1".into()),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::AcpDialectSignal(stream_event::AcpDialectSignalData {
+            kind: stream_event::AcpDialectSignalKind::SessionEnd,
+            session_id: Some("other".into()),
+        }))
+        .unwrap();
+
+        let pending =
+            tokio::time::timeout(std::time::Duration::from_secs(1), wait_for_session_end(&mut rx, "s1")).await;
+        assert!(pending.is_err(), "only same-session session_end may complete the wait");
+    }
+
+    #[tokio::test]
+    async fn wait_for_session_end_accepts_matching_session_end() {
+        let (tx, _) = broadcast::channel::<AgentStreamEvent>(8);
+        let mut rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AcpDialectSignal(stream_event::AcpDialectSignalData {
+            kind: stream_event::AcpDialectSignalKind::SessionEnd,
+            session_id: Some("s1".into()),
+        }))
+        .unwrap();
+
+        wait_for_session_end(&mut rx, "s1").await;
     }
 
     #[test]

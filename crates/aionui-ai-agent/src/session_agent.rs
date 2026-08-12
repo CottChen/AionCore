@@ -1556,7 +1556,7 @@ pub async fn build_antigravity_instance(
     let init = SessionInit {
         mcp_servers,
         skills: config.skills.clone(),
-        preset_context: config.preset_context.clone(),
+        preset_context: crate::default_prompt::append_default_prompt_rules(config.preset_context.as_deref()),
         session_snapshot: None,
         resume: matches!(spec, aionui_session::SessionSpec::Resume { .. }),
     };
@@ -1673,7 +1673,7 @@ pub async fn build_session_instance(
     let init = SessionInit {
         mcp_servers,
         skills: config.skills.clone(),
-        preset_context: config.preset_context.clone(),
+        preset_context: crate::default_prompt::append_default_prompt_rules(config.preset_context.as_deref()),
         // acp/codex resume via SessionSpec::Resume; no in-band snapshot needed.
         session_snapshot: None,
         resume: matches!(spec, SessionSpec::Resume { .. }),

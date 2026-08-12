@@ -211,6 +211,8 @@ pub struct WorkflowProgressData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpDialectSignalData {
     pub kind: AcpDialectSignalKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[cfg(test)]

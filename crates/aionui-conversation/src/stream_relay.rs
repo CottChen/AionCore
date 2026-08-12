@@ -1540,6 +1540,7 @@ mod tests {
 
         tx.send(AgentStreamEvent::AcpDialectSignal(AcpDialectSignalData {
             kind: AcpDialectSignalKind::TokenPressure,
+            session_id: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();

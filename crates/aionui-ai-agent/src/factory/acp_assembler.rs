@@ -104,10 +104,7 @@ fn resolve_mcp_servers(config: &AcpBuildExtra, user_mcp_servers: Vec<McpServer>)
 
 /// Compose first-message preset context.
 fn compose_preset_context(base_preset_context: Option<&str>) -> Option<String> {
-    base_preset_context
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+    crate::default_prompt::append_default_prompt_rules(base_preset_context)
 }
 
 fn team_mcp_server(cfg: &TeamMcpStdioConfig) -> McpServer {
@@ -130,11 +127,20 @@ mod tests {
     fn compose_preset_context_returns_trimmed_base_only() {
         assert_eq!(
             compose_preset_context(Some("  frozen rules  ")),
-            Some("frozen rules".to_owned())
+            Some(format!(
+                "frozen rules\n\n{}",
+                crate::default_prompt::MARKDOWN_LINK_TARGET_RULE
+            ))
         );
         let result = compose_preset_context(Some("  "));
-        assert_eq!(result, None);
-        assert_eq!(compose_preset_context(None), None);
+        assert_eq!(
+            result,
+            Some(crate::default_prompt::MARKDOWN_LINK_TARGET_RULE.to_owned())
+        );
+        assert_eq!(
+            compose_preset_context(None),
+            Some(crate::default_prompt::MARKDOWN_LINK_TARGET_RULE.to_owned())
+        );
     }
 
     fn user_stdio(name: &str) -> McpServer {
@@ -219,7 +225,14 @@ mod tests {
         .await;
 
         assert!(params.dump_prompts);
-        assert_eq!(params.preset_context.as_deref(), Some("frozen rules"));
+        assert_eq!(
+            params.preset_context.as_deref(),
+            Some(format!(
+                "frozen rules\n\n{}",
+                crate::default_prompt::MARKDOWN_LINK_TARGET_RULE
+            ))
+            .as_deref()
+        );
         assert_eq!(params.config.skills, vec!["pdf"]);
         assert_eq!(
             params.config.mcp_server_ids.as_deref(),

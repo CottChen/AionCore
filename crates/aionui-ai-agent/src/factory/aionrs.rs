@@ -41,12 +41,7 @@ pub(super) async fn build(
     // target contract. Native skill materialization for Aionrs is tracked as a
     // separate follow-up because this factory currently has no stable Aionrs
     // skill-loading path.
-    if let Some(rules) = overrides.preset_rules.take() {
-        overrides.system_prompt = Some(match overrides.system_prompt.take() {
-            Some(existing) => format!("{existing}\n\n{rules}"),
-            None => rules,
-        });
-    }
+    apply_default_prompt_rules(&mut overrides);
 
     let mut extra_mcp_servers = resolve_mcp_servers(&overrides);
     if let Some(repo) = deps.mcp_server_repo.as_ref() {
@@ -234,6 +229,19 @@ pub(super) async fn build(
 
     let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
+}
+
+fn apply_default_prompt_rules(overrides: &mut AionrsBuildExtra) {
+    let default_rules = crate::default_prompt::MARKDOWN_LINK_TARGET_RULE;
+    if let Some(rules) = overrides.preset_rules.take() {
+        overrides.system_prompt = Some(match overrides.system_prompt.take() {
+            Some(existing) => format!("{existing}\n\n{rules}\n\n{default_rules}"),
+            None => format!("{rules}\n\n{default_rules}"),
+        });
+    } else {
+        overrides.system_prompt =
+            crate::default_prompt::append_default_prompt_rules(overrides.system_prompt.as_deref());
+    }
 }
 
 /// Map AionUi DB platform/protocol settings to the aionrs provider identifier.
@@ -1897,16 +1905,15 @@ mod tests {
         });
         let mut overrides: AionrsBuildExtra = serde_json::from_value(json).unwrap();
 
-        if let Some(rules) = overrides.preset_rules.take() {
-            overrides.system_prompt = Some(match overrides.system_prompt.take() {
-                Some(existing) => format!("{existing}\n\n{rules}"),
-                None => rules,
-            });
-        }
+        apply_default_prompt_rules(&mut overrides);
 
         assert_eq!(
             overrides.system_prompt.as_deref(),
-            Some("You are a data analyst. Always use Python.")
+            Some(format!(
+                "You are a data analyst. Always use Python.\n\n{}",
+                crate::default_prompt::MARKDOWN_LINK_TARGET_RULE
+            ))
+            .as_deref()
         );
         assert!(overrides.preset_rules.is_none());
     }
@@ -1919,33 +1926,34 @@ mod tests {
         });
         let mut overrides: AionrsBuildExtra = serde_json::from_value(json).unwrap();
 
-        if let Some(rules) = overrides.preset_rules.take() {
-            overrides.system_prompt = Some(match overrides.system_prompt.take() {
-                Some(existing) => format!("{existing}\n\n{rules}"),
-                None => rules,
-            });
-        }
+        apply_default_prompt_rules(&mut overrides);
 
         assert_eq!(
             overrides.system_prompt.as_deref(),
-            Some("Be concise.\n\nYou are a data analyst.")
+            Some(format!(
+                "Be concise.\n\nYou are a data analyst.\n\n{}",
+                crate::default_prompt::MARKDOWN_LINK_TARGET_RULE
+            ))
+            .as_deref()
         );
     }
 
     #[test]
-    fn no_preset_rules_leaves_system_prompt_unchanged() {
+    fn no_preset_rules_appends_default_prompt_rule() {
         let json = serde_json::json!({
             "system_prompt": "Be concise.",
         });
         let mut overrides: AionrsBuildExtra = serde_json::from_value(json).unwrap();
 
-        if let Some(rules) = overrides.preset_rules.take() {
-            overrides.system_prompt = Some(match overrides.system_prompt.take() {
-                Some(existing) => format!("{existing}\n\n{rules}"),
-                None => rules,
-            });
-        }
+        apply_default_prompt_rules(&mut overrides);
 
-        assert_eq!(overrides.system_prompt.as_deref(), Some("Be concise."));
+        assert_eq!(
+            overrides.system_prompt.as_deref(),
+            Some(format!(
+                "Be concise.\n\n{}",
+                crate::default_prompt::MARKDOWN_LINK_TARGET_RULE
+            ))
+            .as_deref()
+        );
     }
 }
