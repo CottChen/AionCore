@@ -211,6 +211,26 @@ async fn symlink_reports_kind_and_target() {
     let fact = provider.stat(&uri(&link)).await.unwrap().expect("some");
     assert_eq!(fact.kind, Kind::Symlink);
     assert!(fact.symlink_target.is_some());
+    assert_eq!(fact.symlink_target_is_dir, Some(false));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn directory_symlink_reports_expandable_target_hint() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target-dir");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.path().join("link-dir");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let provider = LocalFsProvider::new();
+    let fact = provider.stat(&uri(&link)).await.unwrap().expect("some");
+    assert_eq!(fact.kind, Kind::Symlink);
+    assert_eq!(fact.symlink_target_is_dir, Some(true));
+
+    std::fs::write(target.join("inside.txt"), b"x").unwrap();
+    let entries = provider.read_dir(&uri(&link)).await.unwrap();
+    assert_eq!(entries[0].0, "inside.txt");
 }
 
 #[cfg(unix)]

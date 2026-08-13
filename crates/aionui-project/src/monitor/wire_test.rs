@@ -10,6 +10,7 @@ fn fact(kind: Kind) -> EntryFact {
         kind,
         inode: 7,
         symlink_target: None,
+        symlink_target_is_dir: None,
         // Non-`None` on purpose: the wire-projection tests below assert the
         // serialized entry carries no mtime, which only proves anything if the
         // fact going in had one.
@@ -92,11 +93,13 @@ fn wire_entry_symlink_includes_target() {
         kind: Kind::Symlink,
         inode: 1,
         symlink_target: Some("target".to_owned()),
+        symlink_target_is_dir: Some(true),
         mtime_ms: Some(1_700_000_000_000),
     };
     let v = serde_json::to_value(WireEntry::from_fact("link", &ef)).unwrap();
     assert_eq!(v["kind"], "symlink");
     assert_eq!(v["symlink_target"], "target");
+    assert_eq!(v["symlink_target_is_dir"], true);
 }
 
 // ── snapshot / delta params ───────────────────────────────────────────────
@@ -133,6 +136,7 @@ fn delta_params_tags_each_change_op() {
             Change::Added {
                 name: "new.ts".to_owned(),
                 kind: Kind::File,
+                symlink_target_is_dir: None,
             },
             Change::Removed {
                 name: "old.ts".to_owned(),
@@ -156,6 +160,28 @@ fn delta_params_tags_each_change_op() {
     // subscriber replaying it as a write precondition would make its own save pass
     // conflict detection against the edit this op exists to warn about.
     assert_eq!(v["changes"][3], json!({"op":"modified","name":"edited.ts"}));
+}
+
+#[test]
+fn delta_added_symlink_includes_directory_target_hint() {
+    let delta = DeltaBatch {
+        canonical: "file:///x".to_owned(),
+        changes: vec![Change::Added {
+            name: "linked-dir".to_owned(),
+            kind: Kind::Symlink,
+            symlink_target_is_dir: Some(true),
+        }],
+    };
+    let v = delta_params(&delta, &target());
+    assert_eq!(
+        v["changes"][0],
+        json!({
+            "op": "added",
+            "name": "linked-dir",
+            "kind": "symlink",
+            "symlink_target_is_dir": true
+        })
+    );
 }
 
 // ── frame builders ────────────────────────────────────────────────────────

@@ -128,7 +128,8 @@ async fn apply_fans_delta_to_current_subscribers() {
                 delta.changes,
                 vec![Change::Added {
                     name: "new.txt".to_owned(),
-                    kind: crate::runtime::provider::Kind::File
+                    kind: crate::runtime::provider::Kind::File,
+                    symlink_target_is_dir: None,
                 }]
             );
         }

@@ -22,8 +22,8 @@ pub enum Kind {
 
 /// Backend-internal fact about a single entry. Carries `inode` for same-inode
 /// rename synthesis and `mtime_ms` for content-modify detection in the tree
-/// model; the outward wire `Entry` (protocol.md) exposes only name + kind +
-/// symlink_target + excluded — neither field leaves the backend.
+/// model; the outward wire `Entry` (protocol.md) exposes only display facts and
+/// never exposes inode or mtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryFact {
     pub kind: Kind,
@@ -32,6 +32,9 @@ pub struct EntryFact {
     pub inode: u64,
     /// Link target when `kind == Symlink`.
     pub symlink_target: Option<String>,
+    /// Whether a symlink currently resolves to a directory. `None` for
+    /// non-symlinks and broken/unreadable symlinks.
+    pub symlink_target_is_dir: Option<bool>,
     /// Last-modified time in milliseconds since the Unix epoch, used only to
     /// detect that an entry's *content* changed (`Change::Modified`).
     ///

@@ -124,27 +124,29 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Build an [`EntryFact`] from a path via `symlink_metadata` (does not follow
-/// symlinks — a symlink is its own kind, matching the folder-identity rule that
-/// realpath folding is deferred to the access-time containment boundary).
+/// Build an [`EntryFact`] from a path via `symlink_metadata`. A symlink remains
+/// its own kind, while a separate target hint lets clients render directory
+/// links as expandable without folding their identity into the real path.
 async fn fact_of(uri: &str, path: &Path) -> Result<EntryFact, FsError> {
     let meta = tokio::fs::symlink_metadata(path).await.map_err(|e| map_io(uri, &e))?;
     let ft = meta.file_type();
-    let (kind, symlink_target) = if ft.is_symlink() {
+    let (kind, symlink_target, symlink_target_is_dir) = if ft.is_symlink() {
         let target = tokio::fs::read_link(path)
             .await
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
-        (Kind::Symlink, target)
+        let target_is_dir = tokio::fs::metadata(path).await.ok().map(|m| m.is_dir());
+        (Kind::Symlink, target, target_is_dir)
     } else if ft.is_dir() {
-        (Kind::Dir, None)
+        (Kind::Dir, None, None)
     } else {
-        (Kind::File, None)
+        (Kind::File, None, None)
     };
     Ok(EntryFact {
         kind,
         inode: inode_of(&meta),
         symlink_target,
+        symlink_target_is_dir,
         // Read off the metadata already fetched above — no extra syscall.
         mtime_ms: mtime_ms_of(&meta),
     })

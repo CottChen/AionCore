@@ -31,14 +31,17 @@ pub struct Snapshot {
     pub entries: Vec<(String, EntryFact)>,
 }
 
-/// One reconciled change to a directory level. The tree tracks name+kind for
-/// listing purposes (a kind change surfaces as removed + added) plus an mtime
-/// used solely to detect that a file's content changed.
+/// One reconciled change to a directory level. The tree tracks display facts
+/// for listing purposes (a kind change surfaces as removed + added) plus an
+/// mtime used solely to detect that a file's content changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     Added {
         name: String,
         kind: Kind,
+        /// Present for symlinks so clients can distinguish linked directories
+        /// from linked files without resolving paths themselves.
+        symlink_target_is_dir: Option<bool>,
     },
     Removed {
         name: String,
@@ -191,7 +194,11 @@ fn diff(old: &BTreeMap<String, EntryFact>, fresh: &BTreeMap<String, EntryFact>) 
 
     for (i, (name, af)) in added.into_iter().enumerate() {
         if !used_added[i] {
-            changes.push(Change::Added { name, kind: af.kind });
+            changes.push(Change::Added {
+                name,
+                kind: af.kind,
+                symlink_target_is_dir: af.symlink_target_is_dir,
+            });
         }
     }
     for (name, _) in removed {

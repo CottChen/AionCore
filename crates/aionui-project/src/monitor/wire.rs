@@ -167,7 +167,7 @@ impl From<Kind> for WireKind {
     }
 }
 
-/// One directory entry as the client sees it: name + kind (+ symlink target).
+/// One directory entry as the client sees it: name + kind (+ symlink facts).
 /// `excluded` (excludes-set membership, e.g. `node_modules`) is not wired in
 /// stage 1 — the excludes source is not yet plumbed; omitted from output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -176,6 +176,8 @@ pub struct WireEntry {
     pub kind: WireKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlink_target_is_dir: Option<bool>,
 }
 
 impl WireEntry {
@@ -185,6 +187,7 @@ impl WireEntry {
             name: name.to_owned(),
             kind: fact.kind.into(),
             symlink_target: fact.symlink_target.clone(),
+            symlink_target_is_dir: fact.symlink_target_is_dir,
         }
     }
 }
@@ -251,11 +254,21 @@ pub fn delta_params(delta: &DeltaBatch, target: &ResourceRef) -> Value {
 /// modified).
 fn change_to_wire(change: &Change) -> Value {
     match change {
-        Change::Added { name, kind } => json!({
-            "op": "added",
-            "name": name,
-            "kind": WireKind::from(*kind),
-        }),
+        Change::Added {
+            name,
+            kind,
+            symlink_target_is_dir,
+        } => {
+            let mut value = json!({
+                "op": "added",
+                "name": name,
+                "kind": WireKind::from(*kind),
+            });
+            if let Some(is_dir) = symlink_target_is_dir {
+                value["symlink_target_is_dir"] = json!(is_dir);
+            }
+            value
+        }
         Change::Removed { name } => json!({
             "op": "removed",
             "name": name,

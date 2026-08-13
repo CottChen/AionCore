@@ -159,6 +159,46 @@ async fn subscribe_root_returns_baseline_snapshot() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn subscribe_directory_symlink_returns_expandable_snapshot() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    let target = dir.path().join("target-dir");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("inside.txt"), b"x").unwrap();
+    std::os::unix::fs::symlink(&target, dir.path().join("linked-dir")).unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
+        )
+        .await;
+    let root_reply = push.last_for("1").unwrap();
+    let linked = root_reply["result"]["snapshots"][0]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "linked-dir")
+        .unwrap();
+    assert_eq!(linked["kind"], "symlink");
+    assert_eq!(linked["symlink_target_is_dir"], true);
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(2, "fs/subscribe", json!({"targets":[dir_ref(&pe, "linked-dir")]})),
+        )
+        .await;
+    let linked_reply = push.last_for("1").unwrap();
+    assert_eq!(
+        linked_reply["result"]["snapshots"][0]["entries"][0]["name"],
+        "inside.txt"
+    );
+}
+
 #[tokio::test]
 async fn subscribe_multiple_targets_returns_snapshot_per_target() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;
@@ -384,6 +424,7 @@ async fn fan_out_snapshot_is_scoped_and_pe_keyed_per_subscriber() {
                 kind: Kind::File,
                 inode: 1,
                 symlink_target: None,
+                symlink_target_is_dir: None,
                 mtime_ms: Some(1_700_000_000_000),
             },
         )],

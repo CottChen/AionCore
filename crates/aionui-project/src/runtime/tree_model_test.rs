@@ -60,7 +60,8 @@ async fn apply_all_detects_added_and_removed() {
         vec![
             Change::Added {
                 name: "new.txt".to_owned(),
-                kind: Kind::File
+                kind: Kind::File,
+                symlink_target_is_dir: None,
             },
             Change::Removed {
                 name: "gone.txt".to_owned()
@@ -88,7 +89,8 @@ async fn apply_child_names_stats_only_named_children() {
         delta.changes,
         vec![Change::Added {
             name: "added.txt".to_owned(),
-            kind: Kind::File
+            kind: Kind::File,
+            symlink_target_is_dir: None,
         }]
     );
 }
@@ -258,7 +260,8 @@ async fn apply_kind_change_is_remove_plus_add() {
         vec![
             Change::Added {
                 name: "x".to_owned(),
-                kind: Kind::Dir
+                kind: Kind::Dir,
+                symlink_target_is_dir: None,
             },
             Change::Removed { name: "x".to_owned() },
         ]
@@ -289,6 +292,7 @@ fn file_fact_at(inode: u64, mtime_ms: Option<i64>) -> EntryFact {
         kind: Kind::File,
         inode,
         symlink_target: None,
+        symlink_target_is_dir: None,
         mtime_ms,
     }
 }
@@ -302,6 +306,7 @@ fn dir_fact_at(inode: u64, mtime_ms: Option<i64>) -> EntryFact {
         kind: Kind::Dir,
         inode,
         symlink_target: None,
+        symlink_target_is_dir: None,
         mtime_ms,
     }
 }
@@ -311,6 +316,7 @@ fn symlink_fact_at(inode: u64, mtime_ms: Option<i64>) -> EntryFact {
         kind: Kind::Symlink,
         inode,
         symlink_target: Some("target".to_owned()),
+        symlink_target_is_dir: Some(false),
         mtime_ms,
     }
 }
@@ -332,7 +338,8 @@ fn diff_same_inode_kind_change_is_remove_add_not_rename() {
         vec![
             Change::Added {
                 name: "x".to_owned(),
-                kind: Kind::Dir
+                kind: Kind::Dir,
+                symlink_target_is_dir: None,
             },
             Change::Removed { name: "x".to_owned() },
         ]
@@ -354,7 +361,8 @@ fn diff_inode_zero_rename_degrades_to_remove_add() {
         vec![
             Change::Added {
                 name: "b".to_owned(),
-                kind: Kind::File
+                kind: Kind::File,
+                symlink_target_is_dir: None,
             },
             Change::Removed { name: "a".to_owned() },
         ]
@@ -463,7 +471,8 @@ fn diff_kind_change_with_moved_mtime_is_remove_add_not_modified() {
         vec![
             Change::Added {
                 name: "x".to_owned(),
-                kind: Kind::Dir
+                kind: Kind::Dir,
+                symlink_target_is_dir: None,
             },
             Change::Removed { name: "x".to_owned() },
         ]
@@ -508,7 +517,8 @@ fn diff_reports_modified_alongside_other_changes() {
         vec![
             Change::Added {
                 name: "new.txt".to_owned(),
-                kind: Kind::File
+                kind: Kind::File,
+                symlink_target_is_dir: None,
             },
             Change::Modified {
                 name: "kept.txt".to_owned()
