@@ -11,6 +11,10 @@ pub struct OfficeRouterState {
     pub conversion_service: Arc<ConversionService>,
     pub proxy_service: Arc<ProxyService>,
     pub allowed_roots: Vec<PathBuf>,
+    /// Managed roots accepted for `ChatFileRef::Upload`. This stays narrower
+    /// than `allowed_roots`; caller-owned project roots are checked separately,
+    /// so upload refs still cannot name arbitrary local files.
+    pub upload_roots: Vec<PathBuf>,
     /// Resolves a `ChatFileRef` preview target to an absolute path server-side
     /// (`start_preview`), so pe→path resolution stays on the backend.
     pub project: Arc<aionui_project::ProjectService>,

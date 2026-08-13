@@ -163,6 +163,13 @@ fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::P
     roots
 }
 
+fn default_upload_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    match work_dir {
+        Some(wd) => aionui_project::managed_upload_roots(&wd.join("conversations")),
+        None => vec![aionui_project::legacy_upload_root()],
+    }
+}
+
 fn build_module_state_phase<T>(boot: &Instant, phase: &'static str, build: impl FnOnce() -> T) -> T {
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -479,6 +486,7 @@ pub fn build_connection_test_state() -> ConnectionTestRouterState {
 pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, RouterBuildError> {
     let broadcaster = services.event_bus.clone();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
+    let upload_roots = default_upload_roots(Some(services.work_dir.as_path()));
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
     let snapshot_service = Arc::new(SnapshotService::new());
     let preference_repo = Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone()));
@@ -508,6 +516,7 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         system_opener,
         clipboard,
         allowed_roots,
+        upload_roots,
     })
 }
 
@@ -875,6 +884,7 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
 pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
     let data_dir = services.data_dir.as_path();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));
+    let upload_roots = default_upload_roots(Some(services.work_dir.as_path()));
 
     let spawner: Arc<dyn aionui_office::ProcessSpawner> =
         Arc::new(aionui_office::DefaultProcessSpawner::new(data_dir.to_path_buf()));
@@ -888,6 +898,7 @@ pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
         conversion_service,
         proxy_service,
         allowed_roots,
+        upload_roots,
         project: Arc::new(services.project_service.clone()),
     }
 }

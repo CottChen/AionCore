@@ -101,6 +101,7 @@ fn build_test_office_state(
         watch_manager: wm,
         conversion_service: conversion,
         proxy_service: proxy,
+        upload_roots: vec![aionui_project::legacy_upload_root()],
         allowed_roots,
         project,
     }

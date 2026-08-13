@@ -956,6 +956,82 @@ async fn upload_with_preference_uses_temporary_conversation_workspace() {
 }
 
 #[tokio::test]
+async fn content_read_accepts_upload_saved_in_temporary_conversation_workspace() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(data_dir.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    set_save_upload_to_workspace(&mut app, &token, &csrf, true).await;
+    let (conversation_id, _workspace) = create_upload_conversation(&mut app, &token, &csrf, None).await;
+
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "preview.txt", "text/plain", b"preview body")
+        .add_text("conversation_id", &conversation_id)
+        .build();
+    let resp = app
+        .clone()
+        .oneshot(upload_request(&content_type, body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let uploaded = json["data"].as_str().unwrap();
+
+    let req = json_with_token(
+        "POST",
+        "/api/fs/content",
+        json!({
+            "file": { "kind": "upload", "path": uploaded },
+            "encoding": "utf8"
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"], "preview body");
+}
+
+#[tokio::test]
+async fn content_read_accepts_upload_saved_in_project_workspace() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    let (mut app, services) = build_app_with_data_dir(data_dir.path()).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    set_save_upload_to_workspace(&mut app, &token, &csrf, true).await;
+    let (conversation_id, _workspace) =
+        create_upload_conversation(&mut app, &token, &csrf, Some(project_dir.path())).await;
+
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", "project-preview.txt", "text/plain", b"project preview")
+        .add_text("conversation_id", &conversation_id)
+        .build();
+    let resp = app
+        .clone()
+        .oneshot(upload_request(&content_type, body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let uploaded = json["data"].as_str().unwrap();
+
+    let req = json_with_token(
+        "POST",
+        "/api/fs/content",
+        json!({
+            "file": { "kind": "upload", "path": uploaded },
+            "encoding": "utf8"
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"], "project preview");
+}
+
+#[tokio::test]
 async fn explicit_workspace_upload_uses_selected_directory_when_preference_is_disabled() {
     let data_dir = tempfile::tempdir().unwrap();
     let project_dir = tempfile::tempdir().unwrap();

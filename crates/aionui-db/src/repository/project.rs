@@ -44,6 +44,11 @@ pub trait IProjectStore: Send + Sync {
         project_id: &str,
     ) -> Result<Vec<(ProjectExplorerRow, FolderRow)>, DbError>;
 
+    /// Every explorer entry currently visible to `user_id`, joined with its
+    /// folder. Used by path-origin checks that do not carry a project id.
+    async fn list_entry_folders_for_user(&self, user_id: &str)
+    -> Result<Vec<(ProjectExplorerRow, FolderRow)>, DbError>;
+
     /// Atomic unit: create a project and its single `workspace` entry in one
     /// transaction, both owned by `user_id`. On a
     /// `UNIQUE(owner_user_id, folder_id) WHERE role = 'workspace'` violation

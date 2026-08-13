@@ -5,7 +5,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, Query, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tower::ServiceExt;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -97,6 +97,11 @@ pub struct FileRouterState {
     /// service; the path is written server-side and never returned to the client.
     pub clipboard: ClipboardWriterRef,
     pub allowed_roots: Vec<std::path::PathBuf>,
+    /// Managed roots accepted for `ChatFileRef::Upload`. This is narrower than
+    /// `allowed_roots`: uploads may come from the legacy temp upload dir,
+    /// managed conversation workspaces, or caller-owned project roots, but not
+    /// arbitrary home-directory files.
+    pub upload_roots: Vec<std::path::PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -418,12 +423,7 @@ async fn open_system_file(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
-            &user.id,
-            &req.file,
-            &content_upload_root(),
-            aionui_project::FileOp::Read,
-        )
+        .resolve_chat_file_ref_with_upload_roots(&user.id, &req.file, &state.upload_roots, aionui_project::FileOp::Read)
         .await
         .map_err(chat_file_resolve_error)?;
     state.system_opener.open(&abs).await?;
@@ -433,12 +433,6 @@ async fn open_system_file(
 // ---------------------------------------------------------------------------
 // Content endpoint (ChatFileRef identity) — handlers
 // ---------------------------------------------------------------------------
-
-/// Managed upload directory (`<tmp>/aionui`) used to validate `Upload`
-/// ChatFileRef variants — mirrors the chat send-boundary convention.
-fn content_upload_root() -> PathBuf {
-    std::env::temp_dir().join("aionui")
-}
 
 /// Parse the optional `If-Match` header as a last-modified-millisecond stamp.
 fn parse_if_match(headers: &axum::http::HeaderMap) -> Option<i64> {
@@ -463,12 +457,7 @@ async fn read_content(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
-            &user.id,
-            &req.file,
-            &content_upload_root(),
-            aionui_project::FileOp::Read,
-        )
+        .resolve_chat_file_ref_with_upload_roots(&user.id, &req.file, &state.upload_roots, aionui_project::FileOp::Read)
         .await
         .map_err(chat_file_resolve_error)?;
     let content = state
@@ -492,10 +481,10 @@ async fn write_content(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
+        .resolve_chat_file_ref_with_upload_roots(
             &user.id,
             &req.file,
-            &content_upload_root(),
+            &state.upload_roots,
             aionui_project::FileOp::Write,
         )
         .await
@@ -527,12 +516,7 @@ async fn content_metadata(
     let Json(req) = body.map_err(ApiError::from)?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
-            &user.id,
-            &req.file,
-            &content_upload_root(),
-            aionui_project::FileOp::Read,
-        )
+        .resolve_chat_file_ref_with_upload_roots(&user.id, &req.file, &state.upload_roots, aionui_project::FileOp::Read)
         .await
         .map_err(chat_file_resolve_error)?;
     let meta = state.file_service.resolved_metadata(Path::new(&abs)).await?;
@@ -559,12 +543,7 @@ async fn stream_file(
         .map_err(|m| ApiError::BadRequest(m.to_owned()))?;
     let abs = state
         .project
-        .resolve_chat_file_ref(
-            &user.id,
-            &file_ref,
-            &content_upload_root(),
-            aionui_project::FileOp::Read,
-        )
+        .resolve_chat_file_ref_with_upload_roots(&user.id, &file_ref, &state.upload_roots, aionui_project::FileOp::Read)
         .await
         .map_err(chat_file_resolve_error)?;
     // ServeFile owns Range/If-Range/Content-Type; the path is already
@@ -1272,7 +1251,7 @@ mod tests {
             .map(|(before, _)| before)
             .expect("routes.rs has a #[cfg(test)] module");
 
-        let resolve_calls = handlers.matches(".resolve_chat_file_ref(").count();
+        let resolve_calls = handlers.matches(".resolve_chat_file_ref_with_upload_roots(").count();
         let sealed = handlers.matches(".map_err(chat_file_resolve_error)?").count();
 
         assert_eq!(

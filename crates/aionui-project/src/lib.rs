@@ -18,7 +18,7 @@ pub mod scm;
 mod service;
 pub mod types;
 
-pub use chat_files::ResolvedChatMessage;
+pub use chat_files::{ResolvedChatMessage, legacy_upload_root, managed_upload_roots, workspace_upload_root};
 pub use routes::{ProjectRouterState, project_routes};
 pub use service::ProjectService;
 pub use types::{

@@ -209,6 +209,71 @@ async fn upload_under_root_is_accepted() {
 }
 
 #[tokio::test]
+async fn upload_under_any_managed_root_is_accepted() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace_upload_root = workspace.path().join("uploads");
+    std::fs::create_dir(&workspace_upload_root).unwrap();
+    let up = workspace_upload_root.join("from-workspace.png");
+    std::fs::write(&up, b"x").unwrap();
+    let path = up.to_string_lossy().into_owned();
+
+    let roots = vec![upload_root.path().to_path_buf(), workspace_upload_root.to_path_buf()];
+    let out = service
+        .resolve_chat_message_with_upload_roots(
+            "system_default_user",
+            "",
+            &[ChatFileRef::Upload { path: path.clone() }],
+            &roots,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.files, vec![path]);
+}
+
+#[tokio::test]
+async fn upload_inside_owned_project_is_accepted_without_static_root() {
+    let (service, _pe, dir, upload_root) = setup().await;
+    let project_uploads = dir.path().join("uploads");
+    std::fs::create_dir(&project_uploads).unwrap();
+    let file = project_uploads.join("from-project.txt");
+    std::fs::write(&file, b"project").unwrap();
+    let path = file.to_string_lossy().into_owned();
+
+    let out = service
+        .resolve_chat_message(
+            "system_default_user",
+            "",
+            &[ChatFileRef::Upload { path: path.clone() }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(out.files, vec![path]);
+}
+
+#[tokio::test]
+async fn upload_inside_another_users_project_is_rejected() {
+    let (service, _pe, dir, upload_root) = setup().await;
+    let file = dir.path().join("private.txt");
+    std::fs::write(&file, b"private").unwrap();
+    let path = file.to_string_lossy().into_owned();
+
+    let err = service
+        .resolve_chat_message(
+            "different_user",
+            "",
+            &[ChatFileRef::Upload { path: path.clone() }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ProjectError::UploadPathOutsideRoot { .. }), "got {err:?}");
+}
+
+#[tokio::test]
 async fn local_readable_file_resolves_and_inlines_marker() {
     let (service, _pe, _dir, upload_root) = setup().await;
     // A file anywhere on disk (outside the managed upload root) — `local` has no

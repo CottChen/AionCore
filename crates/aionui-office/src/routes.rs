@@ -165,14 +165,11 @@ async fn start_preview(
     // containment-checked per variant); fall back to the legacy device path +
     // office sandbox validation for callers that have not migrated yet.
     let validated_path = match &req.file {
-        Some(file) => {
-            let upload_root = std::env::temp_dir().join("aionui");
-            state
-                .project
-                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
-                .await
-                .map_err(ApiError::from)?
-        }
+        Some(file) => state
+            .project
+            .resolve_chat_file_ref_with_upload_roots(user_id, file, &state.upload_roots, aionui_project::FileOp::Read)
+            .await
+            .map_err(preview_resolve_error)?,
         None => validate_office_path(&state, &req.file_path, req.workspace.as_deref())?
             .to_string_lossy()
             .into_owned(),
@@ -232,14 +229,11 @@ async fn refresh_preview(
     // the watch was registered under. Prefer the ChatFileRef; fall back to the
     // legacy device path.
     let target_path = match &req.file {
-        Some(file) => {
-            let upload_root = std::env::temp_dir().join("aionui");
-            state
-                .project
-                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
-                .await
-                .map_err(refresh_resolve_error)?
-        }
+        Some(file) => state
+            .project
+            .resolve_chat_file_ref_with_upload_roots(user_id, file, &state.upload_roots, aionui_project::FileOp::Read)
+            .await
+            .map_err(refresh_resolve_error)?,
         None => validate_office_path(&state, &req.file_path, req.workspace.as_deref())?
             .to_string_lossy()
             .into_owned(),
@@ -299,6 +293,17 @@ fn refresh_resolve_error(err: aionui_project::ProjectError) -> ApiError {
     )
 }
 
+fn preview_resolve_error(err: aionui_project::ProjectError) -> ApiError {
+    let code = err.code();
+    tracing::warn!(target: "office_preview", error = %err, code, "could not resolve preview target");
+    ApiError::coded(
+        StatusCode::NOT_FOUND,
+        "FILE_NOT_FOUND",
+        "The requested file no longer exists.",
+        None::<serde_json::Value>,
+    )
+}
+
 async fn stop_preview(
     state: OfficeRouterState,
     user_id: &str,
@@ -312,14 +317,11 @@ async fn stop_preview(
     // explorer office tab has only a ChatFileRef (no device path), so without
     // this branch stop can't match the watch and the officecli subprocess leaks.
     let target_path = match &req.file {
-        Some(file) => {
-            let upload_root = std::env::temp_dir().join("aionui");
-            state
-                .project
-                .resolve_chat_file_ref(user_id, file, &upload_root, aionui_project::FileOp::Read)
-                .await
-                .map_err(ApiError::from)?
-        }
+        Some(file) => state
+            .project
+            .resolve_chat_file_ref_with_upload_roots(user_id, file, &state.upload_roots, aionui_project::FileOp::Read)
+            .await
+            .map_err(preview_resolve_error)?,
         None => req.file_path.clone(),
     };
     state.watch_manager.stop_for_user(user_id, &target_path, doc_type).await;
@@ -627,6 +629,7 @@ mod tests {
             conversion_service: conversion,
             proxy_service: proxy,
             allowed_roots: vec![std::env::temp_dir()],
+            upload_roots: vec![aionui_project::legacy_upload_root()],
             project,
         }
     }

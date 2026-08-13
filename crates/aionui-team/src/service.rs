@@ -2046,9 +2046,11 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
+        let team = self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
+        let (content, files) = self
+            .resolve_message_attachments(user_id, content, files, Some(team.workspace.as_str()))
+            .await?;
         let session = {
             let entry = self
                 .sessions
@@ -2067,9 +2069,11 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
-        self.load_owned_team(user_id, team_id).await?;
+        let team = self.load_owned_team(user_id, team_id).await?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
-        let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
+        let (content, files) = self
+            .resolve_message_attachments(user_id, content, files, Some(team.workspace.as_str()))
+            .await?;
         let session = {
             let entry = self
                 .sessions
@@ -2088,6 +2092,7 @@ impl TeamSessionService {
         user_id: &str,
         content: &str,
         files: Option<Vec<ChatFileRef>>,
+        workspace: Option<&str>,
     ) -> Result<(String, Option<Vec<String>>), TeamError> {
         let files = match files {
             Some(files) if !files.is_empty() => files,
@@ -2101,9 +2106,9 @@ impl TeamSessionService {
             .ok_or_else(|| {
                 TeamError::InvalidRequest("project service unavailable; cannot resolve file attachments".into())
             })?;
-        let upload_root = std::env::temp_dir().join("aionui");
+        let upload_roots = team_upload_roots(workspace);
         let resolved = project
-            .resolve_chat_message(user_id, content, &files, &upload_root)
+            .resolve_chat_message_with_upload_roots(user_id, content, &files, &upload_roots)
             .await
             .map_err(|err| TeamError::InvalidRequest(err.to_string()))?;
         Ok((resolved.content, Some(resolved.files)))
@@ -2321,6 +2326,17 @@ fn is_idle_collectable_team_member(task: &AgentInstance, now: TimestampMs, idle_
         return false;
     }
     now.saturating_sub(task.last_activity_at()) > idle_threshold_ms
+}
+
+fn team_upload_roots(workspace: Option<&str>) -> Vec<PathBuf> {
+    let mut roots = vec![aionui_project::legacy_upload_root()];
+    if let Some(workspace) = workspace.filter(|value| !value.trim().is_empty()) {
+        let workspace_root = aionui_project::workspace_upload_root(Path::new(workspace));
+        if !roots.iter().any(|root| root == &workspace_root) {
+            roots.push(workspace_root);
+        }
+    }
+    roots
 }
 
 #[cfg(test)]

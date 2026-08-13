@@ -8,7 +8,7 @@
 //! UI — is unchanged: only the *origin* of the paths moves from the client to
 //! this backend edge.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aionui_api_types::ChatFileRef;
 use aionui_common::constants::AIONUI_FILES_MARKER;
@@ -35,8 +35,8 @@ impl ProjectService {
     /// content. Atomic: any bad reference (unknown pe, escape, missing file,
     /// out-of-root upload, unreadable local path) fails the whole message.
     ///
-    /// `upload_root` is the managed upload directory (`temp_dir()/aionui`);
-    /// `Upload` paths must live under it.
+    /// `upload_root` is the legacy managed upload directory (`temp_dir()/aionui`).
+    /// `Upload` paths must live under it or one of the caller's project roots.
     pub async fn resolve_chat_message(
         &self,
         user_id: &str,
@@ -44,10 +44,25 @@ impl ProjectService {
         files: &[ChatFileRef],
         upload_root: &Path,
     ) -> Result<ResolvedChatMessage, ProjectError> {
+        self.resolve_chat_message_with_upload_roots(user_id, content, files, &[upload_root.to_path_buf()])
+            .await
+    }
+
+    /// Resolve a message's files using every managed upload root supplied by
+    /// the caller. Use this when a request can legitimately address uploads
+    /// from more than the legacy temp directory, for example conversation
+    /// workspace uploads.
+    pub async fn resolve_chat_message_with_upload_roots(
+        &self,
+        user_id: &str,
+        content: &str,
+        files: &[ChatFileRef],
+        upload_roots: &[PathBuf],
+    ) -> Result<ResolvedChatMessage, ProjectError> {
         let mut paths = Vec::with_capacity(files.len());
         for file in files {
             paths.push(
-                self.resolve_chat_file_ref(user_id, file, upload_root, FileOp::Read)
+                self.resolve_chat_file_ref_with_upload_roots(user_id, file, upload_roots, FileOp::Read)
                     .await?,
             );
         }
@@ -68,7 +83,8 @@ impl ProjectService {
     /// - `Project` → [`resolve_reference`](Self::resolve_reference) with the caller's `op` (lexical +
     ///   realpath containment; read paths pass `Read`, the write endpoint passes `Write`); must exist
     ///   (file or folder).
-    /// - `Upload` → an existing regular file under the managed `upload_root` (D2 invariant).
+    /// - `Upload` → an existing regular file under a managed upload root or one
+    ///   of the caller's project roots (D2 invariant).
     /// - `Local` → a canonicalized existing regular file; **no sandbox** (the host picker that
     ///   produced it already exposes the whole filesystem).
     ///
@@ -79,6 +95,19 @@ impl ProjectService {
         user_id: &str,
         file: &ChatFileRef,
         upload_root: &Path,
+        op: FileOp,
+    ) -> Result<String, ProjectError> {
+        self.resolve_chat_file_ref_with_upload_roots(user_id, file, &[upload_root.to_path_buf()], op)
+            .await
+    }
+
+    /// Resolve a single [`ChatFileRef`] using every managed upload root supplied
+    /// by the caller, plus the caller's current project roots.
+    pub async fn resolve_chat_file_ref_with_upload_roots(
+        &self,
+        user_id: &str,
+        file: &ChatFileRef,
+        upload_roots: &[PathBuf],
         op: FileOp,
     ) -> Result<String, ProjectError> {
         match file {
@@ -108,7 +137,8 @@ impl ProjectService {
                 if !candidate.is_file() {
                     return Err(ProjectError::ChatFileMissing { path: path.clone() });
                 }
-                if !path_within(upload_root, candidate) {
+                let in_managed_root = upload_roots.iter().any(|root| path_within(root, candidate));
+                if !in_managed_root && !self.path_belongs_to_user_project(user_id, candidate).await? {
                     return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
                 }
                 Ok(path.clone())
@@ -247,6 +277,44 @@ impl ProjectService {
 
         Ok(None)
     }
+
+    /// Upload requests return an absolute path but do not carry a `pe_id`.
+    /// Accept that path when it is inside one of the caller's current explorer
+    /// roots, which covers project-workspace uploads without widening the upload
+    /// channel to arbitrary files under home or the general file sandbox.
+    async fn path_belongs_to_user_project(&self, user_id: &str, target: &Path) -> Result<bool, ProjectError> {
+        for folder in self.list_folder_roots_for_user(user_id).await? {
+            let Ok(root) = canonical::uri_to_path(&folder.resource_uri) else {
+                continue;
+            };
+            if path_within(&root, target) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Legacy upload root used before workspace-aware uploads were added.
+pub fn legacy_upload_root() -> PathBuf {
+    std::env::temp_dir().join("aionui")
+}
+
+/// Uploads saved inside a conversation/team workspace live under this child
+/// directory. Keeping it centralized prevents send, preview, and office routes
+/// from drifting apart.
+pub fn workspace_upload_root(workspace: &Path) -> PathBuf {
+    workspace.join("uploads")
+}
+
+/// Upload roots that do not require a specific conversation context.
+///
+/// This is intentionally narrower than the general file sandbox. It includes
+/// the legacy temp upload root and the managed conversation workspace parent
+/// (`work_dir/conversations`) so content/office preview endpoints can resolve
+/// workspace uploads even though their requests only carry `ChatFileRef`.
+pub fn managed_upload_roots(conversation_workspaces_root: &Path) -> Vec<PathBuf> {
+    vec![legacy_upload_root(), conversation_workspaces_root.to_path_buf()]
 }
 
 /// Whether `target` resolves inside `root` (both canonicalized, so `..` and

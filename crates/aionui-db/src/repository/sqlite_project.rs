@@ -143,6 +143,49 @@ impl IProjectStore for SqliteProjectStore {
         Ok(out)
     }
 
+    async fn list_entry_folders_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<(ProjectExplorerRow, FolderRow)>, DbError> {
+        let rows = sqlx::query(
+            "SELECT pe.pe_id, pe.project_id, pe.folder_id, pe.role, pe.display_name, pe.order_index, \
+                    pe.created_at, pe.updated_at, \
+                    f.resource_uri AS f_resource_uri, f.resource_canonical AS f_resource_canonical, \
+                    f.created_at AS f_created_at, f.updated_at AS f_updated_at \
+             FROM project_explorer pe \
+             JOIN folders f ON f.folder_id = pe.folder_id \
+             WHERE pe.owner_user_id = ? \
+             ORDER BY pe.project_id ASC, pe.order_index ASC, pe.created_at ASC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let folder_id: String = r.get("folder_id");
+            let entry = ProjectExplorerRow {
+                pe_id: r.get("pe_id"),
+                project_id: r.get("project_id"),
+                folder_id: folder_id.clone(),
+                role: r.get("role"),
+                display_name: r.get("display_name"),
+                order_index: r.get("order_index"),
+                created_at: r.get("created_at"),
+                updated_at: r.get("updated_at"),
+            };
+            let folder = FolderRow {
+                folder_id,
+                resource_uri: r.get("f_resource_uri"),
+                resource_canonical: r.get("f_resource_canonical"),
+                created_at: r.get("f_created_at"),
+                updated_at: r.get("f_updated_at"),
+            };
+            out.push((entry, folder));
+        }
+        Ok(out)
+    }
+
     async fn create_project_with_workspace_entry(
         &self,
         user_id: &str,

@@ -530,6 +530,7 @@ impl ConversationService {
         user_id: &str,
         content: &str,
         files: &[ChatFileRef],
+        conversation_extra: &str,
     ) -> Result<ResolvedChatMessage, ConversationError> {
         if files.is_empty() {
             return Ok(ResolvedChatMessage {
@@ -545,9 +546,9 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::BadRequest {
                 reason: "project service unavailable; cannot resolve file attachments".to_owned(),
             })?;
-        let upload_root = std::env::temp_dir().join("aionui");
+        let upload_roots = conversation_upload_roots(conversation_extra, &self.workspace_root);
         project
-            .resolve_chat_message(user_id, content, files, &upload_root)
+            .resolve_chat_message_with_upload_roots(user_id, content, files, &upload_roots)
             .await
             .map_err(|err| ConversationError::BadRequest {
                 reason: err.to_string(),
@@ -3681,7 +3682,7 @@ impl ConversationService {
         // (atomic: a bad reference fails the whole send). Produces the inlined
         // `[[AION_FILES]]` content used for persistence, broadcast, and the turn.
         let resolved = self
-            .resolve_message_attachments(user_id, &req.content, &req.files)
+            .resolve_message_attachments(user_id, &req.content, &req.files, &row.extra)
             .await?;
 
         let turn_id = Self::mint_turn_id();
@@ -4709,6 +4710,22 @@ fn strip_request_fork_spec(extra: &mut serde_json::Value) {
 
 fn team_id_from_extra(extra: &str) -> Option<String> {
     TeamSessionBinding::team_id_marker_from_extra_str(extra)
+}
+
+fn conversation_upload_roots(extra: &str, workspace_root: &Path) -> Vec<PathBuf> {
+    let mut roots = aionui_project::managed_upload_roots(&workspace_root.join("conversations"));
+    if let Ok(extra) = serde_json::from_str::<serde_json::Value>(extra)
+        && let Some(workspace) = extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    {
+        let workspace_root = aionui_project::workspace_upload_root(Path::new(workspace));
+        if !roots.iter().any(|root| root == &workspace_root) {
+            roots.push(workspace_root);
+        }
+    }
+    roots
 }
 
 fn normalize_workspace_path(workspace: &str) -> Result<String, ConversationError> {

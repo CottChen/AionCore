@@ -300,6 +300,16 @@ impl ProjectService {
         })
     }
 
+    pub(crate) async fn list_folder_roots_for_user(&self, user_id: &str) -> Result<Vec<FolderRow>, ProjectError> {
+        Ok(self
+            .store
+            .list_entry_folders_for_user(user_id)
+            .await?
+            .into_iter()
+            .map(|(_entry, folder)| folder)
+            .collect())
+    }
+
     // ── resource resolution (identity + containment, no IO) ─────────────
 
     pub async fn resolve_reference(
