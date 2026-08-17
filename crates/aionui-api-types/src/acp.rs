@@ -89,11 +89,29 @@ pub struct AgentSessionItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentSessionTurn {
     pub id: String,
+    /// Model recorded for this turn by the local CLI session, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
     pub items: Vec<AgentSessionItem>,
+}
+
+/// The first task a child session received from its parent agent.
+///
+/// `agent_type` and `fork_context` are populated only when the child task text
+/// uniquely matches a recorded parent `spawn_agent` call. Codex's thread edge
+/// storage does not retain a spawn call ID, so ambiguous calls deliberately do
+/// not receive parent-call metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentSessionChildTask {
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_context: Option<bool>,
 }
 
 /// Complete read-only snapshot for a CLI session ID.
@@ -102,6 +120,8 @@ pub struct AgentSessionSnapshot {
     pub session: AgentSessionSummary,
     pub turns: Vec<AgentSessionTurn>,
     pub children: Vec<AgentSessionSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_task: Option<AgentSessionChildTask>,
     pub truncated: bool,
 }
 

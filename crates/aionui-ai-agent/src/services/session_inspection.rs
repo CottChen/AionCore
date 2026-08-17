@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use aionui_api_types::{
-    AgentSessionBackend, AgentSessionItem, AgentSessionItemKind, AgentSessionScope, AgentSessionSnapshot,
-    AgentSessionSummary, AgentSessionTurn,
+    AgentSessionBackend, AgentSessionChildTask, AgentSessionItem, AgentSessionItemKind, AgentSessionScope,
+    AgentSessionSnapshot, AgentSessionSummary, AgentSessionTurn,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -206,10 +206,15 @@ impl AgentSessionInspectionService {
             .collect::<Result<Vec<_>, _>>()
             .map_err(sql_error)?;
         let (turns, truncated) = parse_codex_rollout(&row.1)?;
+        let child_task = match row.0.parent_id.as_deref() {
+            Some(parent_id) => codex_child_task(&connection, parent_id, &turns)?,
+            None => None,
+        };
         Ok(AgentSessionSnapshot {
             session: row.0,
             turns,
             children,
+            child_task,
             truncated,
         })
     }
@@ -287,6 +292,7 @@ impl AgentSessionInspectionService {
             session,
             turns,
             children,
+            child_task: None,
             truncated,
         })
     }
@@ -322,6 +328,7 @@ impl AgentSessionInspectionService {
                     session: summary,
                     turns,
                     children: Vec::new(),
+                    child_task: None,
                     truncated,
                 });
             }
@@ -452,6 +459,7 @@ fn parse_codex_rollout(path: &Path) -> Result<(Vec<AgentSessionTurn>, bool), Age
                 .unwrap_or_else(|| format!("turn-{}", turns.len() + 1));
             turns.push(AgentSessionTurn {
                 id,
+                model: None,
                 started_at: payload
                     .get("started_at")
                     .and_then(Value::as_str)
@@ -465,12 +473,18 @@ fn parse_codex_rollout(path: &Path) -> Result<(Vec<AgentSessionTurn>, bool), Age
         if turns.is_empty() {
             turns.push(AgentSessionTurn {
                 id: "turn-1".to_owned(),
+                model: None,
                 started_at: timestamp.clone(),
                 completed_at: None,
                 items: Vec::new(),
             });
         }
         let turn_index = turns.len() - 1;
+
+        if entry_type == "turn_context" {
+            turns[turn_index].model = payload.get("model").and_then(Value::as_str).map(str::to_owned);
+            continue;
+        }
 
         if entry_type == "event_msg" {
             let item = match payload_type {
@@ -536,6 +550,108 @@ fn parse_codex_rollout(path: &Path) -> Result<(Vec<AgentSessionTurn>, bool), Age
     Ok((turns, truncated))
 }
 
+#[derive(Debug)]
+struct CodexSpawnDispatch {
+    prompt: String,
+    agent_type: Option<String>,
+    fork_context: Option<bool>,
+}
+
+/// Build child-task metadata without assuming a thread edge identifies a
+/// particular `spawn_agent` call. Codex persists parent/child thread IDs but
+/// not the call ID, so the dispatch options are exposed only for one exact
+/// prompt match. The child-received prompt remains useful on its own.
+fn codex_child_task(
+    connection: &Connection,
+    parent_id: &str,
+    child_turns: &[AgentSessionTurn],
+) -> Result<Option<AgentSessionChildTask>, AgentError> {
+    let Some(initial_item) = child_turns
+        .iter()
+        .flat_map(|turn| turn.items.iter())
+        .find(|item| item.kind == AgentSessionItemKind::UserMessage && item.text.is_some())
+    else {
+        return Ok(None);
+    };
+    let prompt = initial_item.text.clone().unwrap_or_default();
+    if initial_item.truncated {
+        return Ok(Some(child_task_from_dispatches(&prompt, true, &[])));
+    }
+    let parent_rollout = connection
+        .query_row(
+            "SELECT rollout_path FROM threads WHERE id = ?1",
+            params![parent_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(parent_rollout) = parent_rollout else {
+        return Ok(Some(child_task_from_dispatches(&prompt, false, &[])));
+    };
+    let dispatches = match parse_codex_spawn_dispatches(Path::new(&parent_rollout)) {
+        Ok(dispatches) => dispatches,
+        Err(_) => return Ok(Some(child_task_from_dispatches(&prompt, false, &[]))),
+    };
+    Ok(Some(child_task_from_dispatches(&prompt, false, &dispatches)))
+}
+
+fn child_task_from_dispatches(
+    prompt: &str,
+    prompt_truncated: bool,
+    dispatches: &[CodexSpawnDispatch],
+) -> AgentSessionChildTask {
+    let mut task = AgentSessionChildTask {
+        prompt: prompt.to_owned(),
+        agent_type: None,
+        fork_context: None,
+    };
+    if prompt_truncated {
+        return task;
+    }
+    let matches = dispatches
+        .iter()
+        .filter(|dispatch| dispatch.prompt == prompt)
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        task.agent_type.clone_from(&matches[0].agent_type);
+        task.fork_context = matches[0].fork_context;
+    }
+    task
+}
+
+fn parse_codex_spawn_dispatches(path: &Path) -> Result<Vec<CodexSpawnDispatch>, AgentError> {
+    let file = File::open(path).map_err(|error| io_error("open Codex parent rollout", error))?;
+    let mut dispatches = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| io_error("read Codex parent rollout", error))?;
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let payload = &entry["payload"];
+        if entry.get("type").and_then(Value::as_str) != Some("response_item")
+            || payload.get("type").and_then(Value::as_str) != Some("function_call")
+            || payload.get("name").and_then(Value::as_str) != Some("spawn_agent")
+        {
+            continue;
+        }
+        let Some(arguments) = payload.get("arguments").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(arguments) = serde_json::from_str::<Value>(arguments) else {
+            continue;
+        };
+        let Some(prompt) = arguments.get("message").and_then(Value::as_str) else {
+            continue;
+        };
+        dispatches.push(CodexSpawnDispatch {
+            prompt: prompt.to_owned(),
+            agent_type: arguments.get("agent_type").and_then(Value::as_str).map(str::to_owned),
+            fork_context: arguments.get("fork_context").and_then(Value::as_bool),
+        });
+    }
+    Ok(dispatches)
+}
+
 fn parse_opencode_session(
     connection: &Connection,
     session_id: &str,
@@ -576,6 +692,7 @@ fn parse_opencode_session(
         if role == "user" || turns.is_empty() {
             turns.push(AgentSessionTurn {
                 id: message_id.clone(),
+                model: None,
                 started_at: Some(created_at.to_string()),
                 completed_at: None,
                 items: Vec::new(),
@@ -771,6 +888,7 @@ fn parse_pi_session(path: &Path) -> Result<(Vec<AgentSessionTurn>, bool), AgentE
                     .and_then(Value::as_str)
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("turn-{}", turns.len() + 1)),
+                model: None,
                 started_at: timestamp.clone(),
                 completed_at: None,
                 items: Vec::new(),
@@ -1007,17 +1125,43 @@ mod tests {
             .unwrap();
         let parent_id = "019f-parent".to_owned();
         let child_id = "019f-child".to_owned();
-        let rollout = root.join("sessions").join("parent.jsonl");
-        let mut file = File::create(&rollout).unwrap();
-        writeln!(file, "{}", json!({"timestamp":"2026-08-01T00:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}})).unwrap();
-        writeln!(file, "{}", json!({"timestamp":"2026-08-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"inspect"}})).unwrap();
-        writeln!(file, "{}", json!({"timestamp":"2026-08-01T00:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}})).unwrap();
-        writeln!(file, "{}", json!({"timestamp":"2026-08-01T00:00:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"ok"}})).unwrap();
-        for (id, title, path) in [
-            (&parent_id, "Parent", rollout.to_string_lossy().to_string()),
-            (&child_id, "Child", rollout.to_string_lossy().to_string()),
+        let parent_rollout = root.join("sessions").join("parent.jsonl");
+        let mut parent_file = File::create(&parent_rollout).unwrap();
+        writeln!(parent_file, "{}", json!({"timestamp":"2026-08-01T00:00:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}})).unwrap();
+        writeln!(parent_file, "{}", json!({"timestamp":"2026-08-01T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"inspect"}})).unwrap();
+        writeln!(parent_file, "{}", json!({"timestamp":"2026-08-01T00:00:02Z","type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}})).unwrap();
+        let spawn_args =
+            json!({"message":"inspect child workspace","agent_type":"explorer","fork_context":true}).to_string();
+        writeln!(parent_file, "{}", json!({"timestamp":"2026-08-01T00:00:03Z","type":"response_item","payload":{"type":"function_call","call_id":"call-spawn","name":"spawn_agent","arguments":spawn_args}})).unwrap();
+        writeln!(parent_file, "{}", json!({"timestamp":"2026-08-01T00:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"ok"}})).unwrap();
+
+        let child_rollout = root.join("sessions").join("child.jsonl");
+        let mut child_file = File::create(&child_rollout).unwrap();
+        writeln!(child_file, "{}", json!({"timestamp":"2026-08-01T00:00:05Z","type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn-1"}})).unwrap();
+        writeln!(
+            child_file,
+            "{}",
+            json!({"timestamp":"2026-08-01T00:00:06Z","type":"turn_context","payload":{"model":"gpt-child-mini"}})
+        )
+        .unwrap();
+        writeln!(child_file, "{}", json!({"timestamp":"2026-08-01T00:00:07Z","type":"event_msg","payload":{"type":"user_message","message":"inspect child workspace"}})).unwrap();
+        writeln!(child_file, "{}", json!({"timestamp":"2026-08-01T00:00:08Z","type":"event_msg","payload":{"type":"agent_message","message":"done"}})).unwrap();
+
+        for (id, title, model, path) in [
+            (
+                &parent_id,
+                "Parent",
+                "gpt-parent",
+                parent_rollout.to_string_lossy().to_string(),
+            ),
+            (
+                &child_id,
+                "Child",
+                "gpt-child",
+                child_rollout.to_string_lossy().to_string(),
+            ),
         ] {
-            connection.execute("INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, archived, model, created_at_ms, updated_at_ms, recency_at_ms) VALUES (?1, ?2, 1, 2, 'cli', 'openai', '/tmp', ?3, 0, 'gpt-5', 1000, 2000, 2000)", params![id, path, title]).unwrap();
+            connection.execute("INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, archived, model, created_at_ms, updated_at_ms, recency_at_ms) VALUES (?1, ?2, 1, 2, 'cli', 'openai', '/tmp', ?3, 0, ?4, 1000, 2000, 2000)", params![id, path, title, model]).unwrap();
         }
         connection
             .execute(
@@ -1131,6 +1275,48 @@ mod tests {
         assert_eq!(tool.name.as_deref(), Some("exec_command"));
         assert_eq!(tool.status.as_deref(), Some("completed"));
         assert_eq!(tool.output, Some(Value::String("ok".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn reads_codex_child_dispatch_and_turn_model() {
+        let codex = TempDir::new().unwrap();
+        let opencode = TempDir::new().unwrap();
+        let pi = TempDir::new().unwrap();
+        let (_parent_id, child_id) = create_codex_fixture(codex.path());
+        let service = AgentSessionInspectionService::with_roots(
+            codex.path().to_owned(),
+            opencode.path().to_owned(),
+            pi.path().to_owned(),
+        );
+
+        let snapshot = service.inspect(AgentSessionBackend::Codex, child_id).await.unwrap();
+        let task = snapshot.child_task.expect("child initial task");
+        assert_eq!(task.prompt, "inspect child workspace");
+        assert_eq!(task.agent_type.as_deref(), Some("explorer"));
+        assert_eq!(task.fork_context, Some(true));
+        assert_eq!(snapshot.session.model.as_deref(), Some("gpt-child"));
+        assert_eq!(snapshot.turns[0].model.as_deref(), Some("gpt-child-mini"));
+    }
+
+    #[test]
+    fn child_task_keeps_the_received_prompt_when_parent_dispatch_is_ambiguous() {
+        let dispatches = vec![
+            CodexSpawnDispatch {
+                prompt: "same task".to_owned(),
+                agent_type: Some("first".to_owned()),
+                fork_context: Some(true),
+            },
+            CodexSpawnDispatch {
+                prompt: "same task".to_owned(),
+                agent_type: Some("second".to_owned()),
+                fork_context: Some(false),
+            },
+        ];
+
+        let task = child_task_from_dispatches("same task", false, &dispatches);
+        assert_eq!(task.prompt, "same task");
+        assert_eq!(task.agent_type, None);
+        assert_eq!(task.fork_context, None);
     }
 
     #[tokio::test]

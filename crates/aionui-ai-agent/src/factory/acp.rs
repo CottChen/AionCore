@@ -22,6 +22,9 @@ use tracing::{info, warn};
 
 use crate::runtime_status::conversation_runtime_reporter;
 
+const PI_AGENT_SETTLED_MIN_VERSION: &[u32] = &[0, 80, 4];
+const PI_AGENT_END_COMPAT_ADAPTER: &str = "pi-acp@0.0.32";
+
 /// Where a conversation that arrived on the ACP factory actually has to run.
 ///
 /// Conversations reach this factory by their *family*, not by how their agent
@@ -326,8 +329,10 @@ async fn resolve_agent_command_spec(
         && meta.agent_source_info.bridge_binary.as_deref() == Some("npx")
         && let Some(backend) = meta.backend.as_deref()
     {
-        aionui_runtime::pin_registry_npx_args(backend, &meta.args)
-            .map_err(|error| AgentError::bad_request(format!("Agent '{}' package lock invalid: {error}", meta.name)))?
+        let mut args = aionui_runtime::pin_registry_npx_args(backend, &meta.args)
+            .map_err(|error| AgentError::bad_request(format!("Agent '{}' package lock invalid: {error}", meta.name)))?;
+        apply_pi_adapter_compatibility(meta, &mut args).await;
+        args
     } else {
         meta.args.clone()
     };
@@ -352,6 +357,50 @@ async fn resolve_agent_command_spec(
         env,
         cwd: Some(workspace.to_owned()),
     })
+}
+
+/// pi-acp 0.0.33 waits for Pi's `agent_settled` event and officially requires
+/// Pi 0.80.4+. Older Pi releases end at `agent_end`, so that adapter streams the
+/// final text but never returns `session/prompt`. Keep the current adapter for
+/// supported/unknown versions and use the last `agent_end` adapter only when
+/// the installed Pi version is positively identified as older.
+async fn apply_pi_adapter_compatibility(meta: &AgentMetadata, args: &mut [String]) {
+    if meta.backend.as_deref() != Some("pi") {
+        return;
+    }
+
+    let Ok(probe) = crate::cli_probe::validate_with_budget(meta, crate::cli_probe::CLI_VERSION_TIMEOUT).await else {
+        return;
+    };
+    let Some(reported) = probe.reported_version.as_deref() else {
+        return;
+    };
+    if !pi_needs_agent_end_compatibility(reported) {
+        return;
+    }
+
+    if !replace_pi_adapter_with_agent_end_compatibility(args) {
+        warn!(pi_version = %reported, "Pi compatibility adapter could not be applied: package argument missing");
+        return;
+    }
+    info!(
+        pi_version = %reported,
+        pi_acp_version = "0.0.32",
+        completion_event = "agent_end",
+        "Using legacy Pi ACP adapter because the installed Pi predates agent_settled"
+    );
+}
+
+fn pi_needs_agent_end_compatibility(reported: &str) -> bool {
+    aionui_session::parse_cli_version(reported).is_some_and(|version| version.as_slice() < PI_AGENT_SETTLED_MIN_VERSION)
+}
+
+fn replace_pi_adapter_with_agent_end_compatibility(args: &mut [String]) -> bool {
+    let Some(package_arg) = args.iter_mut().find(|arg| arg.starts_with("pi-acp@")) else {
+        return false;
+    };
+    *package_arg = PI_AGENT_END_COMPAT_ADAPTER.to_owned();
+    true
 }
 
 /// Load the operator's enabled MCP servers from the DB, log+skip any rows
@@ -600,6 +649,30 @@ mod tests {
     };
 
     const TEST_USER_ID: &str = "user-1";
+
+    #[test]
+    fn pi_versions_before_agent_settled_use_the_compatibility_adapter() {
+        assert!(pi_needs_agent_end_compatibility("0.79.10"));
+        assert!(pi_needs_agent_end_compatibility("pi 0.80.3"));
+    }
+
+    #[test]
+    fn pi_versions_with_agent_settled_keep_the_current_adapter() {
+        assert!(!pi_needs_agent_end_compatibility("0.80.4"));
+        assert!(!pi_needs_agent_end_compatibility("0.82.1"));
+        assert!(!pi_needs_agent_end_compatibility("unknown"));
+    }
+
+    #[test]
+    fn pi_compatibility_rewrites_only_the_pinned_adapter_argument() {
+        let mut args = vec!["-y".to_owned(), "pi-acp@0.0.33".to_owned()];
+        assert!(replace_pi_adapter_with_agent_end_compatibility(&mut args));
+        assert_eq!(args, ["-y", "pi-acp@0.0.32"]);
+
+        let mut unrelated = vec!["-y".to_owned(), "other-agent@1.0.0".to_owned()];
+        assert!(!replace_pi_adapter_with_agent_end_compatibility(&mut unrelated));
+        assert_eq!(unrelated, ["-y", "other-agent@1.0.0"]);
+    }
 
     fn make_row(
         name: &str,
