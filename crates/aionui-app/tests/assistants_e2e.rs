@@ -1006,6 +1006,39 @@ async fn regular_users_can_read_admin_assistants_but_cannot_mutate_them() {
     assert_eq!(body_json(resp).await["data"]["profile"]["name"], "Private A");
 }
 
+#[tokio::test]
+async fn regular_users_must_opt_in_to_new_custom_assistants() {
+    let fx = fixture().await;
+    create_user(&fx, "opt-in-assistant", "Opt-in Assistant").await;
+
+    let mut app = fx.app.clone();
+    let (regular_token, regular_csrf) = setup_and_login(&mut app, &fx.services, "opt-in-user", "OtherP@ss1").await;
+
+    let detail_resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants/opt-in-assistant", &regular_token))
+        .await
+        .unwrap();
+    assert_eq!(detail_resp.status(), StatusCode::OK);
+    assert_eq!(body_json(detail_resp).await["data"]["state"]["enabled"], false);
+
+    let enable_resp = fx
+        .app
+        .clone()
+        .oneshot(json_with_token(
+            "PATCH",
+            "/api/assistants/opt-in-assistant/state",
+            json!({ "enabled": true }),
+            &regular_token,
+            &regular_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(enable_resp.status(), StatusCode::OK);
+    assert_eq!(body_json(enable_resp).await["data"]["enabled"], true);
+}
+
 // ===========================================================================
 // DELETE /api/assistants/{id}
 // ===========================================================================

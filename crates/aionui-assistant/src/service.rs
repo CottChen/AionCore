@@ -934,10 +934,11 @@ impl AssistantService {
                 state_map.get(&definition.id),
                 admin_user_state_map.get(&definition.id),
             );
-            let effective_state = self.effective_state(
+            let effective_state = self.effective_state_for_catalog_user(
                 definition,
                 administered_state.as_ref(),
                 user_state_map.get(&definition.id),
+                user_id,
             );
             let projection = self
                 .project_definition(
@@ -1010,7 +1011,12 @@ impl AssistantService {
                 Some(user_id) => self.user_state_repo.get(user_id, &definition.id).await?,
                 None => None,
             };
-            let effective_state = self.effective_state(&definition, administered_state.as_ref(), user_state.as_ref());
+            let effective_state = self.effective_state_for_catalog_user(
+                &definition,
+                administered_state.as_ref(),
+                user_state.as_ref(),
+                user_id,
+            );
             let projection = self
                 .project_definition(
                     DEFAULT_USER_ID,
@@ -1065,7 +1071,12 @@ impl AssistantService {
                 Some(user_id) => self.user_state_repo.get(user_id, &definition.id).await?,
                 None => None,
             };
-            let effective_state = self.effective_state(&definition, administered_state.as_ref(), user_state.as_ref());
+            let effective_state = self.effective_state_for_catalog_user(
+                &definition,
+                administered_state.as_ref(),
+                user_state.as_ref(),
+                user_id,
+            );
             let preference = self
                 .preference_repo
                 .get_for_user(DEFAULT_USER_ID, &definition.id)
@@ -1758,29 +1769,27 @@ impl AssistantService {
         let admin_user_state = self.user_state_repo.get(DEFAULT_USER_ID, &definition.id).await?;
         let administered_state = self.effective_state(&definition, existing_state.as_ref(), admin_user_state.as_ref());
         let existing_user_state = self.user_state_repo.get(user_id, &definition.id).await?;
+        let effective_user_state = self.effective_state_for_catalog_user(
+            &definition,
+            administered_state.as_ref(),
+            existing_user_state.as_ref(),
+            Some(user_id),
+        );
         let builtin_default = self.builtin_listing_default(&definition);
         let enabled = req
             .enabled
-            .or_else(|| existing_user_state.as_ref().and_then(|state| state.enabled))
-            .or_else(|| administered_state.as_ref().map(|state| state.enabled))
+            .or_else(|| effective_user_state.as_ref().map(|state| state.enabled))
             .unwrap_or_else(|| builtin_default.map(|(_, enabled)| enabled).unwrap_or(true));
         let sort_order = req
             .sort_order
-            .or_else(|| existing_user_state.as_ref().and_then(|state| state.sort_order))
-            .or_else(|| administered_state.as_ref().map(|state| state.sort_order))
+            .or_else(|| effective_user_state.as_ref().map(|state| state.sort_order))
             .unwrap_or_else(|| builtin_default.map(|(sort_order, _)| sort_order).unwrap_or_default());
         let last_used_at = req
             .last_used_at
-            .or_else(|| existing_user_state.as_ref().and_then(|state| state.last_used_at))
-            .or_else(|| administered_state.as_ref().and_then(|state| state.last_used_at));
-        let agent_id_override = existing_user_state
+            .or_else(|| effective_user_state.as_ref().and_then(|state| state.last_used_at));
+        let agent_id_override = effective_user_state
             .as_ref()
-            .and_then(|state| state.agent_id_override.clone())
-            .or_else(|| {
-                administered_state
-                    .as_ref()
-                    .and_then(|state| state.agent_id_override.clone())
-            });
+            .and_then(|state| state.agent_id_override.clone());
 
         self.user_state_repo
             .upsert(&UpsertAssistantUserOverlayParams {
@@ -2721,6 +2730,38 @@ impl AssistantService {
                 .or_else(|| global_state.map(|row| row.updated_at))
                 .unwrap_or_default(),
         })
+    }
+
+    fn effective_state_for_catalog_user(
+        &self,
+        definition: &AssistantDefinitionRow,
+        administered_state: Option<&AssistantOverlayRow>,
+        user_state: Option<&AssistantUserOverlayRow>,
+        user_id: Option<&str>,
+    ) -> Option<AssistantOverlayRow> {
+        let mut effective_state = self.effective_state(definition, administered_state, user_state);
+        let uses_regular_user_default = user_id.is_some_and(|id| id != DEFAULT_USER_ID)
+            && definition.source == "user"
+            && user_state.and_then(|state| state.enabled).is_none();
+
+        if uses_regular_user_default {
+            match effective_state.as_mut() {
+                Some(state) => state.enabled = false,
+                None => {
+                    effective_state = Some(AssistantOverlayRow {
+                        assistant_definition_id: definition.id.clone(),
+                        enabled: false,
+                        sort_order: 0,
+                        agent_id_override: None,
+                        last_used_at: None,
+                        created_at: 0,
+                        updated_at: 0,
+                    });
+                }
+            }
+        }
+
+        effective_state
     }
 
     fn definition_to_response(
@@ -4456,6 +4497,94 @@ mod tests {
         assert!(user_b_list.iter().any(|assistant| assistant.id == "builtin-office"));
         assert!(default_list.iter().any(|assistant| assistant.id == "u-default"));
         assert!(user_b_list.iter().any(|assistant| assistant.id == "u-default"));
+    }
+
+    #[tokio::test]
+    async fn custom_assistant_defaults_to_disabled_for_regular_users() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("admin-custom".into()),
+                name: "Admin Custom".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let regular_user = create_test_user(&fx._db, "custom_default_reader").await;
+
+        let admin_assistant = fx.service.get("admin-custom").await.unwrap();
+        let regular_assistant = fx.service.get_for_user(&regular_user, "admin-custom").await.unwrap();
+        let regular_detail = fx
+            .service
+            .get_detail_for_user(&regular_user, "admin-custom", None)
+            .await
+            .unwrap();
+
+        assert!(admin_assistant.enabled);
+        assert!(!regular_assistant.enabled);
+        assert!(!regular_detail.state.enabled);
+    }
+
+    #[tokio::test]
+    async fn regular_user_can_enable_a_custom_assistant_personally() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("opt-in-custom".into()),
+                name: "Opt-in Custom".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let regular_user = create_test_user(&fx._db, "custom_opt_in_user").await;
+
+        let enabled = fx
+            .service
+            .set_state_for_user(
+                &regular_user,
+                "opt-in-custom",
+                SetAssistantStateRequest {
+                    enabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let listed = fx.service.list_for_user(&regular_user).await.unwrap();
+        let listed_custom = listed.iter().find(|assistant| assistant.id == "opt-in-custom").unwrap();
+
+        assert!(enabled.enabled);
+        assert!(listed_custom.enabled);
+    }
+
+    #[tokio::test]
+    async fn regular_user_sort_update_does_not_enable_a_custom_assistant() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("sorted-custom".into()),
+                name: "Sorted Custom".into(),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        let regular_user = create_test_user(&fx._db, "custom_sort_user").await;
+
+        let updated = fx
+            .service
+            .set_state_for_user(
+                &regular_user,
+                "sorted-custom",
+                SetAssistantStateRequest {
+                    sort_order: Some(25),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!updated.enabled);
+        assert_eq!(updated.sort_order, 25);
     }
 
     #[tokio::test]
