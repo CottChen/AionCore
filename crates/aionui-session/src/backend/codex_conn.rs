@@ -3094,30 +3094,16 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
     let usage = params.get("tokenUsage").unwrap_or(&Value::Null);
     let last = usage.get("last").unwrap_or(&Value::Null);
     let g = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let context_window = usage
+        .get("modelContextWindow")
+        .and_then(Value::as_u64)
+        .filter(|window| *window > 0);
     vec![SessionEvent::UsageDelta {
         input_tokens: g("inputTokens"),
         output_tokens: g("outputTokens"),
         total_tokens: g("totalTokens"),
         cost_usd: None,
-        // DELIBERATELY NOT REPORTED, despite `tokenUsage.modelContextWindow` being
-        // the only context-window field in the whole codex protocol.
-        //
-        // Live-probed on 0.145.0 through a custom `model_provider`: `gpt-5.6-sol`,
-        // `gpt-5.5` and `gpt-5.6-luna` ALL report 258_400, and an explicit
-        // `model_context_window` (in `config.toml` AND via `-c`) is ignored. A
-        // figure that never varies by model and cannot be configured says nothing
-        // about the model in use, and a wrong denominator is worse than none: the
-        // renderer has a designed "context window size unknown" state that shows a
-        // plain token count instead of inventing a percentage.
-        //
-        // The likely explanation is that codex falls back to a stand-in for models
-        // it does not recognise, i.e. any custom provider — an official/Bedrock
-        // setup may well report a real window. That is UNVERIFIED: this machine has
-        // no official codex auth (no `~/.codex/auth.json`) to test against. Suppress
-        // unconditionally rather than encode a guess; revisit with a capture from a
-        // first-party provider, and gate on that evidence rather than on a
-        // hardcoded constant.
-        context_window: None,
+        context_window,
         // Per-turn detail line. codex reports every field natively on `last`
         // (verified: TokenUsageBreakdown in the generated schema), including the
         // reasoning tokens claude only exposes per-call.
@@ -3137,10 +3123,10 @@ mod usage_window_tests {
     /// `gpt-5.6-sol`): turn 2, window 258400. `used` must stay on `last`
     /// (11030 = the request carrying the whole history + its reply), NOT on the
     /// cumulative `total` (22043) which would blow past any window on a long
-    /// session. The reported `modelContextWindow` is NOT forwarded — see
-    /// `map_usage` for why codex's only window figure is unusable.
+    /// session. The reported `modelContextWindow` is the protocol's denominator
+    /// and must be forwarded without guessing a value from the model name.
     #[test]
-    fn live_token_usage_maps_last_as_occupancy_and_drops_the_window() {
+    fn live_token_usage_maps_last_as_occupancy_and_forwards_the_window() {
         let params: Value = serde_json::from_str(
             r#"{"threadId":"th1","turnId":"t1","tokenUsage":{
                  "modelContextWindow":258400,
@@ -3158,14 +3144,12 @@ mod usage_window_tests {
                     input_tokens: 11024,
                     output_tokens: 6,
                     total_tokens: 11030,
-                    // The frame carried `modelContextWindow: 258400`; it is
-                    // deliberately not forwarded — see `map_usage`.
-                    context_window: None,
+                    context_window: Some(258400),
                     cost_usd: None,
                     ..
                 }]
             ),
-            "expected last-based occupancy and no window, got {events:?}"
+            "expected last-based occupancy and the reported window, got {events:?}"
         );
     }
 
@@ -3189,13 +3173,15 @@ mod usage_window_tests {
         assert_eq!(b.thought_tokens, 242, "reasoningOutputTokens is the thinking count");
     }
 
-    /// `modelContextWindow` is `int|null` in the schema — a null (or absent) field
-    /// must degrade to `None`, never to 0, which would render a 0-sized bar.
+    /// `modelContextWindow` is `int|null` in the schema. Null, absent, zero, or a
+    /// malformed negative value must degrade to `None`, never render a 0-sized bar.
     #[test]
-    fn null_or_absent_context_window_is_none() {
+    fn invalid_or_missing_context_window_is_none() {
         for raw in [
             r#"{"tokenUsage":{"modelContextWindow":null,"last":{"totalTokens":5,"inputTokens":4,"outputTokens":1}}}"#,
             r#"{"tokenUsage":{"last":{"totalTokens":5,"inputTokens":4,"outputTokens":1}}}"#,
+            r#"{"tokenUsage":{"modelContextWindow":0,"last":{"totalTokens":5,"inputTokens":4,"outputTokens":1}}}"#,
+            r#"{"tokenUsage":{"modelContextWindow":-1,"last":{"totalTokens":5,"inputTokens":4,"outputTokens":1}}}"#,
         ] {
             let params: Value = serde_json::from_str(raw).unwrap();
             assert!(
