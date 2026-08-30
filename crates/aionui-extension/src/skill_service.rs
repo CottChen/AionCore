@@ -1616,7 +1616,7 @@ async fn sync_managed_skill_into_repo(
         return Ok(());
     }
 
-    repo.upsert(UpsertSkillParams {
+    repo.upsert_global(UpsertSkillParams {
         name: &skill.name,
         description: Some(&skill.description),
         path: &skill.path,
@@ -2191,6 +2191,7 @@ async fn create_symlink(src: &Path, dst: &Path) -> Result<(), ExtensionError> {
 mod tests {
     use super::*;
     use aionui_db::{ISkillRepository, SqliteSkillRepository, init_database_memory};
+    use sqlx::sqlite::SqlitePoolOptions;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -2841,6 +2842,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_skill_catalog_accepts_scoped_duplicate_with_partial_indexes() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_disk_builtin_paths(tmp.path());
+        let auto_dir = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR);
+        create_skill_in_dir(&auto_dir, "cron", "Updated cron skill");
+        let (repo, pool) = make_user_scoped_skill_repo().await;
+
+        sqlx::query(
+            "INSERT INTO skills \
+                (id, user_id, name, description, path, source, enabled, created_at, updated_at) \
+             VALUES \
+                ('user-cron', 'system_default_user', 'cron', 'User cron', '/user/cron', 'cron', 1, 1, 1), \
+                ('global-cron', NULL, 'cron', 'Global cron', '/old/global/cron', 'builtin', 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sync_skill_catalog_into_repo(&paths, &repo).await.unwrap();
+
+        let rows = sqlx::query_as::<_, (Option<String>, String)>(
+            "SELECT user_id, path FROM skills WHERE name = 'cron' ORDER BY user_id IS NULL",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, "/user/cron");
+        assert_eq!(rows[1].1, auto_dir.join("cron").to_string_lossy());
+    }
+
+    #[tokio::test]
     async fn list_available_skills_with_repo_does_not_restore_soft_deleted_disk_skill() {
         let tmp = TempDir::new().unwrap();
         let paths = make_test_paths(tmp.path());
@@ -3164,6 +3197,42 @@ mod tests {
     async fn make_test_skill_repo() -> SqliteSkillRepository {
         let db = init_database_memory().await.unwrap();
         SqliteSkillRepository::new(db.pool().clone())
+    }
+
+    async fn make_user_scoped_skill_repo() -> (SqliteSkillRepository, sqlx::SqlitePool) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE skills (\
+                id TEXT PRIMARY KEY NOT NULL, \
+                user_id TEXT, \
+                name TEXT NOT NULL, \
+                description TEXT, \
+                path TEXT NOT NULL, \
+                source TEXT NOT NULL, \
+                enabled INTEGER NOT NULL DEFAULT 1, \
+                deleted_at INTEGER, \
+                created_at INTEGER NOT NULL, \
+                updated_at INTEGER NOT NULL\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("CREATE UNIQUE INDEX idx_skills_global_name ON skills(name) WHERE user_id IS NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE UNIQUE INDEX idx_skills_user_name ON skills(user_id, name) WHERE user_id IS NOT NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let repo = SqliteSkillRepository::new(pool.clone());
+        (repo, pool)
     }
 
     fn create_skill_in_dir(base: &Path, name: &str, description: &str) {

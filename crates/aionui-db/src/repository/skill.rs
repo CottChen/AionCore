@@ -16,6 +16,11 @@ pub trait ISkillRepository: Send + Sync {
     /// Creates or updates a user skill by name and clears soft-delete state.
     async fn upsert(&self, params: UpsertSkillParams<'_>) -> Result<SkillRow, DbError>;
 
+    /// Creates or updates a global skill row when the schema supports user ownership.
+    async fn upsert_global(&self, params: UpsertSkillParams<'_>) -> Result<SkillRow, DbError> {
+        self.upsert(params).await
+    }
+
     /// Soft-deletes an active skill by name.
     async fn delete_by_name(&self, name: &str) -> Result<SkillRow, DbError>;
 
