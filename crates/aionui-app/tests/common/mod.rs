@@ -20,6 +20,17 @@ pub async fn build_app() -> (axum::Router, AppServices) {
     (router, services)
 }
 
+pub async fn build_app_with_upload_max_size(upload_max_size_bytes: usize) -> (axum::Router, AppServices) {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = AppConfig {
+        upload_max_size_bytes,
+        ..Default::default()
+    };
+    let services = AppServices::from_config(db, &config).await.unwrap();
+    let router = create_router(&services).await.expect("build router");
+    (router, services)
+}
+
 pub async fn build_app_with_data_dir(root: &std::path::Path) -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let config = AppConfig {

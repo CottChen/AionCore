@@ -49,6 +49,7 @@ pub struct AppServices {
     /// When `true`, skip JWT authentication and use a fixed default user.
     pub local: bool,
     pub app_version: String,
+    pub upload_max_size_bytes: usize,
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
@@ -95,6 +96,7 @@ impl AppServices {
         let local = config.local;
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
+        let upload_max_size_bytes = config.upload_max_size_bytes;
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
 
         // Resolve JWT secret: env var → system user db field → random generation
@@ -229,6 +231,7 @@ impl AppServices {
             work_dir,
             local,
             app_version,
+            upload_max_size_bytes,
             skill_paths,
             skill_repo,
             runtime_helper_bin,

@@ -18,7 +18,6 @@ use aionui_api_types::{
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
-use aionui_common::constants::UPLOAD_MAX_SIZE;
 
 use crate::browse;
 use crate::error::FileError;
@@ -101,6 +100,8 @@ pub struct FileRouterState {
     /// drive letters, and `/` on Unix) because the WebUI host-file picker
     /// legitimately needs to reach outside any single workspace.
     pub browse_roots: BrowseRoots,
+    /// Maximum accepted multipart upload request size in bytes.
+    pub upload_max_size_bytes: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,7 +112,7 @@ pub struct FileRouterState {
 ///
 /// All routes require authentication (applied by the caller).
 pub fn file_routes(state: FileRouterState) -> Router {
-    // Upload route carries its own body-size limit (UPLOAD_MAX_SIZE, 30 MB).
+    // Upload route carries its own configurable body-size limit.
     // We first disable the global `DefaultBodyLimit` that `aionui-app`
     // installs (otherwise the `Multipart` extractor would cap the body at
     // `BODY_LIMIT`), then apply `RequestBodyLimitLayer` as the sole hard
@@ -119,7 +120,7 @@ pub fn file_routes(state: FileRouterState) -> Router {
     let upload_router = Router::new()
         .route("/api/fs/upload", post(upload_file))
         .layer(DefaultBodyLimit::disable())
-        .layer(RequestBodyLimitLayer::new(UPLOAD_MAX_SIZE))
+        .layer(RequestBodyLimitLayer::new(state.upload_max_size_bytes))
         .with_state(state.clone());
 
     Router::new()

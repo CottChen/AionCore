@@ -14,6 +14,9 @@ use super::tracing_init::{LogGuards, init_tracing};
 use super::work_dir::resolve_work_dir;
 use super::{BootstrapError, BootstrapErrorCode};
 
+const UPLOAD_MAX_SIZE_ENV: &str = "AIONUI_UPLOAD_MAX_SIZE_MB";
+const MIB: usize = 1024 * 1024;
+
 /// Resolved environment needed by all non-MCP subcommands.
 pub struct ServerEnvironment {
     /// Must be held alive for the process lifetime to flush log buffers.
@@ -36,6 +39,7 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
     );
 
     let work_dir = resolve_work_dir(cli.work_dir.clone(), &cli.data_dir);
+    let upload_max_size_bytes = resolve_upload_max_size_bytes(cli.upload_max_size_mb)?;
 
     // SAFETY: called before any service initialization; no concurrent reads.
     unsafe {
@@ -51,17 +55,64 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         local: cli.local,
         dump_prompts: cli.dump_prompts,
         recover_corrupted_database: cli.recover_corrupted_database,
+        upload_max_size_bytes,
     };
     info!(
         "Running in {} mode — authentication is {}",
         if config.local { "local" } else { "remote" },
         if config.local { "disabled" } else { "enabled" }
     );
+    info!(
+        upload_max_size_bytes = config.upload_max_size_bytes,
+        "File upload limit configured"
+    );
 
     Ok(ServerEnvironment {
         _log_guard: log_guard,
         config,
     })
+}
+
+fn resolve_upload_max_size_bytes(cli_value_mb: Option<usize>) -> Result<usize, BootstrapError> {
+    let env_value = std::env::var(UPLOAD_MAX_SIZE_ENV).ok();
+    resolve_upload_max_size_bytes_from(cli_value_mb, env_value.as_deref())
+}
+
+fn resolve_upload_max_size_bytes_from(
+    cli_value_mb: Option<usize>,
+    env_value_mb: Option<&str>,
+) -> Result<usize, BootstrapError> {
+    if let Some(value_mb) = cli_value_mb {
+        return upload_max_size_bytes(value_mb, "command line");
+    }
+
+    match env_value_mb {
+        Some(raw) if !raw.trim().is_empty() => {
+            let value_mb = raw
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| upload_max_size_error(raw, "environment"))?;
+            upload_max_size_bytes(value_mb, "environment")
+        }
+        _ => Ok(aionui_common::constants::DEFAULT_UPLOAD_MAX_SIZE),
+    }
+}
+
+fn upload_max_size_bytes(value_mb: usize, source: &'static str) -> Result<usize, BootstrapError> {
+    value_mb
+        .checked_mul(MIB)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| upload_max_size_error(&value_mb.to_string(), source))
+}
+
+fn upload_max_size_error(value: &str, source: &'static str) -> BootstrapError {
+    BootstrapError::new(
+        BootstrapErrorCode::ConfigInvalid,
+        "config.upload_max_size_mb",
+        "upload max size must be a positive integer number of MiB",
+    )
+    .with_field("source", source)
+    .with_field("value", value.trim())
 }
 
 /// Layer 2: Materialize builtin skills + initialize the database.
@@ -120,6 +171,8 @@ pub async fn init_data_layer(config: &AppConfig) -> Result<Database, BootstrapEr
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn database_stage_comes_from_db_boundary_error() {
         let err = aionui_db::DatabaseInitError::new(
@@ -151,5 +204,54 @@ mod tests {
         );
 
         assert_eq!(err.stage(), "database.recoverable_corruption");
+    }
+
+    #[test]
+    fn upload_max_size_converts_mib_to_bytes() {
+        assert_eq!(upload_max_size_bytes(256, "test").unwrap(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn upload_max_size_rejects_zero() {
+        let error = upload_max_size_bytes(0, "test").unwrap_err();
+        assert_eq!(error.code(), BootstrapErrorCode::ConfigInvalid);
+        assert_eq!(error.stage(), "config.upload_max_size_mb");
+    }
+
+    #[test]
+    fn upload_max_size_rejects_overflow() {
+        let error = upload_max_size_bytes(usize::MAX, "test").unwrap_err();
+        assert_eq!(error.code(), BootstrapErrorCode::ConfigInvalid);
+    }
+
+    #[test]
+    fn upload_max_size_uses_cli_before_environment() {
+        assert_eq!(
+            resolve_upload_max_size_bytes_from(Some(64), Some("invalid")).unwrap(),
+            64 * MIB
+        );
+    }
+
+    #[test]
+    fn upload_max_size_uses_environment_when_cli_is_absent() {
+        assert_eq!(
+            resolve_upload_max_size_bytes_from(None, Some("128")).unwrap(),
+            128 * MIB
+        );
+    }
+
+    #[test]
+    fn upload_max_size_uses_default_when_not_configured() {
+        assert_eq!(
+            resolve_upload_max_size_bytes_from(None, None).unwrap(),
+            aionui_common::constants::DEFAULT_UPLOAD_MAX_SIZE
+        );
+    }
+
+    #[test]
+    fn upload_max_size_rejects_invalid_environment_value() {
+        let error = resolve_upload_max_size_bytes_from(None, Some("large")).unwrap_err();
+        assert_eq!(error.code(), BootstrapErrorCode::ConfigInvalid);
+        assert_eq!(error.stage(), "config.upload_max_size_mb");
     }
 }

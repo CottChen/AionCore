@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub dump_prompts: bool,
     /// Explicitly authorize backup and rebuild for corruption-like local databases.
     pub recover_corrupted_database: bool,
+    /// Maximum accepted multipart upload request size in bytes.
+    pub upload_max_size_bytes: usize,
 }
 
 impl AppConfig {
@@ -52,6 +54,7 @@ impl Default for AppConfig {
             local: false,
             dump_prompts: false,
             recover_corrupted_database: false,
+            upload_max_size_bytes: aionui_common::constants::DEFAULT_UPLOAD_MAX_SIZE,
         }
     }
 }
@@ -77,6 +80,7 @@ mod tests {
         assert_eq!(config.app_version, env!("CARGO_PKG_VERSION"));
         assert!(!config.dump_prompts);
         assert!(!config.recover_corrupted_database);
+        assert_eq!(config.upload_max_size_bytes, 30 * 1024 * 1024);
     }
 
     #[test]

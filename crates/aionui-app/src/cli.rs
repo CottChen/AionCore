@@ -57,6 +57,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub recover_corrupted_database: bool,
 
+    /// Maximum multipart file upload size in MiB.
+    /// Falls back to AIONUI_UPLOAD_MAX_SIZE_MB, then to 30 MiB.
+    #[arg(long, value_name = "MIB")]
+    pub upload_max_size_mb: Option<usize>,
+
     /// Managed runtime resource source selection.
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
     pub managed_resources_mode: ManagedResourcesModeArg,
@@ -694,6 +699,18 @@ mod tests {
     fn recover_corrupted_database_flag_is_accepted() {
         let cli = Cli::parse_from(["aioncore", "--recover-corrupted-database"]);
         assert!(cli.recover_corrupted_database);
+    }
+
+    #[test]
+    fn upload_max_size_defaults_to_runtime_resolution() {
+        let cli = Cli::parse_from(["aioncore"]);
+        assert_eq!(cli.upload_max_size_mb, None);
+    }
+
+    #[test]
+    fn upload_max_size_accepts_mib_value() {
+        let cli = Cli::parse_from(["aioncore", "--upload-max-size-mb", "256"]);
+        assert_eq!(cli.upload_max_size_mb, Some(256));
     }
 
     #[test]

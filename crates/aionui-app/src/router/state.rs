@@ -453,6 +453,7 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         snapshot_service,
         allowed_roots,
         browse_roots,
+        upload_max_size_bytes: services.upload_max_size_bytes,
     })
 }
 
