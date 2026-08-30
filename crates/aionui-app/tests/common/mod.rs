@@ -124,6 +124,15 @@ pub async fn build_app_with_file_roots(allowed_roots: Vec<std::path::PathBuf>) -
     (router, services)
 }
 
+pub async fn build_app_with_upload_max_size(upload_max_size_bytes: usize) -> (axum::Router, AppServices) {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let (mut states, _) = build_module_states(&services).await.expect("build module states");
+    states.file.upload_max_size_bytes = upload_max_size_bytes;
+    let router = create_router_with_states(&services, states);
+    (router, services)
+}
+
 pub async fn build_app_with_mock_version(
     current_version: &str,
     mock_server: &MockServer,

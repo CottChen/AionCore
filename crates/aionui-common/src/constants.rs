@@ -25,9 +25,6 @@ pub const REMOTE_HOST: &str = "0.0.0.0";
 pub const DEFAULT_PORT: u16 = 25808;
 /// Request body size limit (10 MB).
 pub const BODY_LIMIT: usize = 10 * 1024 * 1024;
-/// File upload size limit (30 MB).
-pub const UPLOAD_MAX_SIZE: usize = 30 * 1024 * 1024;
-
 // --- Team mode ---
 
 /// Runtime backend that supports Team MCP without ACP capability metadata.

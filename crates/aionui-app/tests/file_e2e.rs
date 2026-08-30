@@ -8,7 +8,8 @@ use serde_json::json;
 use tower::ServiceExt;
 
 use common::{
-    body_json, build_app, build_app_with_data_dir, build_app_with_file_roots, json_with_token, setup_and_login,
+    body_json, build_app, build_app_with_data_dir, build_app_with_file_roots, build_app_with_upload_max_size,
+    json_with_token, setup_and_login,
 };
 
 // ===========================================================================
@@ -1234,14 +1235,12 @@ async fn upload_missing_file_field_returns_400() {
 }
 
 #[tokio::test]
-async fn upload_body_exceeding_30mb_returns_413() {
-    let (mut app, services) = build_app().await;
+async fn upload_body_exceeding_configured_limit_returns_413() {
+    let (mut app, services) = build_app_with_upload_max_size(512).await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    // 31 MB payload comfortably exceeds UPLOAD_MAX_SIZE (30 MB).
-    let big = vec![0u8; 31 * 1024 * 1024];
     let (content_type, body) = UploadMultipart::new()
-        .add_file("file", "big.bin", "application/octet-stream", &big)
+        .add_file("file", "big.bin", "application/octet-stream", &[0_u8; 512])
         .build();
 
     let req = upload_request(&content_type, body, &token, &csrf);

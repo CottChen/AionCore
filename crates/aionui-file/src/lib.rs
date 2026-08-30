@@ -11,7 +11,7 @@ pub mod types;
 
 pub use error::FileError;
 pub use path_safety::{has_traversal, validate_path, validate_path_for_write};
-pub use routes::{FileRouterState, file_routes};
+pub use routes::{FileRouterState, configured_upload_max_size_bytes, file_routes};
 pub use service::FileService;
 pub use snapshot_service::SnapshotService;
 pub use traits::{

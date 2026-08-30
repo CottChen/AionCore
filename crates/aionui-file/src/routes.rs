@@ -11,6 +11,11 @@ use tower::ServiceExt;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeFile;
 
+use crate::error::FileError;
+use crate::traits::{
+    ClipboardWriterRef, FileServiceRef, ItemRevealerRef, SnapshotServiceRef, SystemFileOpenerRef,
+    UploadWorkspaceResolverRef,
+};
 use aionui_api_types::{
     ApiResponse, ContentMetadataRequest, CopyFilesRequest, CopyFilesResponse, DirOrFileResponse,
     FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, GetFileMetadataRequest,
@@ -21,17 +26,13 @@ use aionui_api_types::{
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
-use aionui_common::constants::UPLOAD_MAX_SIZE;
-
-use crate::error::FileError;
-use crate::traits::{
-    ClipboardWriterRef, FileServiceRef, ItemRevealerRef, SnapshotServiceRef, SystemFileOpenerRef,
-    UploadWorkspaceResolverRef,
-};
 
 /// Request-body cap for `PUT /api/fs/content`, aligned with the 256 MB read cap
 /// so large files can be saved (the 10 MB global limit would otherwise 413).
 const CONTENT_MAX_SIZE: usize = 256 * 1024 * 1024;
+const UPLOAD_MAX_SIZE_MB_ENV: &str = "AIONUI_UPLOAD_MAX_SIZE_MB";
+const DEFAULT_UPLOAD_MAX_SIZE_MB: usize = 30;
+const BYTES_PER_MB: usize = 1024 * 1024;
 use crate::types::{
     CompareResult, CopyResult, DirOrFile, FileChangeInfo, FileMetadata, SnapshotInfo, SnapshotMode, WorkspaceFlatFile,
 };
@@ -102,6 +103,57 @@ pub struct FileRouterState {
     /// managed conversation workspaces, or caller-owned project roots, but not
     /// arbitrary home-directory files.
     pub upload_roots: Vec<std::path::PathBuf>,
+    /// Multipart request-body limit resolved once during application startup.
+    pub upload_max_size_bytes: usize,
+}
+
+fn parse_upload_max_size_bytes(raw: &str) -> Option<usize> {
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|size_mb| *size_mb > 0)
+        .and_then(|size_mb| size_mb.checked_mul(BYTES_PER_MB))
+}
+
+fn resolve_upload_max_size_bytes(raw: Option<&str>) -> usize {
+    raw.and_then(parse_upload_max_size_bytes)
+        .unwrap_or(DEFAULT_UPLOAD_MAX_SIZE_MB * BYTES_PER_MB)
+}
+
+/// Resolve the upload cap from `AIONUI_UPLOAD_MAX_SIZE_MB`.
+///
+/// Invalid values fall back to 30 MB so a typo cannot disable uploads or
+/// accidentally remove the request-body guard.
+pub fn configured_upload_max_size_bytes() -> usize {
+    match std::env::var(UPLOAD_MAX_SIZE_MB_ENV) {
+        Ok(raw) => match parse_upload_max_size_bytes(&raw) {
+            Some(bytes) => {
+                tracing::info!(
+                    env = UPLOAD_MAX_SIZE_MB_ENV,
+                    max_size_mb = bytes / BYTES_PER_MB,
+                    "file upload limit configured"
+                );
+                bytes
+            }
+            None => {
+                tracing::warn!(
+                    env = UPLOAD_MAX_SIZE_MB_ENV,
+                    default_size_mb = DEFAULT_UPLOAD_MAX_SIZE_MB,
+                    "invalid file upload limit; using default"
+                );
+                resolve_upload_max_size_bytes(None)
+            }
+        },
+        Err(std::env::VarError::NotPresent) => resolve_upload_max_size_bytes(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                env = UPLOAD_MAX_SIZE_MB_ENV,
+                default_size_mb = DEFAULT_UPLOAD_MAX_SIZE_MB,
+                "non-Unicode file upload limit; using default"
+            );
+            resolve_upload_max_size_bytes(None)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +164,7 @@ pub struct FileRouterState {
 ///
 /// All routes require authentication (applied by the caller).
 pub fn file_routes(state: FileRouterState) -> Router {
-    // Upload route carries its own body-size limit (UPLOAD_MAX_SIZE, 30 MB).
+    // Upload route carries its own configurable body-size limit.
     // We first disable the global `DefaultBodyLimit` that `aionui-app`
     // installs (otherwise the `Multipart` extractor would cap the body at
     // `BODY_LIMIT`), then apply `RequestBodyLimitLayer` as the sole hard
@@ -120,7 +172,7 @@ pub fn file_routes(state: FileRouterState) -> Router {
     let upload_router = Router::new()
         .route("/api/fs/upload", post(upload_file))
         .layer(DefaultBodyLimit::disable())
-        .layer(RequestBodyLimitLayer::new(UPLOAD_MAX_SIZE))
+        .layer(RequestBodyLimitLayer::new(state.upload_max_size_bytes))
         .with_state(state.clone());
 
     // Content endpoint (ChatFileRef identity). PUT carries the full file body,
@@ -967,6 +1019,27 @@ fn to_compare_response(r: CompareResult) -> SnapshotCompareResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_limit_parses_positive_megabytes() {
+        assert_eq!(parse_upload_max_size_bytes("64"), Some(64 * BYTES_PER_MB));
+        assert_eq!(parse_upload_max_size_bytes(" 2 "), Some(2 * BYTES_PER_MB));
+    }
+
+    #[test]
+    fn upload_limit_rejects_values_that_cannot_form_a_positive_byte_limit() {
+        for raw in ["", "0", "-1", "invalid", "18446744073709551615"] {
+            assert_eq!(parse_upload_max_size_bytes(raw), None, "raw value: {raw}");
+        }
+    }
+
+    #[test]
+    fn upload_limit_defaults_when_not_set_or_invalid() {
+        let default = DEFAULT_UPLOAD_MAX_SIZE_MB * BYTES_PER_MB;
+        assert_eq!(resolve_upload_max_size_bytes(None), default);
+        assert_eq!(resolve_upload_max_size_bytes(Some("0")), default);
+        assert_eq!(resolve_upload_max_size_bytes(Some("invalid")), default);
+    }
 
     #[test]
     fn file_path_outside_sandbox_maps_to_explicit_api_code() {

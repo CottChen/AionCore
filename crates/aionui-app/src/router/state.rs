@@ -29,7 +29,7 @@ use aionui_extension::{
     HubIndexManager, HubInstaller, HubRouterState, SkillRouterState, resolve_install_target_dir_for_data_dir,
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
-use aionui_file::{FileRouterState, FileService, SnapshotService};
+use aionui_file::{FileRouterState, FileService, SnapshotService, configured_upload_max_size_bytes};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -517,6 +517,7 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         clipboard,
         allowed_roots,
         upload_roots,
+        upload_max_size_bytes: configured_upload_max_size_bytes(),
     })
 }
 
