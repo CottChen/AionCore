@@ -653,6 +653,15 @@ async fn admin_delete_user_handler(
     if id == current_user.id || id == "system_default_user" {
         return Err(ApiError::BadRequest("Cannot delete the current or system user".into()));
     }
+    if state
+        .user_repo
+        .find_by_id(&id)
+        .await
+        .map_err(db_error_to_api_error)?
+        .is_some_and(|user| user.is_admin)
+    {
+        return Err(ApiError::Forbidden("Administrator users cannot be deleted".into()));
+    }
     state.user_repo.delete_user(&id).await.map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(())))
 }
@@ -668,6 +677,15 @@ async fn admin_reset_password_handler(
         .map(|Json(req)| req.new_password)
         .unwrap_or_else(|| generate_password(16));
     validate_password(&password)?;
+    if state
+        .user_repo
+        .find_by_id(&id)
+        .await
+        .map_err(db_error_to_api_error)?
+        .is_some_and(|user| user.is_admin)
+    {
+        return Err(ApiError::Forbidden("Administrator passwords must be changed by the user".into()));
+    }
     let hash = tokio::task::spawn_blocking({
         let password = password.clone();
         move || hash_password(&password)
