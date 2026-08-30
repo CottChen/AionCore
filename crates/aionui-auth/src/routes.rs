@@ -633,7 +633,11 @@ async fn admin_create_user_handler(
     let hash = tokio::task::spawn_blocking(move || hash_password(&password))
         .await
         .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
-    let user = state.user_repo.create_user(&req.username, &hash).await.map_err(db_error_to_api_error)?;
+    let user = state
+        .user_repo
+        .create_user(&req.username, &hash)
+        .await
+        .map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(AdminUserView {
         id: user.id,
         username: user.username,
@@ -684,15 +688,21 @@ async fn admin_reset_password_handler(
         .map_err(db_error_to_api_error)?
         .is_some_and(|user| user.is_admin)
     {
-        return Err(ApiError::Forbidden("Administrator passwords must be changed by the user".into()));
+        return Err(ApiError::Forbidden(
+            "Administrator passwords must be changed by the user".into(),
+        ));
     }
     let hash = tokio::task::spawn_blocking({
         let password = password.clone();
         move || hash_password(&password)
     })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
+    state
+        .user_repo
+        .update_password(&id, &hash)
         .await
-        .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
-    state.user_repo.update_password(&id, &hash).await.map_err(db_error_to_api_error)?;
+        .map_err(db_error_to_api_error)?;
     Ok(Json(ApiResponse::ok(AdminResetPasswordResponse {
         new_password: password,
     })))

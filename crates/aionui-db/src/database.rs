@@ -403,10 +403,7 @@ async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<
                 no_tx: DB_MIGRATOR.no_tx,
             };
             compatible_migrator.set_ignore_missing(true);
-            compatible_migrator
-                .run(&mut *conn)
-                .await
-                .map_err(DbError::Migration)
+            compatible_migrator.run(&mut *conn).await.map_err(DbError::Migration)
         }
         Err(e) if is_migrations_table_unique_conflict(&e) => {
             warn!("Concurrent migrator detected (UNIQUE conflict on _sqlx_migrations); retrying");
@@ -491,22 +488,20 @@ async fn ensure_schema_columns(pool: &SqlitePool) -> Result<(), DbError> {
 /// The column is intentionally repaired before SQLx migrations run so both
 /// v0.1.50 databases and databases created by newer clients can be opened.
 async fn ensure_user_role_schema(pool: &SqlitePool) -> Result<(), DbError> {
-    let table_exists: bool = sqlx::query_scalar(
-        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='users'",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::Query)?;
+    let table_exists: bool =
+        sqlx::query_scalar("SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='users'")
+            .fetch_one(pool)
+            .await
+            .map_err(DbError::Query)?;
     if !table_exists {
         return Ok(());
     }
 
-    let has_is_admin: bool = sqlx::query_scalar(
-        "SELECT COUNT(*) > 0 FROM pragma_table_info('users') WHERE name = 'is_admin'",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(DbError::Query)?;
+    let has_is_admin: bool =
+        sqlx::query_scalar("SELECT COUNT(*) > 0 FROM pragma_table_info('users') WHERE name = 'is_admin'")
+            .fetch_one(pool)
+            .await
+            .map_err(DbError::Query)?;
     if !has_is_admin {
         sqlx::query("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
             .execute(pool)
@@ -835,12 +830,10 @@ mod tests {
     #[tokio::test]
     async fn system_user_is_admin_after_schema_repair() {
         let db = init_database_memory().await.unwrap();
-        let is_admin: bool = sqlx::query_scalar(
-            "SELECT is_admin FROM users WHERE id = 'system_default_user'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
+        let is_admin: bool = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = 'system_default_user'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
 
         assert!(is_admin);
     }
