@@ -683,8 +683,8 @@ async fn align_reconciled_mcp_migration_checksum(conn: &mut sqlx::SqliteConnecti
 async fn ensure_system_user(pool: &SqlitePool) -> Result<(), DbError> {
     let now = aionui_common::now_ms();
     sqlx::query(
-        "INSERT OR IGNORE INTO users (id, username, password_hash, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO users (id, username, is_admin, password_hash, created_at, updated_at) \
+         VALUES (?, ?, 1, ?, ?, ?)",
     )
     .bind("system_default_user")
     .bind("admin")
