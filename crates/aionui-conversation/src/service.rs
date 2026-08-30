@@ -1766,7 +1766,14 @@ impl ConversationService {
             pinned: query.pinned,
         };
 
-        let result = self.conversation_repo.list_paginated(user_id, &filters).await?;
+        let result = self
+            .conversation_repo
+            .list_paginated(user_id, &filters)
+            .await
+            .map_err(|err| {
+                error!(error = %ErrorChain(&err), "Failed to query conversation list");
+                err
+            })?;
 
         // Tolerate per-row deserialization failures — a single legacy row
         // (e.g. an abandoned agent_type='gemini' conversation post-migration)
@@ -1789,7 +1796,13 @@ impl ConversationService {
             self.backfill_extra_inplace(&row_id, &mut extra).await;
             match row_to_response_with_extra(row, extra, &self.workspace_root) {
                 Ok(mut resp) => {
-                    self.attach_assistant_identity(&mut resp).await?;
+                    if let Err(err) = self.attach_assistant_identity(&mut resp).await {
+                        warn!(
+                            conversation_id = %row_id,
+                            error = %ErrorChain(&err),
+                            "Skipping unavailable assistant identity while listing conversation"
+                        );
+                    }
                     items.push(resp);
                 }
                 Err(err) => warn!(

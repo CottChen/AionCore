@@ -362,7 +362,7 @@ fn platform_to_source(platform: PluginType) -> ConversationSource {
         PluginType::Dingtalk => ConversationSource::Dingtalk,
         PluginType::Weixin => ConversationSource::Weixin,
         // Reserved variants default to Aionui
-        PluginType::Slack | PluginType::Discord => ConversationSource::Aionui,
+        PluginType::Wecom | PluginType::Slack | PluginType::Discord => ConversationSource::Aionui,
     }
 }
 
@@ -401,6 +401,7 @@ fn channel_conversation_name(
         PluginType::Lark => "lark",
         PluginType::Dingtalk => "ding",
         PluginType::Weixin => "wx",
+        PluginType::Wecom => "wecom",
         PluginType::Slack => "slack",
         PluginType::Discord => "discord",
     };

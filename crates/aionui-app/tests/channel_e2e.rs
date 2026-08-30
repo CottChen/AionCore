@@ -344,6 +344,20 @@ async fn get_channel_settings_defaults_to_generated_aionrs_assistant() {
 }
 
 #[tokio::test]
+async fn get_wecom_channel_settings_is_supported() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let response = app
+        .oneshot(get_with_token("/api/channel/settings/wecom", &token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["data"]["platform"], "wecom");
+}
+
+#[tokio::test]
 async fn put_channel_assistant_setting_persists_binding() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

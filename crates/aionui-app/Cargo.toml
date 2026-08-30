@@ -53,6 +53,8 @@ reqwest.workspace = true
 rmcp = { version = "1.5", features = ["server", "transport-io", "schemars"] }
 anyhow.workspace = true
 async-trait.workspace = true
+sqlx.workspace = true
+url.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

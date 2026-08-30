@@ -17,8 +17,9 @@ pub use routes::{BrowseRoots, FileRouterState, file_routes};
 pub use service::FileService;
 pub use snapshot_service::SnapshotService;
 pub use traits::{
-    FileServiceRef, FileWatchServiceRef, IFileService, IFileWatchService, ISnapshotService, IUploadWorkspaceResolver,
-    SnapshotServiceRef, UploadWorkspaceResolverRef,
+    ChatFileOperation, ChatFileResolverRef, FileServiceRef, FileWatchServiceRef, IChatFileResolver, IFileService,
+    IFileWatchService, ISnapshotService, IUploadWorkspaceResolver, ResolvedChatFile, SnapshotServiceRef,
+    UploadWorkspaceResolverRef,
 };
 pub use types::{
     CompareResult, ContentUpdateEvent, ContentUpdateOperation, CopyResult, DirOrFile, FileChangeInfo, FileMetadata,

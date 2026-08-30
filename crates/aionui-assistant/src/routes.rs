@@ -5,15 +5,16 @@
 use axum::Router;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, Path, Query, State};
+use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, patch, post};
 
 use aionui_api_types::{
-    ApiResponse, AssistantDetailResponse, AssistantResponse, CreateAssistantRequest, ImportAssistantsRequest,
-    ImportAssistantsResult, SetAssistantStateRequest, UpdateAssistantRequest,
+    ApiResponse, AssistantDetailResponse, AssistantResponse, AssistantSource, CreateAssistantRequest,
+    ImportAssistantsRequest, ImportAssistantsResult, SetAssistantStateRequest, UpdateAssistantRequest,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
 use crate::error::AssistantError;
@@ -51,17 +52,36 @@ impl From<AssistantError> for ApiError {
     }
 }
 
+fn require_admin(user: &CurrentUser) -> Result<(), ApiError> {
+    user.is_admin
+        .then_some(())
+        .ok_or_else(|| ApiError::Forbidden("Administrator access required".to_owned()))
+}
+
+async fn require_visible_assistant(state: &AssistantRouterState, user: &CurrentUser, id: &str) -> Result<(), ApiError> {
+    if user.is_admin || state.service.classify_source(id).await != AssistantSource::User {
+        return Ok(());
+    }
+    Err(ApiError::NotFound(format!("assistant '{id}' not found")))
+}
+
 async fn list(
     State(state): State<AssistantRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<AssistantResponse>>>, ApiError> {
-    let items = state.service.list().await?;
+    let mut items = state.service.list().await?;
+    if !user.is_admin {
+        items.retain(|assistant| assistant.source != AssistantSource::User);
+    }
     Ok(Json(ApiResponse::ok(items)))
 }
 
 async fn create(
     State(state): State<AssistantRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateAssistantRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<AssistantResponse>>), ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let created = state.service.create(req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
@@ -69,18 +89,22 @@ async fn create(
 
 async fn get_one(
     State(state): State<AssistantRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     Query(query): Query<GetAssistantDetailQuery>,
 ) -> Result<Json<ApiResponse<AssistantDetailResponse>>, ApiError> {
+    require_visible_assistant(&state, &user, &id).await?;
     let detail = state.service.get_detail(&id, query.locale.as_deref()).await?;
     Ok(Json(ApiResponse::ok(detail)))
 }
 
 async fn update(
     State(state): State<AssistantRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<UpdateAssistantRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let updated = state.service.update(&id, req).await?;
     Ok(Json(ApiResponse::ok(updated)))
@@ -88,17 +112,21 @@ async fn update(
 
 async fn delete_one(
     State(state): State<AssistantRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    require_admin(&user)?;
     state.service.delete(&id).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn set_state(
     State(state): State<AssistantRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SetAssistantStateRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let resp = state.service.set_state(&id, req).await?;
     Ok(Json(ApiResponse::ok(resp)))
@@ -106,8 +134,10 @@ async fn set_state(
 
 async fn import(
     State(state): State<AssistantRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ImportAssistantsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportAssistantsResult>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state.service.import(req).await?;
     Ok(Json(ApiResponse::ok(result)))
@@ -116,7 +146,12 @@ async fn import(
 /// Serve the raw avatar bytes for an assistant. Content-Type inferred from the
 /// file extension (png/jpg/svg default). Extensions return 404 — the frontend
 /// serves those via `aion-asset://`.
-async fn get_avatar(State(state): State<AssistantRouterState>, Path(id): Path<String>) -> Result<Response, ApiError> {
+async fn get_avatar(
+    State(state): State<AssistantRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    require_visible_assistant(&state, &user, &id).await?;
     let asset = state
         .service
         .avatar_asset(&id)

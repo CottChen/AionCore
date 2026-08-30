@@ -1,5 +1,6 @@
 //! HTTP router assembly for the application.
 
+mod chat_file_resolver;
 mod health;
 mod routes;
 mod runtime_team_tools;

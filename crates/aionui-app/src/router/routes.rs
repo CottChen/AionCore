@@ -4,8 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Json;
-use axum::extract::DefaultBodyLimit;
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Extension, Request};
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -18,12 +17,12 @@ use aionui_api_types::ErrorResponse;
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthRouterState, AuthState, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
+    AuthRouterState, AuthState, CurrentUser, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
 use aionui_channel::weixin_login_route;
-use aionui_common::ApiErrorLogContext;
+use aionui_common::{ApiError, ApiErrorLogContext};
 use aionui_conversation::{conversation_ops_routes, conversation_routes};
 use aionui_cron::cron_routes;
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
@@ -162,6 +161,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     // Remote agent routes protected by auth middleware
     let remote_agent_authenticated = remote_agent_routes(states.remote_agent)
+        .route_layer(middleware::from_fn(require_admin))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Unified agent listing/refresh/test routes protected by auth middleware
@@ -170,6 +170,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     // Connection test routes (Bedrock, Gemini) protected by auth middleware
     let connection_test_authenticated = connection_test_routes(states.connection_test)
+        .route_layer(middleware::from_fn(require_admin))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // File routes protected by auth middleware
@@ -177,43 +178,52 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         file_routes(states.file).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // MCP routes protected by auth middleware
-    let mcp_authenticated =
-        mcp_routes(states.mcp).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let mcp_authenticated = mcp_routes(states.mcp)
+        .route_layer(middleware::from_fn(require_admin))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Extension routes protected by auth middleware
-    let extension_authenticated =
-        extension_routes(states.extension).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let extension_authenticated = extension_routes(states.extension)
+        .route_layer(middleware::from_fn(require_admin))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Hub routes protected by auth middleware
-    let hub_authenticated =
-        hub_routes(states.hub).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let hub_authenticated = hub_routes(states.hub)
+        .route_layer(middleware::from_fn(require_admin))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Skill routes protected by auth middleware
-    let skill_authenticated =
-        skill_routes(states.skill).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let skill_authenticated = skill_routes(states.skill)
+        .route_layer(middleware::from_fn(require_admin))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Channel routes protected by auth middleware
     #[cfg(feature = "weixin")]
     let weixin_login_authenticated = weixin_login_route(states.channel.clone())
+        .route_layer(middleware::from_fn(require_admin))
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
-    let channel_authenticated =
-        channel_routes(states.channel).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let channel_authenticated = channel_routes(states.channel)
+        .route_layer(middleware::from_fn(require_admin))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Team routes protected by auth middleware
     let team_authenticated =
         team_routes(states.team.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Cron routes protected by auth middleware
-    let cron_authenticated =
-        cron_routes(states.cron).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let cron_authenticated = cron_routes(states.cron)
+        .route_layer(middleware::from_fn(require_admin))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Office routes protected by auth middleware
-    let office_authenticated =
-        office_routes(states.office.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let office_authenticated = office_routes(states.office.clone())
+        .route_layer(middleware::from_fn(require_admin))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Shell + STT routes protected by auth middleware
-    let shell_authenticated =
-        shell_routes(states.shell).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let shell_authenticated = shell_routes(states.shell)
+        .route_layer(middleware::from_fn(require_admin))
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Assistant routes protected by auth middleware (T1a skeleton: all
     // handlers return 500 "not implemented"; T1b wires real service)
@@ -300,6 +310,17 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     } else {
         router
     }
+}
+
+async fn require_admin(
+    Extension(user): axum::extract::Extension<CurrentUser>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if !user.is_admin {
+        return Err(ApiError::Forbidden("Administrator access required".to_owned()));
+    }
+    Ok(next.run(request).await)
 }
 
 async fn normalize_boundary_error_response(request: Request, next: Next) -> Response {

@@ -1,4 +1,5 @@
 pub(crate) mod acp;
+mod acp_compat;
 pub(crate) mod cli_detect;
 pub(crate) mod custom_agent_probe;
 pub(crate) mod error;

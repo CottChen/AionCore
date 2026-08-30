@@ -33,14 +33,16 @@ use agent_client_protocol::schema::{
     SetSessionModelResponse,
 };
 use agent_client_protocol::{
-    Agent, ByteStreams, Client, ConnectionTo, Responder, on_receive_notification, on_receive_request,
+    Agent, Client, ConnectionTo, Lines, Responder, on_receive_notification, on_receive_request,
 };
 use aionui_common::ErrorChain;
+use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use tokio::process::{ChildStdin, ChildStdout};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 use tracing::{debug, info, warn};
 
+use crate::protocol::acp_compat;
 use crate::protocol::error::AcpError;
 use crate::protocol::events::{self as stream_event, AgentStreamEvent};
 
@@ -514,7 +516,11 @@ async fn run_sdk_background(
     alive: Arc<AtomicBool>,
     replay_suppression: Arc<AtomicBool>,
 ) {
-    let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+    let incoming = FramedRead::new(stdout, LinesCodec::new())
+        .map_err(std::io::Error::other)
+        .map(|line| line.map(|line| acp_compat::normalize_incoming_line(&line)));
+    let outgoing = SinkExt::<String>::sink_map_err(FramedWrite::new(stdin, LinesCodec::new()), std::io::Error::other);
+    let transport = Lines::new(outgoing, incoming);
 
     // `init_tx` / `ready_tx` are consumed inside the main_fn closure; wrap
     // them in Option so we can .take() without moving out of captured state.

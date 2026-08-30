@@ -23,6 +23,8 @@ async fn fs_endpoints_require_auth() {
         "/api/fs/list",
         "/api/fs/metadata",
         "/api/fs/read",
+        "/api/fs/content",
+        "/api/fs/content/metadata",
         "/api/fs/write",
         "/api/fs/copy",
         "/api/fs/remove",
@@ -144,6 +146,75 @@ async fn list_workspace_files_flat_list() {
     let names: Vec<&str> = data.iter().filter_map(|e| e["name"].as_str()).collect();
     assert!(names.contains(&"a.txt"));
     assert!(names.contains(&"b.txt"));
+}
+
+#[tokio::test]
+async fn ordinary_user_file_operations_are_limited_to_owned_conversation_workspaces() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "ordinary", "StrongP@ss1").await;
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'ordinary'")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let owned = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(owned.path().join("owned.md"), "owned").unwrap();
+    std::fs::write(other.path().join("other.md"), "other").unwrap();
+    let now = aionui_common::now_ms();
+    sqlx::query(
+        "INSERT INTO conversations \
+            (id, user_id, name, type, extra, status, source, pinned, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+    )
+    .bind("ordinary-conversation")
+    .bind(user_id)
+    .bind("Owned")
+    .bind("gemini")
+    .bind(json!({ "workspace": owned.path() }).to_string())
+    .bind("finished")
+    .bind("aionui")
+    .bind(now)
+    .bind(now)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+
+    let own_request = json_with_token("POST", "/api/fs/list", json!({ "root": owned.path() }), &token, &csrf);
+    let own_response = app.clone().oneshot(own_request).await.unwrap();
+    assert_eq!(own_response.status(), StatusCode::OK);
+
+    let other_request = json_with_token("POST", "/api/fs/list", json!({ "root": other.path() }), &token, &csrf);
+    let other_response = app.clone().oneshot(other_request).await.unwrap();
+    assert_eq!(other_response.status(), StatusCode::NOT_FOUND);
+
+    let own_preview = json_with_token(
+        "POST",
+        "/api/fs/content/metadata",
+        json!({ "file": { "kind": "local", "path": owned.path().join("owned.md") } }),
+        &token,
+        &csrf,
+    );
+    assert_eq!(app.clone().oneshot(own_preview).await.unwrap().status(), StatusCode::OK);
+    let other_preview = json_with_token(
+        "POST",
+        "/api/fs/content/metadata",
+        json!({ "file": { "kind": "local", "path": other.path().join("other.md") } }),
+        &token,
+        &csrf,
+    );
+    assert_eq!(
+        app.clone().oneshot(other_preview).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let browse_request = axum::http::Request::builder()
+        .method("GET")
+        .uri("/api/fs/browse")
+        .header("authorization", format!("Bearer {token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let browse_response = app.oneshot(browse_request).await.unwrap();
+    assert_eq!(browse_response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -272,6 +343,104 @@ async fn read_file_returns_content() {
 
     let json = body_json(resp).await;
     assert_eq!(json["data"], "file content here");
+}
+
+#[tokio::test]
+async fn content_endpoints_accept_local_file_refs() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("preview.md");
+    std::fs::write(&file_path, "# preview").unwrap();
+
+    let metadata_req = json_with_token(
+        "POST",
+        "/api/fs/content/metadata",
+        json!({ "file": { "kind": "local", "path": file_path } }),
+        &token,
+        &csrf,
+    );
+    let metadata_resp = app.clone().oneshot(metadata_req).await.unwrap();
+    assert_eq!(metadata_resp.status(), StatusCode::OK);
+    let metadata = body_json(metadata_resp).await;
+    assert_eq!(metadata["data"]["name"], "preview.md");
+
+    let content_req = json_with_token(
+        "POST",
+        "/api/fs/content",
+        json!({ "file": { "kind": "local", "path": file_path }, "encoding": "utf8" }),
+        &token,
+        &csrf,
+    );
+    let content_resp = app.oneshot(content_req).await.unwrap();
+    assert_eq!(content_resp.status(), StatusCode::OK);
+    assert_eq!(body_json(content_resp).await["data"], "# preview");
+}
+
+#[tokio::test]
+async fn project_content_refs_are_scoped_to_the_authenticated_user() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let owner_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+
+    for statement in [
+        "CREATE TABLE projects (project_id TEXT PRIMARY KEY, user_id TEXT NOT NULL)",
+        "CREATE TABLE folders (folder_id TEXT PRIMARY KEY, resource_uri TEXT NOT NULL)",
+        "CREATE TABLE project_explorer (pe_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, owner_user_id TEXT NOT NULL, folder_id TEXT NOT NULL)",
+    ] {
+        sqlx::query(statement).execute(services.database.pool()).await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("owned.md"), "owned").unwrap();
+    let resource_uri = url::Url::from_directory_path(dir.path()).unwrap().to_string();
+    sqlx::query("INSERT INTO folders (folder_id, resource_uri) VALUES ('folder-1', ?)")
+        .bind(resource_uri)
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO projects (project_id, user_id) VALUES ('project-own', ?), ('project-other', 'other-user')",
+    )
+    .bind(&owner_id)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO project_explorer (pe_id, project_id, owner_user_id, folder_id) \
+         VALUES ('pe-own', 'project-own', ?, 'folder-1'), ('pe-other', 'project-other', 'other-user', 'folder-1')",
+    )
+    .bind(&owner_id)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+
+    let own_req = json_with_token(
+        "POST",
+        "/api/fs/content",
+        json!({
+            "file": { "kind": "project", "pe_id": "pe-own", "relative_path": "owned.md" },
+            "encoding": "utf8"
+        }),
+        &token,
+        &csrf,
+    );
+    let own_resp = app.clone().oneshot(own_req).await.unwrap();
+    assert_eq!(own_resp.status(), StatusCode::OK);
+    assert_eq!(body_json(own_resp).await["data"], "owned");
+
+    let other_req = json_with_token(
+        "POST",
+        "/api/fs/content/metadata",
+        json!({ "file": { "kind": "project", "pe_id": "pe-other", "relative_path": "owned.md" } }),
+        &token,
+        &csrf,
+    );
+    let other_resp = app.oneshot(other_req).await.unwrap();
+    assert_eq!(other_resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

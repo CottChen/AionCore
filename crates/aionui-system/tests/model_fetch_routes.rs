@@ -13,6 +13,7 @@ use tower::ServiceExt;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use aionui_auth::CurrentUser;
 use aionui_common::encrypt_string;
 use aionui_db::{
     CreateProviderParams, IProviderRepository, SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository,
@@ -89,6 +90,11 @@ fn post_request(uri: &str, body: serde_json::Value) -> Request<Body> {
         .method("POST")
         .uri(uri)
         .header("content-type", "application/json")
+        .extension(CurrentUser {
+            id: "admin".to_owned(),
+            username: "admin".to_owned(),
+            is_admin: true,
+        })
         .body(Body::from(body.to_string()))
         .unwrap()
 }

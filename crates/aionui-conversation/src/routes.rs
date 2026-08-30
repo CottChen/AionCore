@@ -9,13 +9,15 @@ use axum::routing::{get, patch, post};
 use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
-    MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse,
+    ConversationRatingResponse, ConversationRatingVote, ConversationResponse, CreateConversationRequest,
+    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SubmitConversationRatingRequest, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
-use aionui_common::ApiError;
+use aionui_common::{ApiError, MessagePosition, MessageType, generate_short_id, now_ms};
+use sqlx::Row;
 
 use crate::ConversationError;
 use crate::state::ConversationRouterState;
@@ -113,6 +115,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
+        .route("/api/conversations/{id}/ratings/{answerMessageId}", post(submit_rating))
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
@@ -126,6 +129,115 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/clone", post(clone))
         .route("/api/messages/search", get(search_messages))
         .with_state(state)
+}
+
+#[derive(serde::Deserialize)]
+struct RatingPathParams {
+    id: String,
+    #[serde(rename = "answerMessageId")]
+    answer_message_id: String,
+}
+
+async fn submit_rating(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<RatingPathParams>,
+    body: Result<Json<SubmitConversationRatingRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ConversationRatingResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    state.service.get(&user.id, &params.id).await.map_err(ApiError::from)?;
+
+    match req.vote {
+        ConversationRatingVote::Up if !(6..=10).contains(&req.score) => {
+            return Err(ApiError::BadRequest("like score must be between 6 and 10".to_owned()));
+        }
+        ConversationRatingVote::Down if !(0..=5).contains(&req.score) => {
+            return Err(ApiError::BadRequest("dislike score must be between 0 and 5".to_owned()));
+        }
+        _ => {}
+    }
+
+    let question = state
+        .service
+        .get_message(&user.id, &params.id, &req.question_message_id)
+        .await
+        .map_err(ApiError::from)?;
+    let answer = state
+        .service
+        .get_message(&user.id, &params.id, &params.answer_message_id)
+        .await
+        .map_err(ApiError::from)?;
+    if question.r#type != MessageType::Text || question.position != Some(MessagePosition::Right) {
+        return Err(ApiError::BadRequest(
+            "question_message_id must reference a right-side text message".to_owned(),
+        ));
+    }
+    if answer.r#type != MessageType::Text || answer.position != Some(MessagePosition::Left) {
+        return Err(ApiError::BadRequest(
+            "answer_message_id must reference a left-side text message".to_owned(),
+        ));
+    }
+
+    let vote = match req.vote {
+        ConversationRatingVote::Up => "up",
+        ConversationRatingVote::Down => "down",
+    };
+    let comment = req.comment.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let id = format!("rating_{}", generate_short_id());
+    let now = now_ms();
+    let row = sqlx::query(
+        "INSERT INTO conversation_ratings \
+            (id, user_id, conversation_id, question_message_id, answer_message_id, vote, score, comment, \
+             question_snapshot, answer_snapshot, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(user_id, conversation_id, answer_message_id) DO UPDATE SET \
+            question_message_id = excluded.question_message_id, vote = excluded.vote, score = excluded.score, \
+            comment = excluded.comment, question_snapshot = excluded.question_snapshot, \
+            answer_snapshot = excluded.answer_snapshot, updated_at = excluded.updated_at \
+         RETURNING *",
+    )
+    .bind(&id)
+    .bind(&user.id)
+    .bind(&params.id)
+    .bind(&req.question_message_id)
+    .bind(&params.answer_message_id)
+    .bind(vote)
+    .bind(req.score)
+    .bind(comment)
+    .bind(&req.question_snapshot)
+    .bind(&req.answer_snapshot)
+    .bind(now)
+    .bind(now)
+    .fetch_one(&state.rating_pool)
+    .await
+    .map_err(|error| ApiError::Internal(format!("failed to save conversation rating: {error}")))?;
+
+    let stored_vote: String = row
+        .try_get("vote")
+        .map_err(|error| ApiError::Internal(format!("invalid stored rating: {error}")))?;
+    let vote = match stored_vote.as_str() {
+        "up" => ConversationRatingVote::Up,
+        "down" => ConversationRatingVote::Down,
+        _ => return Err(ApiError::Internal("invalid stored rating vote".to_owned())),
+    };
+    Ok(Json(ApiResponse::ok(ConversationRatingResponse {
+        id: row.try_get("id").map_err(rating_row_error)?,
+        user_id: row.try_get("user_id").map_err(rating_row_error)?,
+        conversation_id: row.try_get("conversation_id").map_err(rating_row_error)?,
+        question_message_id: row.try_get("question_message_id").map_err(rating_row_error)?,
+        answer_message_id: row.try_get("answer_message_id").map_err(rating_row_error)?,
+        vote,
+        score: row.try_get("score").map_err(rating_row_error)?,
+        comment: row.try_get("comment").map_err(rating_row_error)?,
+        question_snapshot: row.try_get("question_snapshot").map_err(rating_row_error)?,
+        answer_snapshot: row.try_get("answer_snapshot").map_err(rating_row_error)?,
+        created_at: row.try_get("created_at").map_err(rating_row_error)?,
+        updated_at: row.try_get("updated_at").map_err(rating_row_error)?,
+    })))
+}
+
+fn rating_row_error(error: sqlx::Error) -> ApiError {
+    ApiError::Internal(format!("invalid stored rating: {error}"))
 }
 
 // ── Handlers ───────────────────────────────────────────────────────

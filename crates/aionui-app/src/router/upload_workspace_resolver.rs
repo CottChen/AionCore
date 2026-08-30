@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aionui_db::{IClientPreferenceRepository, IConversationRepository};
+use aionui_db::{ConversationFilters, IClientPreferenceRepository, IConversationRepository};
 use aionui_file::{FileError, IUploadWorkspaceResolver};
 
 const SAVE_UPLOAD_TO_WORKSPACE_KEY: &str = "upload.saveToWorkspace";
@@ -65,5 +65,53 @@ impl IUploadWorkspaceResolver for AppUploadWorkspaceResolver {
             .ok_or_else(|| FileError::BadRequest("conversation workspace not found".to_owned()))?;
 
         Ok(Some(PathBuf::from(workspace)))
+    }
+
+    async fn authorize_workspace(&self, user_id: &str, workspace: &std::path::Path) -> Result<(), FileError> {
+        let requested =
+            std::fs::canonicalize(workspace).map_err(|_| FileError::NotFound("workspace not found".to_owned()))?;
+        let mut cursor = None;
+
+        loop {
+            let page = self
+                .conversation_repo
+                .list_paginated(
+                    user_id,
+                    &ConversationFilters {
+                        cursor: cursor.clone(),
+                        limit: 100,
+                        ..ConversationFilters::default()
+                    },
+                )
+                .await
+                .map_err(|error| FileError::Internal(format!("failed to authorize workspace: {error}")))?;
+
+            for row in &page.items {
+                let Ok(extra) = serde_json::from_str::<serde_json::Value>(&row.extra) else {
+                    continue;
+                };
+                let Some(path) = extra
+                    .get("workspace")
+                    .or_else(|| extra.get("workspacePath"))
+                    .or_else(|| extra.get("workspace_path"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                if std::fs::canonicalize(path).is_ok_and(|owned| owned == requested) {
+                    return Ok(());
+                }
+            }
+
+            if !page.has_more {
+                break;
+            }
+            cursor = page.items.last().map(|row| row.id.clone());
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Err(FileError::NotFound("workspace not found".to_owned()))
     }
 }

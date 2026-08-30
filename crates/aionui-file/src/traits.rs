@@ -6,6 +6,32 @@ use aionui_common::FileChangeOperation;
 use crate::error::FileError;
 
 use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotInfo, WorkspaceFlatFile, ZipEntry};
+use aionui_api_types::ChatFileRef;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatFileOperation {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedChatFile {
+    pub path: PathBuf,
+    pub root: PathBuf,
+}
+
+#[async_trait::async_trait]
+pub trait IChatFileResolver: Send + Sync {
+    async fn resolve(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        file: &ChatFileRef,
+        operation: ChatFileOperation,
+    ) -> Result<ResolvedChatFile, FileError>;
+}
+
+pub type ChatFileResolverRef = Arc<dyn IChatFileResolver>;
 
 /// Resolves whether an authenticated conversation upload should be stored in
 /// its workspace. Composition-layer implementations own preference and
@@ -18,6 +44,13 @@ pub trait IUploadWorkspaceResolver: Send + Sync {
         conversation_id: &str,
         force_workspace: bool,
     ) -> Result<Option<PathBuf>, FileError>;
+
+    /// Verify that a workspace belongs to at least one conversation owned by
+    /// the authenticated user.
+    async fn authorize_workspace(&self, user_id: &str, workspace: &Path) -> Result<(), FileError> {
+        let _ = (user_id, workspace);
+        Err(FileError::NotFound("workspace not found".to_owned()))
+    }
 }
 
 pub type UploadWorkspaceResolverRef = Arc<dyn IUploadWorkspaceResolver>;

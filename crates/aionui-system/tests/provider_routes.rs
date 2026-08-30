@@ -13,6 +13,7 @@ use http_body_util::BodyExt;
 use serde_json::json;
 use tower::ServiceExt;
 
+use aionui_auth::CurrentUser;
 use aionui_db::{
     SqliteClientPreferenceRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
     SqliteSettingsRepository, init_database_memory,
@@ -27,6 +28,14 @@ use aionui_system::{
 // ---------------------------------------------------------------------------
 
 const TEST_ENCRYPTION_KEY: [u8; 32] = [0x42; 32];
+
+fn admin_user() -> CurrentUser {
+    CurrentUser {
+        id: "admin".to_owned(),
+        username: "admin".to_owned(),
+        is_admin: true,
+    }
+}
 
 fn build_state(db: &aionui_db::Database) -> SystemRouterState {
     let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
@@ -57,7 +66,12 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 }
 
 fn get_request(uri: &str) -> Request<Body> {
-    Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .extension(admin_user())
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn json_request(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
@@ -65,6 +79,7 @@ fn json_request(method: &str, uri: &str, body: serde_json::Value) -> Request<Bod
         .method(method)
         .uri(uri)
         .header("content-type", "application/json")
+        .extension(admin_user())
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
 }
@@ -73,6 +88,7 @@ fn delete_request(uri: &str) -> Request<Body> {
     Request::builder()
         .method("DELETE")
         .uri(uri)
+        .extension(admin_user())
         .body(Body::empty())
         .unwrap()
 }
@@ -131,6 +147,39 @@ async fn list_providers_returns_plaintext_api_key() {
     // Pre-launch: api_key is returned plaintext on the wire (encrypted at rest).
     assert_eq!(api_key, "sk-ant-api03-test1234");
     assert!(!api_key.contains("***"));
+}
+
+#[tokio::test]
+async fn non_admin_can_use_provider_catalog_without_reading_or_mutating_secrets() {
+    let (_app, db) = setup().await;
+    create_one(&db).await;
+    let user = CurrentUser {
+        id: "ordinary-user".to_owned(),
+        username: "ordinary".to_owned(),
+        is_admin: false,
+    };
+
+    let list_request = Request::builder()
+        .method("GET")
+        .uri("/api/providers")
+        .extension(user.clone())
+        .body(Body::empty())
+        .unwrap();
+    let list_response = system_routes(build_state(&db)).oneshot(list_request).await.unwrap();
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let list_json = body_json(list_response).await;
+    assert_eq!(list_json["data"][0]["api_key"], "");
+    assert!(list_json["data"][0].get("bedrock_config").is_none());
+
+    let create_request = Request::builder()
+        .method("POST")
+        .uri("/api/providers")
+        .header("content-type", "application/json")
+        .extension(user)
+        .body(Body::from(serde_json::to_vec(&sample_create_body()).unwrap()))
+        .unwrap();
+    let create_response = system_routes(build_state(&db)).oneshot(create_request).await.unwrap();
+    assert_eq!(create_response.status(), StatusCode::FORBIDDEN);
 }
 
 // ===========================================================================

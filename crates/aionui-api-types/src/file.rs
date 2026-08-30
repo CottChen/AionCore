@@ -1,6 +1,35 @@
 use aionui_common::FileChangeOperation;
 use serde::{Deserialize, Serialize};
 
+use crate::chat_file::ChatFileRef;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContentEncoding {
+    #[default]
+    Utf8,
+    Base64,
+    DataUrl,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReadContentRequest {
+    pub file: ChatFileRef,
+    #[serde(default)]
+    pub encoding: ContentEncoding,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WriteContentRequest {
+    pub file: ChatFileRef,
+    pub data: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContentMetadataRequest {
+    pub file: ChatFileRef,
+}
+
 // ---------------------------------------------------------------------------
 // A. Core file operations — Request DTOs
 // ---------------------------------------------------------------------------

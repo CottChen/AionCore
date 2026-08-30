@@ -49,6 +49,7 @@ use aionui_team::{
 };
 
 use crate::config::derive_encryption_key;
+use crate::router::chat_file_resolver::AppChatFileResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::router::upload_workspace_resolver::AppUploadWorkspaceResolver;
 use crate::services::AppServices;
@@ -414,6 +415,7 @@ pub fn build_conversation_state(
         service: conversation_service,
         task_manager: services.worker_task_manager.clone(),
         active_leases: services.active_lease_registry.clone(),
+        rating_pool: services.database.pool().clone(),
     }
 }
 
@@ -445,6 +447,7 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
     let preference_repo = Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone()));
     Ok(FileRouterState {
         file_service,
+        chat_file_resolver: Arc::new(AppChatFileResolver::new(services.database.pool().clone())),
         upload_workspace_resolver: Arc::new(AppUploadWorkspaceResolver::new(
             services.conversation_repo.clone(),
             preference_repo,

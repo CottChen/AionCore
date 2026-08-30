@@ -123,6 +123,40 @@ pub struct CancelConversationResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ConversationRatingVote {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SubmitConversationRatingRequest {
+    pub question_message_id: String,
+    pub vote: ConversationRatingVote,
+    pub score: i64,
+    #[serde(default)]
+    pub comment: Option<String>,
+    pub question_snapshot: String,
+    pub answer_snapshot: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationRatingResponse {
+    pub id: String,
+    pub user_id: String,
+    pub conversation_id: String,
+    pub question_message_id: String,
+    pub answer_message_id: String,
+    pub vote: ConversationRatingVote,
+    pub score: i64,
+    pub comment: Option<String>,
+    pub question_snapshot: String,
+    pub answer_snapshot: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ConversationRuntimeStateKind {
     Idle,
     Starting,

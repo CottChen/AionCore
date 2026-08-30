@@ -102,6 +102,12 @@ pub fn settings_routes(state: SystemRouterState) -> Router {
     system_routes(state)
 }
 
+fn require_admin(user: &CurrentUser) -> Result<(), ApiError> {
+    user.is_admin
+        .then_some(())
+        .ok_or_else(|| ApiError::Forbidden("Administrator access required".to_owned()))
+}
+
 // ===========================================================================
 // Settings handlers
 // ===========================================================================
@@ -128,8 +134,10 @@ async fn get_feedback_diagnostics(
 
 async fn update_settings(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<UpdateSettingsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SystemSettingsResponse>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let settings = state
         .settings_service
@@ -171,8 +179,10 @@ async fn get_client_preferences(
 
 async fn update_client_preferences(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<UpdateClientPreferencesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     state
         .client_pref_service
@@ -188,15 +198,24 @@ async fn update_client_preferences(
 
 async fn list_providers(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<ProviderResponse>>>, ApiError> {
-    let providers = state.provider_service.list().await.map_err(ApiError::from)?;
+    let mut providers = state.provider_service.list().await.map_err(ApiError::from)?;
+    if !user.is_admin {
+        for provider in &mut providers {
+            provider.api_key.clear();
+            provider.bedrock_config = None;
+        }
+    }
     Ok(Json(ApiResponse::ok(providers)))
 }
 
 async fn create_provider(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateProviderRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ProviderResponse>>), ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let provider = state.provider_service.create(req).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(provider))))
@@ -204,9 +223,11 @@ async fn create_provider(
 
 async fn update_provider(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<UpdateProviderRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderResponse>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let provider = state.provider_service.update(&id, req).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(provider)))
@@ -214,17 +235,21 @@ async fn update_provider(
 
 async fn delete_provider(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    require_admin(&user)?;
     state.provider_service.delete(&id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn fetch_models(
     State(state): State<SystemRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<FetchModelsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FetchModelsResponse>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     let result = state
         .model_fetch_service

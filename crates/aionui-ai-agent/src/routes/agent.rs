@@ -40,6 +40,12 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
         .with_state(state)
 }
 
+fn require_admin(user: &CurrentUser) -> Result<(), ApiError> {
+    user.is_admin
+        .then_some(())
+        .ok_or_else(|| ApiError::Forbidden("Administrator access required".to_owned()))
+}
+
 async fn list_agent_logos(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
@@ -55,8 +61,9 @@ async fn list_agent_logos(
 
 async fn list_management_agents(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<Vec<AgentManagementRow>>>, ApiError> {
+    require_admin(&user)?;
     Ok(Json(ApiResponse::ok(
         state
             .service
@@ -68,9 +75,10 @@ async fn list_management_agents(
 
 async fn health_check_by_id(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<AgentManagementRow>>, ApiError> {
+    require_admin(&user)?;
     Ok(Json(ApiResponse::ok(
         state
             .service
@@ -82,9 +90,10 @@ async fn health_check_by_id(
 
 async fn provider_health_check(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ProviderHealthCheckRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ProviderHealthCheckResponse>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
@@ -97,9 +106,10 @@ async fn provider_health_check(
 
 async fn try_connect_custom(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<TryConnectCustomAgentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TryConnectCustomAgentResponse>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
@@ -112,9 +122,10 @@ async fn try_connect_custom(
 
 async fn create_custom(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<CustomAgentUpsertRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentMetadata>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
@@ -127,10 +138,11 @@ async fn create_custom(
 
 async fn update_custom(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<CustomAgentUpsertRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentMetadata>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
@@ -143,9 +155,10 @@ async fn update_custom(
 
 async fn delete_custom(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<DeleteCustomAgentResponse>>, ApiError> {
+    require_admin(&user)?;
     state
         .service
         .delete_custom_agent(&id)
@@ -156,10 +169,11 @@ async fn delete_custom(
 
 async fn set_agent_enabled(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SetEnabledRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentMetadata>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state
@@ -172,9 +186,10 @@ async fn set_agent_enabled(
 
 async fn get_agent_overrides(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<AgentOverridesResponse>>, ApiError> {
+    require_admin(&user)?;
     Ok(Json(ApiResponse::ok(
         state
             .service
@@ -186,10 +201,11 @@ async fn get_agent_overrides(
 
 async fn set_agent_overrides(
     State(state): State<AgentRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
     body: Result<Json<SetAgentOverridesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentManagementRow>>, ApiError> {
+    require_admin(&user)?;
     let Json(req) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         state

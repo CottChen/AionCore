@@ -92,6 +92,164 @@ async fn provider_full_crud_with_auth() {
 }
 
 #[tokio::test]
+async fn ordinary_user_can_use_sanitized_catalog_but_cannot_manage_global_resources() {
+    let (mut app, services) = build_app().await;
+    let (admin_token, admin_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let create = json_with_token(
+        "POST",
+        "/api/providers",
+        json!({
+            "platform": "anthropic",
+            "name": "Anthropic",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "secret-key"
+        }),
+        &admin_token,
+        &admin_csrf,
+    );
+    assert_eq!(app.clone().oneshot(create).await.unwrap().status(), StatusCode::CREATED);
+
+    let (token, csrf) = setup_and_login(&mut app, &services, "ordinary", "StrongP@ss2").await;
+    let catalog = app
+        .clone()
+        .oneshot(get_with_token("/api/providers", &token))
+        .await
+        .unwrap();
+    assert_eq!(catalog.status(), StatusCode::OK);
+    let catalog = body_json(catalog).await;
+    assert_eq!(catalog["data"][0]["api_key"], "");
+    assert!(catalog["data"][0].get("bedrock_config").is_none());
+
+    let create = json_with_token(
+        "POST",
+        "/api/providers",
+        json!({
+            "platform": "openai",
+            "name": "Blocked",
+            "base_url": "https://api.openai.com",
+            "api_key": "blocked"
+        }),
+        &token,
+        &csrf,
+    );
+    assert_eq!(
+        app.clone().oneshot(create).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(get_with_token("/api/mcp/servers", &token))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(get_with_token("/api/channel/plugins", &token))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(get_with_token("/api/assistants", &token))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let create_assistant = json_with_token("POST", "/api/assistants", json!({}), &token, &csrf);
+    assert_eq!(
+        app.clone().oneshot(create_assistant).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        app.oneshot(get_with_token("/api/conversations", &token))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn conversation_rating_is_upserted_and_scoped_to_the_conversation_owner() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let now = aionui_common::now_ms();
+    sqlx::query(
+        "INSERT INTO conversations \
+            (id, user_id, name, type, extra, status, source, pinned, created_at, updated_at) \
+         VALUES ('rating-conversation', ?, 'Rating', 'gemini', '{}', 'finished', 'aionui', 0, ?, ?)",
+    )
+    .bind(&user_id)
+    .bind(now)
+    .bind(now)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO messages (id, conversation_id, type, content, position, status, created_at) VALUES \
+            ('question', 'rating-conversation', 'text', '\"Question\"', 'right', 'finish', ?), \
+            ('answer', 'rating-conversation', 'text', '\"Answer\"', 'left', 'finish', ?)",
+    )
+    .bind(now)
+    .bind(now + 1)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+
+    let submit = |score| {
+        json_with_token(
+            "POST",
+            "/api/conversations/rating-conversation/ratings/answer",
+            json!({
+                "question_message_id": "question",
+                "vote": "up",
+                "score": score,
+                "question_snapshot": "Question",
+                "answer_snapshot": "Answer"
+            }),
+            &token,
+            &csrf,
+        )
+    };
+    let first = app.clone().oneshot(submit(8)).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(body_json(first).await["data"]["score"], 8);
+    let updated = app.clone().oneshot(submit(10)).await.unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(body_json(updated).await["data"]["score"], 10);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_ratings")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let (other_token, other_csrf) = setup_and_login(&mut app, &services, "other", "StrongP@ss2").await;
+    let cross_user = json_with_token(
+        "POST",
+        "/api/conversations/rating-conversation/ratings/answer",
+        json!({
+            "question_message_id": "question",
+            "vote": "down",
+            "score": 2,
+            "question_snapshot": "Question",
+            "answer_snapshot": "Answer"
+        }),
+        &other_token,
+        &other_csrf,
+    );
+    assert_eq!(app.oneshot(cross_user).await.unwrap().status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn provider_create_validation_with_auth() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

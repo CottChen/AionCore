@@ -1034,6 +1034,37 @@ mod tests {
         (repo, db)
     }
 
+    #[tokio::test]
+    async fn list_paginated_tolerates_newer_conversation_columns() {
+        let (repo, db) = setup().await;
+        for statement in [
+            "ALTER TABLE conversations ADD COLUMN project_id TEXT",
+            "ALTER TABLE conversations ADD COLUMN folder_id TEXT",
+            "ALTER TABLE conversations ADD COLUMN name_source TEXT",
+        ] {
+            sqlx::query(statement).execute(db.pool()).await.unwrap();
+        }
+        let row = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&row).await.unwrap();
+
+        let result = repo
+            .list_paginated(
+                SYSTEM_USER_ID,
+                &ConversationFilters {
+                    cursor: None,
+                    limit: 20,
+                    source: None,
+                    cron_job_id: None,
+                    pinned: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].id, row.id);
+    }
+
     fn sample_conversation(user_id: &str) -> ConversationRow {
         let now = aionui_common::now_ms();
         ConversationRow {

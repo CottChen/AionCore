@@ -3,25 +3,32 @@
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, Query, State};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, post};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use aionui_api_types::{
-    ApiResponse, BrowseDirectoryQuery, BrowseDirectoryResponse, CancelZipRequest, CopyFilesRequest, CopyFilesResponse,
-    CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse,
-    FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest,
-    ReadFileBufferRequest, ReadFileRequest, RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest,
+    ApiResponse, BrowseDirectoryQuery, BrowseDirectoryResponse, CancelZipRequest, ContentEncoding,
+    ContentMetadataRequest, CopyFilesRequest, CopyFilesResponse, CreateTempFileRequest, DirOrFileResponse,
+    FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, FileWatchRequest, GetFileMetadataRequest,
+    GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest, ReadContentRequest, ReadFileBufferRequest,
+    ReadFileRequest, RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest,
     SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest,
-    SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipRequest,
+    SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteContentRequest,
+    WriteFileRequest, ZipRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
 use crate::browse;
 use crate::error::FileError;
-use crate::traits::{FileServiceRef, FileWatchServiceRef, SnapshotServiceRef, UploadWorkspaceResolverRef};
+use crate::traits::{
+    ChatFileOperation, ChatFileResolverRef, FileServiceRef, FileWatchServiceRef, SnapshotServiceRef,
+    UploadWorkspaceResolverRef,
+};
 use crate::types::{
     CompareResult, CopyResult, DirOrFile, FileChangeInfo, FileMetadata, SnapshotInfo, SnapshotMode, WorkspaceFlatFile,
     ZipEntry,
@@ -91,6 +98,7 @@ impl Default for BrowseRoots {
 #[derive(Clone)]
 pub struct FileRouterState {
     pub file_service: FileServiceRef,
+    pub chat_file_resolver: ChatFileResolverRef,
     pub upload_workspace_resolver: UploadWorkspaceResolverRef,
     pub watch_service: FileWatchServiceRef,
     pub snapshot_service: SnapshotServiceRef,
@@ -123,30 +131,16 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .layer(RequestBodyLimitLayer::new(state.upload_max_size_bytes))
         .with_state(state.clone());
 
-    Router::new()
-        // A. Core file operations
+    let privileged_router = Router::new()
         .route("/api/fs/browse", get(browse_directory))
-        .route("/api/fs/dir", post(get_files_by_dir))
-        .route("/api/fs/list", post(list_workspace_files))
-        .route("/api/fs/metadata", post(get_file_metadata))
-        .route("/api/fs/read", post(read_file))
-        .route("/api/fs/read-buffer", post(read_file_buffer))
-        .route("/api/fs/write", post(write_file))
-        .route("/api/fs/copy", post(copy_files))
-        .route("/api/fs/remove", post(remove_entry))
-        .route("/api/fs/rename", post(rename_entry))
         .route("/api/fs/temp", post(create_temp_file))
-        .route("/api/fs/image-base64", post(get_image_base64))
-        .route("/api/fs/fetch-remote-image", post(fetch_remote_image))
         .route("/api/fs/zip", post(create_zip))
         .route("/api/fs/zip/cancel", post(cancel_zip))
-        // D. File watch
         .route("/api/fs/watch/start", post(start_watch))
         .route("/api/fs/watch/stop", post(stop_watch))
         .route("/api/fs/watch/stop-all", post(stop_all_watches))
         .route("/api/fs/office-watch/start", post(start_office_watch))
         .route("/api/fs/office-watch/stop", post(stop_office_watch))
-        // E. Workspace snapshot
         .route("/api/fs/snapshot/init", post(snapshot_init))
         .route("/api/fs/snapshot/info", post(snapshot_info))
         .route("/api/fs/snapshot/compare", post(snapshot_compare))
@@ -159,21 +153,73 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/snapshot/reset", post(snapshot_reset))
         .route("/api/fs/snapshot/branches", post(snapshot_branches))
         .route("/api/fs/snapshot/dispose", post(snapshot_dispose))
+        .route_layer(middleware::from_fn(require_admin))
+        .with_state(state.clone());
+
+    Router::new()
+        // A. Core file operations
+        .route("/api/fs/dir", post(get_files_by_dir))
+        .route("/api/fs/list", post(list_workspace_files))
+        .route("/api/fs/metadata", post(get_file_metadata))
+        .route("/api/fs/read", post(read_file))
+        .route("/api/fs/content", post(read_content).put(write_content))
+        .route("/api/fs/content/metadata", post(content_metadata))
+        .route("/api/fs/read-buffer", post(read_file_buffer))
+        .route("/api/fs/write", post(write_file))
+        .route("/api/fs/copy", post(copy_files))
+        .route("/api/fs/remove", post(remove_entry))
+        .route("/api/fs/rename", post(rename_entry))
+        .route("/api/fs/image-base64", post(get_image_base64))
+        .route("/api/fs/fetch-remote-image", post(fetch_remote_image))
         .with_state(state)
         .merge(upload_router)
+        .merge(privileged_router)
+}
+
+async fn require_admin(
+    Extension(user): Extension<CurrentUser>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if !user.is_admin {
+        return Err(ApiError::Forbidden("Administrator access required".to_owned()));
+    }
+    Ok(next.run(request).await)
 }
 
 // ---------------------------------------------------------------------------
 // A. Core file operations — handlers
 // ---------------------------------------------------------------------------
 
+async fn require_workspace_access(
+    state: &FileRouterState,
+    user: &CurrentUser,
+    workspace: &str,
+) -> Result<(), ApiError> {
+    if user.is_admin {
+        return Ok(());
+    }
+    if workspace.trim().is_empty() {
+        return Err(ApiError::NotFound("workspace not found".to_owned()));
+    }
+    state
+        .upload_workspace_resolver
+        .authorize_workspace(&user.id, Path::new(workspace))
+        .await
+        .map_err(ApiError::from)
+}
+
 /// `GET /api/fs/browse` — shallow directory listing for the WebUI host-file
 /// picker. Runs on the Tokio blocking pool because it does synchronous
 /// filesystem I/O.
 async fn browse_directory(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Query(query): Query<BrowseDirectoryQuery>,
 ) -> Result<Json<ApiResponse<BrowseDirectoryResponse>>, ApiError> {
+    if !user.is_admin {
+        return Err(ApiError::Forbidden("Administrator access required".to_owned()));
+    }
     let show_files = matches!(query.show_files.as_deref(), Some("true") | Some("1"));
     let raw_path = query.path.clone();
     let browse_roots = state.browse_roots.clone();
@@ -190,9 +236,11 @@ async fn browse_directory(
 
 async fn get_files_by_dir(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetFilesByDirRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<DirOrFileResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_workspace_access(&state, &user, &req.root).await?;
     let items = state.file_service.get_files_by_dir(&req.dir, &req.root).await?;
     let response: Vec<DirOrFileResponse> = items.into_iter().map(to_dir_or_file_response).collect();
     Ok(Json(ApiResponse::ok(response)))
@@ -200,6 +248,7 @@ async fn get_files_by_dir(
 
 async fn list_workspace_files(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ListWorkspaceFilesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<WorkspaceFlatFileResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -207,6 +256,7 @@ async fn list_workspace_files(
     if root.is_empty() {
         return Err(ApiError::BadRequest("root is required".to_owned()));
     }
+    require_workspace_access(&state, &user, root).await?;
     let items = state
         .file_service
         .list_workspace_files_with_extra_root(root, Some(Path::new(root)))
@@ -218,9 +268,12 @@ async fn list_workspace_files(
 
 async fn get_file_metadata(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetFileMetadataRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FileMetadataResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = req.workspace.as_deref().unwrap_or_default();
+    require_workspace_access(&state, &user, workspace).await?;
     let meta = state
         .file_service
         .get_file_metadata(&req.path, req.workspace.as_deref().map(Path::new))
@@ -230,9 +283,12 @@ async fn get_file_metadata(
 
 async fn read_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ReadFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = req.workspace.as_deref().unwrap_or_default();
+    require_workspace_access(&state, &user, workspace).await?;
     let content = state
         .file_service
         .read_file(&req.path, req.workspace.as_deref().map(Path::new))
@@ -240,11 +296,104 @@ async fn read_file(
     Ok(Json(ApiResponse::ok(content)))
 }
 
+async fn read_content(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ReadContentRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<String>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let resolved = state
+        .chat_file_resolver
+        .resolve(&user.id, user.is_admin, &req.file, ChatFileOperation::Read)
+        .await?;
+    let path = resolved.path.to_string_lossy();
+    let root = resolved.root.as_path();
+    let content = match req.encoding {
+        ContentEncoding::Utf8 => state
+            .file_service
+            .read_file(&path, Some(root))
+            .await?
+            .ok_or_else(|| ApiError::NotFound("file not found".to_owned()))?,
+        ContentEncoding::Base64 | ContentEncoding::DataUrl => {
+            use base64::Engine;
+            let bytes = state
+                .file_service
+                .read_file_buffer(&path, Some(root))
+                .await?
+                .ok_or_else(|| ApiError::NotFound("file not found".to_owned()))?;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            if req.encoding == ContentEncoding::DataUrl {
+                let mime = mime_guess::from_path(&resolved.path).first_or_octet_stream();
+                format!("data:{mime};base64,{encoded}")
+            } else {
+                encoded
+            }
+        }
+    };
+    Ok(Json(ApiResponse::ok(content)))
+}
+
+async fn write_content(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<WriteContentRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<bool>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let resolved = state
+        .chat_file_resolver
+        .resolve(&user.id, user.is_admin, &req.file, ChatFileOperation::Write)
+        .await?;
+    if let Some(expected) = headers
+        .get(axum::http::header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok())
+    {
+        let current = state
+            .file_service
+            .get_file_metadata(&resolved.path.to_string_lossy(), Some(&resolved.root))
+            .await?
+            .last_modified;
+        if current != expected {
+            return Err(ApiError::Conflict("file changed on disk since last read".to_owned()));
+        }
+    }
+    let written = state
+        .file_service
+        .write_file(
+            &resolved.path.to_string_lossy(),
+            req.data.as_bytes(),
+            &resolved.root.to_string_lossy(),
+        )
+        .await?;
+    Ok(Json(ApiResponse::ok(written)))
+}
+
+async fn content_metadata(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ContentMetadataRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<FileMetadataResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let resolved = state
+        .chat_file_resolver
+        .resolve(&user.id, user.is_admin, &req.file, ChatFileOperation::Read)
+        .await?;
+    let meta = state
+        .file_service
+        .get_file_metadata(&resolved.path.to_string_lossy(), Some(&resolved.root))
+        .await?;
+    Ok(Json(ApiResponse::ok(to_metadata_response(meta))))
+}
+
 async fn read_file_buffer(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ReadFileBufferRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = req.workspace.as_deref().unwrap_or_default();
+    require_workspace_access(&state, &user, workspace).await?;
     let data = state
         .file_service
         .read_file_buffer(&req.path, req.workspace.as_deref().map(Path::new))
@@ -259,6 +408,7 @@ async fn read_file_buffer(
 
 async fn write_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<WriteFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -268,6 +418,7 @@ async fn write_file(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
+    require_workspace_access(&state, &user, &workspace).await?;
     let ok = state
         .file_service
         .write_file(&req.path, req.data.as_bytes(), &workspace)
@@ -277,9 +428,24 @@ async fn write_file(
 
 async fn copy_files(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<CopyFilesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CopyFilesResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_workspace_access(&state, &user, &req.workspace).await?;
+    if !user.is_admin {
+        for path in &req.file_paths {
+            state
+                .chat_file_resolver
+                .resolve(
+                    &user.id,
+                    false,
+                    &aionui_api_types::ChatFileRef::Upload { path: path.clone() },
+                    ChatFileOperation::Read,
+                )
+                .await?;
+        }
+    }
     let result = state
         .file_service
         .copy_files_to_workspace(&req.file_paths, &req.workspace, req.source_root.as_deref())
@@ -289,6 +455,7 @@ async fn copy_files(
 
 async fn remove_entry(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<RemoveEntryRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -298,12 +465,14 @@ async fn remove_entry(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
+    require_workspace_access(&state, &user, &workspace).await?;
     state.file_service.remove_entry(&req.path, &workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn rename_entry(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<RenameRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RenameResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -313,6 +482,7 @@ async fn rename_entry(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
+    require_workspace_access(&state, &user, &workspace).await?;
     let new_path = state
         .file_service
         .rename_entry_with_extra_root(&req.path, &req.new_name, Some(Path::new(&workspace)))
@@ -322,8 +492,12 @@ async fn rename_entry(
 
 async fn create_temp_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateTempFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
+    if !user.is_admin {
+        return Err(ApiError::Forbidden("Administrator access required".to_owned()));
+    }
     let Json(req) = body.map_err(ApiError::from)?;
     let path = state.file_service.create_temp_file(&req.file_name).await?;
     Ok(Json(ApiResponse::ok(path)))
@@ -463,9 +637,12 @@ async fn upload_file(
 
 async fn get_image_base64(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetImageBase64Request>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = req.workspace.as_deref().unwrap_or_default();
+    require_workspace_access(&state, &user, workspace).await?;
     let data_url = state
         .file_service
         .get_image_base64(&req.path, req.workspace.as_deref().map(Path::new))
