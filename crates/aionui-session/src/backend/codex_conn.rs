@@ -606,37 +606,43 @@ pub fn codex_capabilities() -> Capabilities {
         // can_queue off steer here would be the MX-QUEUE-3 dead button.) Flips true
         // only when B5 wires Steer routing.
         accepts_proactive_input: false,
-        // #101: codex's app-server has no slash-command discovery wire (112 methods
-        // audited, none lists commands — samples/codex-cli/0.137.0/schema-full/
-        // ClientRequest.json). The legacy codex-acp bridge instead advertised a
-        // STATIC 6-command table and translated each to a native op at prompt time
-        // (zed-industries/codex-acp v0.14.0 thread.rs:2894 builtin_commands /
-        // :3252 handle_prompt). We replicate that table here; dispatch(Send)
-        // performs the same slash→native-op translation.
+        // Codex has no unified slash-command discovery wire. Static commands are
+        // adapted locally; per-session native skills are added asynchronously from
+        // `skills/list` and pushed through CatalogUpdated.
         slash_commands: builtin_slash_commands(),
     }
 }
 
-/// The codex-acp bridge's static slash-command table, verbatim
-/// (zed-industries/codex-acp v0.14.0 src/thread.rs:2894-2924 `builtin_commands`;
-/// captured live: samples/codex-acp/0.14.0/freshmode.jsonl). codex itself has no
-/// command-discovery wire, so this is the authoritative catalog for the direct-CLI
-/// path — each entry is translated to its native app-server op in dispatch(Send)
-/// (`route_slash_command`).
+/// Direct-backend command catalog. The native-operation commands preserve the
+/// zed codex-acp table; `/mcp`, `/skills`, and `/status` preserve the installed
+/// `@agentclientprotocol/codex-acp` 1.1.2 adapter. Every advertised entry has a
+/// concrete dispatch path below.
 fn builtin_slash_commands() -> Vec<crate::capability::SlashCommandInfo> {
     use crate::capability::SlashCommandInfo;
     vec![
         SlashCommandInfo {
+            name: "mcp".into(),
+            description: Some("List configured Model Context Protocol (MCP) tools.".into()),
+        },
+        SlashCommandInfo {
+            name: "skills".into(),
+            description: Some("List available skills.".into()),
+        },
+        SlashCommandInfo {
+            name: "status".into(),
+            description: Some("Display session configuration.".into()),
+        },
+        SlashCommandInfo {
             name: "review".into(),
-            description: Some("Review my current changes and find issues".into()),
+            description: Some("Review uncommitted changes, or review with custom instructions.".into()),
         },
         SlashCommandInfo {
             name: "review-branch".into(),
-            description: Some("Review the code changes against a specific branch".into()),
+            description: Some("Review changes relative to a base branch.".into()),
         },
         SlashCommandInfo {
             name: "review-commit".into(),
-            description: Some("Review the code changes introduced by a commit".into()),
+            description: Some("Review a specific commit.".into()),
         },
         SlashCommandInfo {
             name: "init".into(),
@@ -644,13 +650,29 @@ fn builtin_slash_commands() -> Vec<crate::capability::SlashCommandInfo> {
         },
         SlashCommandInfo {
             name: "compact".into(),
-            description: Some("summarize conversation to prevent hitting the context limit".into()),
+            description: Some("Summarize conversation to avoid hitting the context limit.".into()),
+        },
+        SlashCommandInfo {
+            name: "goal".into(),
+            description: Some("Set, pause, resume, or clear a task goal.".into()),
         },
         SlashCommandInfo {
             name: "logout".into(),
-            description: Some("logout of Codex".into()),
+            description: Some("Sign out of Codex.".into()),
         },
     ]
+}
+
+/// Merge the static command table with native codex skills. Builtins win on a
+/// name collision and skill order follows `skills/list`, matching the legacy
+/// `@agentclientprotocol/codex-acp` adapter's `Map`-based catalog construction.
+fn slash_commands_with_skills(
+    skills: &[crate::capability::SlashCommandInfo],
+) -> Vec<crate::capability::SlashCommandInfo> {
+    let mut commands = builtin_slash_commands();
+    let mut names: std::collections::HashSet<String> = commands.iter().map(|c| c.name.clone()).collect();
+    commands.extend(skills.iter().filter(|skill| names.insert(skill.name.clone())).cloned());
+    commands
 }
 
 /// Per-session codex handle. `&self`-concurrent (stdin write behind a Mutex).
@@ -658,7 +680,7 @@ pub struct CodexSessionBackend {
     session_id: String,
     capabilities: Capabilities,
     /// JSON-RPC request id counter (outbound client requests).
-    rpc_id: AtomicU64,
+    rpc_id: Arc<AtomicU64>,
     /// Live turn epoch (set on dispatch(Send), read by the reader to stamp).
     turn_gen: Arc<AtomicU64>,
     /// stdin shared with the reader task: dispatch writes client requests; the
@@ -748,6 +770,16 @@ pub struct CodexSessionBackend {
     /// or surfaces a Notice (NoTurn) — NEVER a silent drop (a dropped rejection
     /// left the turn hanging Running forever, ELECTRON-3Q0).
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
+    /// Turn generation awaiting the runtime effects of an active `/goal` update.
+    /// Codex may start an autonomous turn after `thread/goal/set`, but is allowed
+    /// not to; the official adapter waits one second before settling the no-turn
+    /// case. `turn/started` clears this marker when a real turn appears.
+    pending_goal_activation: Arc<Mutex<Option<u64>>>,
+    /// rpc-id -> local slash command awaiting a query response. Unlike a native
+    /// codex turn, these commands (`/skills`, `/mcp`) have no turn lifecycle on
+    /// the wire, so the reader synthesizes their assistant text + terminal after
+    /// the response arrives.
+    pending_local_commands: Arc<Mutex<HashMap<u64, PendingLocalCommand>>>,
     /// B-CODEX-MODEL-LIST (§9.10 discovery): rpc ids of the `model/list` +
     /// `collaborationMode/list` calls `open_session` issues at handshake, mapped to
     /// which list they fill. The reader claims the matching responses and writes
@@ -783,6 +815,21 @@ pub struct CodexSessionBackend {
 struct PendingSend {
     client_msg_id: Option<String>,
     opens_turn: bool,
+    goal_activation: bool,
+}
+
+#[derive(Clone)]
+struct PendingLocalCommand {
+    client_msg_id: Option<String>,
+    kind: LocalCommandKind,
+}
+
+#[derive(Clone, Copy)]
+enum LocalCommandKind {
+    Skills,
+    Mcp,
+    GoalPause,
+    GoalClear,
 }
 
 /// Which pending response a claimed rpc id maps to. Models/Modes fill the
@@ -797,6 +844,8 @@ enum DiscoveryKind {
     /// codex's mode axis: filled from `permissionProfile/list` and mapped to the fixed
     /// permission-tier enum (feature 012). codex sends no `collaborationMode/list`.
     Permissions,
+    /// `skills/list`: fills the dynamic `$skill` slash-command catalog.
+    Skills,
     Checkpoints,
     Rewind,
 }
@@ -808,6 +857,7 @@ struct Discovered {
     /// For codex this holds the fixed permission-tier mode enum mapped from
     /// `permissionProfile/list` (feature 012), NOT collaborationMode.
     modes: Vec<crate::capability::ModeInfo>,
+    skills: Vec<crate::capability::SlashCommandInfo>,
 }
 
 /// What `CodexSessionBackend::wake_handle` needs to re-spawn the codex app-server
@@ -843,12 +893,16 @@ struct CodexReaderState {
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
+    pending_goal_activation: Arc<Mutex<Option<u64>>>,
+    pending_local_commands: Arc<Mutex<HashMap<u64, PendingLocalCommand>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
+    rpc_id: Arc<AtomicU64>,
+    cwd: Option<String>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     /// F-4 turn-active flag: set on dispatch(Send), cleared by the reader at a turn
     /// terminal (TurnResult / Detached). The idle timer reads it so a streaming turn
@@ -876,12 +930,16 @@ fn start_codex_reader(
             state.pending_auth_id,
             state.pending_tool_approvals,
             state.pending_sends,
+            state.pending_goal_activation,
+            state.pending_local_commands,
             state.pending_discovery,
             state.pending_set,
             state.pending_resume,
             state.resume_poison,
             state.pending_fork,
             state.discovered,
+            state.rpc_id,
+            state.cwd,
             state.stdin,
             state.turn_in_flight,
         )
@@ -1043,6 +1101,8 @@ impl CodexSessionBackend {
         let pending_tool_approvals = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let current_model = Arc::new(Mutex::new(None));
         let pending_sends = Arc::new(Mutex::new(HashMap::new()));
+        let pending_goal_activation = Arc::new(Mutex::new(None));
+        let pending_local_commands = Arc::new(Mutex::new(HashMap::new()));
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
         let pending_resume = Arc::new(Mutex::new(None));
@@ -1050,6 +1110,7 @@ impl CodexSessionBackend {
         let pending_fork = Arc::new(Mutex::new(None));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rpc_id = Arc::new(AtomicU64::new(0));
         let (event_tx, _) = broadcast::channel(1024);
 
         let (stdin, stdout) = match io.take_stdio().await {
@@ -1067,12 +1128,16 @@ impl CodexSessionBackend {
             pending_auth_id: pending_auth_id.clone(),
             pending_tool_approvals: pending_tool_approvals.clone(),
             pending_sends: pending_sends.clone(),
+            pending_goal_activation: pending_goal_activation.clone(),
+            pending_local_commands: pending_local_commands.clone(),
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
             pending_resume: pending_resume.clone(),
             resume_poison: resume_poison.clone(),
             pending_fork: pending_fork.clone(),
             discovered: discovered.clone(),
+            rpc_id: rpc_id.clone(),
+            cwd: wake.config.cwd.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
         };
@@ -1109,7 +1174,7 @@ impl CodexSessionBackend {
         Self {
             session_id,
             capabilities: codex_capabilities(),
-            rpc_id: AtomicU64::new(0),
+            rpc_id,
             turn_gen,
             stdin,
             event_tx,
@@ -1124,6 +1189,8 @@ impl CodexSessionBackend {
             pending_tool_approvals,
             current_model,
             pending_sends,
+            pending_goal_activation,
+            pending_local_commands,
             pending_discovery,
             pending_set,
             pending_resume,
@@ -1281,6 +1348,20 @@ impl CodexSessionBackend {
             "jsonrpc": "2.0", "id": perm_list_id, "method": "permissionProfile/list", "params": {}
         }))
         .await?;
+        // Native skill discovery (codex 0.144.1 generated schema:
+        // `v2/SkillsListParams.json`). This restores the legacy codex-acp
+        // `$skill` command catalog without teaching AionUi about codex's local
+        // skill directories. `skills/changed` reissues this request below.
+        let skills_list_id = self.next_rpc_id();
+        self.pending_discovery
+            .lock()
+            .await
+            .insert(skills_list_id, DiscoveryKind::Skills);
+        self.write_frame(json!({
+            "jsonrpc": "2.0", "id": skills_list_id, "method": "skills/list",
+            "params": skills_list_params(self.wake.config.cwd.as_deref(), false)
+        }))
+        .await?;
         Ok(())
     }
 
@@ -1358,12 +1439,16 @@ async fn reader_task(
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
+    pending_goal_activation: Arc<Mutex<Option<u64>>>,
+    pending_local_commands: Arc<Mutex<HashMap<u64, PendingLocalCommand>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
+    rpc_id: Arc<AtomicU64>,
+    cwd: Option<String>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -1490,6 +1575,21 @@ async fn reader_task(
                         // server notification → SessionEvent(s)
                         let cur = turn_gen.load(Ordering::SeqCst);
                         let params = frame.get("params").unwrap_or(&Value::Null);
+                        if m == "skills/changed" {
+                            // The generated protocol documents this notification as
+                            // an invalidation signal: refresh with the current cwds.
+                            let id = rpc_id.fetch_add(1, Ordering::SeqCst) + 1;
+                            pending_discovery.lock().await.insert(id, DiscoveryKind::Skills);
+                            write_reader_frame(
+                                &stdin,
+                                json!({
+                                    "jsonrpc": "2.0", "id": id, "method": "skills/list",
+                                    "params": skills_list_params(cwd.as_deref(), true)
+                                }),
+                            )
+                            .await;
+                            continue;
+                        }
                         if m == "thread/started" {
                             // bind threadId (backend transport key, kept private).
                             if let Some(tid) = params.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
@@ -1509,6 +1609,7 @@ async fn reader_task(
                             }
                         }
                         if m == "turn/started" {
+                            *pending_goal_activation.lock().await = None;
                             terminated = false; // a new turn can terminate once (R8 reset)
                             idle_pending = false; // and a fresh turn has no deferred idle
                             system_error_pending = false; // nor a deferred systemError
@@ -1546,6 +1647,7 @@ async fn reader_task(
                                 // Turn ended → clear the active turn id (a stale token
                                 // would make a later steer/interrupt target a dead turn).
                                 *active_turn_id.lock().await = None;
+                                *pending_goal_activation.lock().await = None;
                                 // F-4: turn terminal → clear the turn-active flag so the
                                 // idle timer may suspend the now-idle process.
                                 turn_in_flight.store(false, Ordering::SeqCst);
@@ -1706,6 +1808,52 @@ async fn reader_task(
                                 *resume_poison.lock().await = Some(format!("codex thread/fork failed: {msg}"));
                                 continue;
                             }
+                            if let Some(command) = pending_local_commands.lock().await.remove(&rid) {
+                                let cur = turn_gen.load(Ordering::SeqCst);
+                                if let Some(client_msg_id) = command.client_msg_id {
+                                    emit(
+                                        &event_tx,
+                                        &session_id,
+                                        cur,
+                                        SessionEvent::PromptAccepted { client_msg_id },
+                                    );
+                                }
+                                if let Some(result) = frame.get("result") {
+                                    if matches!(command.kind, LocalCommandKind::Skills) {
+                                        fill_discovery(DiscoveryKind::Skills, result, &discovered);
+                                        emit_catalog_updated(&event_tx, &session_id, cur, &discovered);
+                                    }
+                                    emit_local_command_text(
+                                        &event_tx,
+                                        &session_id,
+                                        cur,
+                                        rid,
+                                        format_local_command_result(command.kind, result),
+                                    );
+                                    terminated = true;
+                                    turn_in_flight.store(false, Ordering::SeqCst);
+                                    emit(&event_tx, &session_id, cur, synth_clean_terminal());
+                                } else if let Some(msg) = error_message.as_deref() {
+                                    terminated = true;
+                                    turn_in_flight.store(false, Ordering::SeqCst);
+                                    tracing::warn!(
+                                        conversation_id = %session_id,
+                                        command = local_command_name(command.kind),
+                                        error = %msg,
+                                        "codex local slash command query rejected"
+                                    );
+                                    emit(
+                                        &event_tx,
+                                        &session_id,
+                                        cur,
+                                        synth_error_terminal(format!(
+                                            "Codex /{} failed: {msg}",
+                                            local_command_name(command.kind)
+                                        )),
+                                    );
+                                }
+                                continue;
+                            }
                             let pending_send = pending_sends.lock().await.remove(&rid);
                             if let Some(send) = pending_send {
                                 if frame.get("result").is_some() {
@@ -1717,7 +1865,19 @@ async fn reader_task(
                                             SessionEvent::PromptAccepted { client_msg_id },
                                         );
                                     }
+                                    if send.goal_activation {
+                                        schedule_goal_no_turn_settlement(
+                                            &pending_goal_activation,
+                                            &turn_in_flight,
+                                            &event_tx,
+                                            &session_id,
+                                            turn_gen.load(Ordering::SeqCst),
+                                        );
+                                    }
                                 } else if let Some(msg) = error_message.as_deref() {
+                                    if send.goal_activation {
+                                        *pending_goal_activation.lock().await = None;
+                                    }
                                     // (ELECTRON-3Q0 fix B) codex REJECTED the request.
                                     // Previously the correlation was dropped without
                                     // emitting → the admitted turn hung Running forever
@@ -1771,7 +1931,7 @@ async fn reader_task(
                                 && let Some(result) = frame.get("result")
                             {
                                 match kind {
-                                    DiscoveryKind::Models | DiscoveryKind::Permissions => {
+                                    DiscoveryKind::Models | DiscoveryKind::Permissions | DiscoveryKind::Skills => {
                                         fill_discovery(kind, result, &discovered);
                                         // Signal the async catalog arrival so the conversation
                                         // re-projects the model/mode picker (the ACP
@@ -1783,23 +1943,11 @@ async fn reader_task(
                                         // `config_options` on open, never re-fetches and the
                                         // selectors stay disabled. (codex's modes come from
                                         // permissionProfile/list — the fixed permission-tier enum.)
-                                        let (models, modes) = {
-                                            let disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
-                                            (disc.models.clone(), disc.modes.clone())
-                                        };
-                                        emit(
+                                        emit_catalog_updated(
                                             &event_tx,
                                             &session_id,
                                             turn_gen.load(Ordering::SeqCst),
-                                            SessionEvent::CatalogUpdated {
-                                                models,
-                                                modes,
-                                                // The static bridge-parity command table (codex has
-                                                // no discovery wire) — carried on the catalog event
-                                                // so the agent_metadata writeback + the frontend
-                                                // AvailableCommands push see it (ELECTRON-3PX).
-                                                slash_commands: builtin_slash_commands(),
-                                            },
+                                            &discovered,
                                         );
                                     }
                                     DiscoveryKind::Checkpoints => {
@@ -2227,10 +2375,82 @@ fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::syn
             }
             discovered.lock().unwrap_or_else(|e| e.into_inner()).modes = modes;
         }
+        DiscoveryKind::Skills => {
+            let skills = parse_skill_commands(result);
+            discovered.lock().unwrap_or_else(|e| e.into_inner()).skills = skills;
+        }
         // Checkpoints → CheckpointList event, Rewind → Rewound event: both mapped at
         // the call site, not a cache fill — fill_discovery is never called for them.
         DiscoveryKind::Checkpoints | DiscoveryKind::Rewind => {}
     }
+}
+
+fn parse_skill_commands(result: &Value) -> Vec<crate::capability::SlashCommandInfo> {
+    let mut commands = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for skill in result
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("skills").and_then(Value::as_array))
+        .flatten()
+    {
+        if skill.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        let Some(name) = skill
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let command_name = format!("${name}");
+        if !names.insert(command_name.clone()) {
+            continue;
+        }
+        let description = skill
+            .get("interface")
+            .and_then(|interface| interface.get("shortDescription"))
+            .and_then(Value::as_str)
+            .or_else(|| skill.get("shortDescription").and_then(Value::as_str))
+            .or_else(|| skill.get("description").and_then(Value::as_str))
+            .filter(|description| !description.is_empty())
+            .unwrap_or(name)
+            .to_string();
+        commands.push(crate::capability::SlashCommandInfo {
+            name: command_name,
+            description: Some(description),
+        });
+    }
+    commands
+}
+
+fn emit_catalog_updated(
+    event_tx: &broadcast::Sender<SessionEnvelope>,
+    session_id: &str,
+    turn_gen: u64,
+    discovered: &Arc<std::sync::Mutex<Discovered>>,
+) {
+    let (models, modes, slash_commands) = {
+        let disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            disc.models.clone(),
+            disc.modes.clone(),
+            slash_commands_with_skills(&disc.skills),
+        )
+    };
+    emit(
+        event_tx,
+        session_id,
+        turn_gen,
+        SessionEvent::CatalogUpdated {
+            models,
+            modes,
+            slash_commands,
+        },
+    );
 }
 
 /// O2 up-leg: map a `thread/turns/list` response `result` into the
@@ -2505,6 +2725,139 @@ async fn write_reverse_error(
         let _ = w.write_all(&line).await;
         let _ = w.flush().await;
     }
+}
+
+async fn write_reader_frame(stdin: &Arc<Mutex<Option<aionui_process::BoxedStdin>>>, frame: Value) {
+    let mut guard = stdin.lock().await;
+    let Some(writer) = guard.as_mut() else { return };
+    use tokio::io::AsyncWriteExt;
+    if let Ok(mut line) = serde_json::to_vec(&frame) {
+        line.push(b'\n');
+        let _ = writer.write_all(&line).await;
+        let _ = writer.flush().await;
+    }
+}
+
+fn skills_list_params(cwd: Option<&str>, force_reload: bool) -> Value {
+    let cwds: Vec<&str> = cwd.into_iter().collect();
+    json!({ "cwds": cwds, "forceReload": force_reload })
+}
+
+fn local_command_name(kind: LocalCommandKind) -> &'static str {
+    match kind {
+        LocalCommandKind::Skills => "skills",
+        LocalCommandKind::Mcp => "mcp",
+        LocalCommandKind::GoalPause | LocalCommandKind::GoalClear => "goal",
+    }
+}
+
+fn format_local_command_result(kind: LocalCommandKind, result: &Value) -> String {
+    match kind {
+        LocalCommandKind::Skills => format_skills_message(result),
+        LocalCommandKind::Mcp => format_mcp_message(result),
+        LocalCommandKind::GoalPause => "Goal paused.".into(),
+        LocalCommandKind::GoalClear => {
+            if result.get("cleared").and_then(Value::as_bool) == Some(false) {
+                "No active goal to clear.".into()
+            } else {
+                "Goal cleared.".into()
+            }
+        }
+    }
+}
+
+fn schedule_goal_no_turn_settlement(
+    pending_goal_activation: &Arc<Mutex<Option<u64>>>,
+    turn_in_flight: &Arc<std::sync::atomic::AtomicBool>,
+    event_tx: &broadcast::Sender<SessionEnvelope>,
+    session_id: &str,
+    turn_gen: u64,
+) {
+    let pending_goal_activation = Arc::clone(pending_goal_activation);
+    let turn_in_flight = Arc::clone(turn_in_flight);
+    let event_tx = event_tx.clone();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        // Matches `GOAL_RUNTIME_EFFECTS_GRACE_MS` in the official
+        // @agentclientprotocol/codex-acp 1.1.2 adapter.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let mut pending = pending_goal_activation.lock().await;
+        if *pending != Some(turn_gen) {
+            return;
+        }
+        *pending = None;
+        drop(pending);
+        turn_in_flight.store(false, Ordering::SeqCst);
+        emit_local_command_text(&event_tx, &session_id, turn_gen, turn_gen, "Goal updated.".into());
+        emit(&event_tx, &session_id, turn_gen, synth_clean_terminal());
+    });
+}
+
+fn format_skills_message(result: &Value) -> String {
+    let skills = parse_skill_commands(result);
+    if skills.is_empty() {
+        return "No skills configured.".into();
+    }
+    let mut lines = vec!["Available skills:".to_string()];
+    lines.extend(skills.into_iter().map(|skill| match skill.description {
+        Some(description) => format!("- {}: {description}", skill.name.trim_start_matches('$')),
+        None => format!("- {}", skill.name.trim_start_matches('$')),
+    }));
+    lines.join("\n")
+}
+
+fn format_mcp_message(result: &Value) -> String {
+    let servers = result.get("data").and_then(Value::as_array);
+    let Some(servers) = servers.filter(|servers| !servers.is_empty()) else {
+        return "No MCP servers configured.".into();
+    };
+    let mut lines = vec!["Configured MCP servers:".to_string()];
+    lines.extend(servers.iter().filter_map(|server| {
+        let name = server.get("name").and_then(Value::as_str)?;
+        let tool_count = server
+            .get("tools")
+            .and_then(Value::as_object)
+            .map_or(0, serde_json::Map::len);
+        let resource_count = server.get("resources").and_then(Value::as_array).map_or(0, Vec::len);
+        let auth = server.get("authStatus").and_then(Value::as_str).unwrap_or("unknown");
+        Some(format!(
+            "- {name}: {tool_count} tools, {resource_count} resources, auth={auth}"
+        ))
+    }));
+    lines.join("\n")
+}
+
+fn format_status_message(
+    model: Option<&str>,
+    cwd: Option<&str>,
+    mode: Option<&str>,
+    thread_id: Option<&str>,
+) -> String {
+    [
+        format!("**Model:** {}", model.unwrap_or("unknown")),
+        format!("**Directory:** {}", cwd.unwrap_or("unknown")),
+        format!("**Mode:** {}", mode.unwrap_or("unknown")),
+        format!("**Session:** `{}`", thread_id.unwrap_or("starting")),
+    ]
+    .join("  \n")
+}
+
+fn emit_local_command_text(
+    event_tx: &broadcast::Sender<SessionEnvelope>,
+    session_id: &str,
+    turn_gen: u64,
+    item_id: u64,
+    text: String,
+) {
+    emit(
+        event_tx,
+        session_id,
+        turn_gen,
+        SessionEvent::MessageDelta {
+            item_id: format!("codex-command-{item_id}"),
+            text,
+        },
+    );
 }
 
 /// Map a codex server notification → canonical SessionEvent(s). The A1 fix lives
@@ -3580,6 +3933,7 @@ impl SessionBackend for CodexSessionBackend {
                         PendingSend {
                             client_msg_id: metadata.client_msg_id,
                             opens_turn: false,
+                            goal_activation: false,
                         },
                     );
                     // params is `null` per schema (AccountLogoutParams: {"type":"null"},
@@ -3628,6 +3982,107 @@ impl SessionBackend for CodexSessionBackend {
                 self.suspend
                     .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
                     .await?;
+                let immediate_text = match &route {
+                    Some(SlashRoute::Goal(GoalAction::Usage)) => {
+                        Some("Usage: /goal [<objective>|clear|pause|resume]".to_string())
+                    }
+                    Some(SlashRoute::Goal(GoalAction::Set(objective))) if objective.len() > 4_000 => {
+                        Some("Command \"/goal\" requires goal text of at most 4000 characters.".to_string())
+                    }
+                    _ => None,
+                };
+                if let Some(text) = immediate_text {
+                    let cur_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                    if let Some(client_msg_id) = metadata.client_msg_id {
+                        emit(
+                            &self.event_tx,
+                            &self.session_id,
+                            cur_gen,
+                            SessionEvent::PromptAccepted { client_msg_id },
+                        );
+                    }
+                    emit_local_command_text(&self.event_tx, &self.session_id, cur_gen, cur_gen, text);
+                    emit(&self.event_tx, &self.session_id, cur_gen, synth_clean_terminal());
+                    return Ok(CommandReceipt {
+                        accepted: true,
+                        admission: Admission::Started,
+                        turn_gen: cur_gen,
+                    });
+                }
+                if matches!(&route, Some(SlashRoute::Status)) {
+                    let cur_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                    if let Some(client_msg_id) = metadata.client_msg_id {
+                        emit(
+                            &self.event_tx,
+                            &self.session_id,
+                            cur_gen,
+                            SessionEvent::PromptAccepted { client_msg_id },
+                        );
+                    }
+                    let model = self.current_model.lock().await.clone();
+                    let thread_id = self.thread_binding.lock().await.clone();
+                    let text = format_status_message(
+                        model.as_deref().or(self.capabilities.current_model.as_deref()),
+                        self.wake.config.cwd.as_deref(),
+                        self.capabilities.current_mode.as_deref(),
+                        thread_id.as_deref(),
+                    );
+                    emit_local_command_text(&self.event_tx, &self.session_id, cur_gen, cur_gen, text);
+                    emit(&self.event_tx, &self.session_id, cur_gen, synth_clean_terminal());
+                    return Ok(CommandReceipt {
+                        accepted: true,
+                        admission: Admission::Started,
+                        turn_gen: cur_gen,
+                    });
+                }
+                if let Some(kind) = match &route {
+                    Some(SlashRoute::Skills) => Some(LocalCommandKind::Skills),
+                    Some(SlashRoute::Mcp) => Some(LocalCommandKind::Mcp),
+                    Some(SlashRoute::Goal(GoalAction::Pause)) => Some(LocalCommandKind::GoalPause),
+                    Some(SlashRoute::Goal(GoalAction::Clear)) => Some(LocalCommandKind::GoalClear),
+                    _ => None,
+                } {
+                    let goal_thread_id = match kind {
+                        LocalCommandKind::GoalPause | LocalCommandKind::GoalClear => Some(self.bound_thread().await?),
+                        LocalCommandKind::Skills | LocalCommandKind::Mcp => None,
+                    };
+                    let id = self.next_rpc_id();
+                    let cur_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.turn_in_flight.store(true, Ordering::SeqCst);
+                    self.pending_local_commands.lock().await.insert(
+                        id,
+                        PendingLocalCommand {
+                            client_msg_id: metadata.client_msg_id,
+                            kind,
+                        },
+                    );
+                    let (method, params) = match kind {
+                        LocalCommandKind::Skills => {
+                            ("skills/list", skills_list_params(self.wake.config.cwd.as_deref(), true))
+                        }
+                        LocalCommandKind::Mcp => ("mcpServerStatus/list", json!({})),
+                        LocalCommandKind::GoalPause => (
+                            "thread/goal/set",
+                            json!({ "threadId": goal_thread_id, "status": "paused" }),
+                        ),
+                        LocalCommandKind::GoalClear => ("thread/goal/clear", json!({ "threadId": goal_thread_id })),
+                    };
+                    if let Err(error) = self
+                        .write_frame(json!({
+                            "jsonrpc": "2.0", "id": id, "method": method, "params": params
+                        }))
+                        .await
+                    {
+                        self.pending_local_commands.lock().await.remove(&id);
+                        self.turn_in_flight.store(false, Ordering::SeqCst);
+                        return Err(error);
+                    }
+                    return Ok(CommandReceipt {
+                        accepted: true,
+                        admission: Admission::Started,
+                        turn_gen: cur_gen,
+                    });
+                }
                 // F-4: mark the turn in flight so the idle timer won't suspend the
                 // app-server mid-turn (the reader clears it at the terminal).
                 self.turn_in_flight.store(true, Ordering::SeqCst);
@@ -3645,6 +4100,11 @@ impl SessionBackend for CodexSessionBackend {
                     }
                 };
                 let id = self.next_rpc_id();
+                let goal_activation = matches!(&route, Some(SlashRoute::Goal(GoalAction::Set(_) | GoalAction::Resume)));
+                let cur_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                if goal_activation {
+                    *self.pending_goal_activation.lock().await = Some(cur_gen);
+                }
                 // GAP-A: register the correlation so the reader can emit
                 // PromptAccepted when codex's synchronous turn/start RESPONSE lands
                 // (that response is the "accepted" receipt; the conversation drains
@@ -3660,6 +4120,7 @@ impl SessionBackend for CodexSessionBackend {
                     PendingSend {
                         client_msg_id: metadata.client_msg_id,
                         opens_turn: true,
+                        goal_activation,
                     },
                 );
                 // All three turn-flavored routes run a REAL wire turn on the thread
@@ -3678,7 +4139,22 @@ impl SessionBackend for CodexSessionBackend {
                     // /review* → review/start{threadId, target} (bridge: Op::Review;
                     // delivery omitted = inline on this thread, the bridge's behavior).
                     Some(SlashRoute::Review(target)) => ("review/start", json!({ "threadId": tid, "target": target })),
+                    Some(SlashRoute::Goal(GoalAction::Set(objective))) => (
+                        "thread/goal/set",
+                        json!({ "threadId": tid, "objective": objective, "status": "active" }),
+                    ),
+                    Some(SlashRoute::Goal(GoalAction::Resume)) => {
+                        ("thread/goal/set", json!({ "threadId": tid, "status": "active" }))
+                    }
                     Some(SlashRoute::Logout) => unreachable!("handled above"),
+                    Some(
+                        SlashRoute::Status
+                        | SlashRoute::Skills
+                        | SlashRoute::Mcp
+                        | SlashRoute::Goal(GoalAction::Usage | GoalAction::Pause | GoalAction::Clear),
+                    ) => {
+                        unreachable!("local command handled above")
+                    }
                 };
                 let frame = json!({
                     "jsonrpc": "2.0",
@@ -3686,8 +4162,14 @@ impl SessionBackend for CodexSessionBackend {
                     "method": method,
                     "params": params
                 });
-                self.write_frame(frame).await?;
-                let cur_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Err(error) = self.write_frame(frame).await {
+                    self.pending_sends.lock().await.remove(&id);
+                    if goal_activation {
+                        *self.pending_goal_activation.lock().await = None;
+                    }
+                    self.turn_in_flight.store(false, Ordering::SeqCst);
+                    return Err(error);
+                }
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::Started,
@@ -3698,6 +4180,19 @@ impl SessionBackend for CodexSessionBackend {
                 if let CancelTarget::Tool(_) = target {
                     return Err(BackendError::CommandNotSupported { command: "cancel_tool" });
                 }
+                *self.pending_goal_activation.lock().await = None;
+                let mut pending_local = self.pending_local_commands.lock().await;
+                if !pending_local.is_empty() {
+                    pending_local.clear();
+                    drop(pending_local);
+                    self.turn_in_flight.store(false, Ordering::SeqCst);
+                    return Ok(CommandReceipt {
+                        accepted: true,
+                        admission: Admission::NoTurn,
+                        turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                    });
+                }
+                drop(pending_local);
                 // REAL codex: `turn/interrupt{threadId, turnId}` (hard cancel).
                 // `turnId` is REQUIRED (non-Option on the wire). bound_thread first
                 // (establishes the handshake completed + lets the reader bind the
@@ -4124,6 +4619,7 @@ impl SessionBackend for CodexSessionBackend {
         if !disc.modes.is_empty() {
             caps.available_modes = disc.modes.clone();
         }
+        caps.slash_commands = slash_commands_with_skills(&disc.skills);
         caps
     }
 
@@ -4170,6 +4666,14 @@ const CODEX_INIT_PROMPT: &str = include_str!("./codex_init_prompt.md");
 /// each to a native op; we replicate that mapping onto app-server JSON-RPC.
 #[derive(Debug, PartialEq)]
 enum SlashRoute {
+    /// `/status` → locally-rendered session configuration.
+    Status,
+    /// `/skills` → `skills/list`, then locally-rendered results.
+    Skills,
+    /// `/mcp` → `mcpServerStatus/list`, then locally-rendered results.
+    Mcp,
+    /// `/goal` routes to codex's native persistent goal API.
+    Goal(GoalAction),
     /// `/init` → the canned AGENTS.md prompt as a normal `turn/start`.
     Init,
     /// `/compact` → `thread/compact/start{threadId}`.
@@ -4180,6 +4684,15 @@ enum SlashRoute {
     Review(Value),
     /// `/logout` → `account/logout` (no turn follows).
     Logout,
+}
+
+#[derive(Debug, PartialEq)]
+enum GoalAction {
+    Usage,
+    Set(String),
+    Pause,
+    Resume,
+    Clear,
 }
 
 /// Parse a leading slash command NAME from raw text. Sole grammar owner, shared
@@ -4220,6 +4733,20 @@ fn route_slash_command(content: &[ContentBlock]) -> Option<SlashRoute> {
     // name because the name never contains a multi-byte prefix split), trimmed.
     let rest = text[1 + name.len()..].trim_start();
     match name {
+        "status" => Some(SlashRoute::Status),
+        "skills" => Some(SlashRoute::Skills),
+        "mcp" => Some(SlashRoute::Mcp),
+        "goal" => {
+            let argument = rest.trim();
+            let action = match argument.to_ascii_lowercase().as_str() {
+                "" => GoalAction::Usage,
+                "pause" => GoalAction::Pause,
+                "resume" => GoalAction::Resume,
+                "clear" => GoalAction::Clear,
+                _ => GoalAction::Set(argument.to_string()),
+            };
+            Some(SlashRoute::Goal(action))
+        }
         "compact" => Some(SlashRoute::Compact),
         "init" => Some(SlashRoute::Init),
         "review" => {
@@ -5960,6 +6487,14 @@ mod tests {
         assert_eq!(route_slash_command(&text("/init")), Some(SlashRoute::Init));
         assert_eq!(route_slash_command(&text("/logout")), Some(SlashRoute::Logout));
         assert_eq!(
+            route_slash_command(&text("/goal ship the release")),
+            Some(SlashRoute::Goal(GoalAction::Set("ship the release".into())))
+        );
+        assert_eq!(
+            route_slash_command(&text("/goal pause")),
+            Some(SlashRoute::Goal(GoalAction::Pause))
+        );
+        assert_eq!(
             route_slash_command(&text("/review")),
             Some(SlashRoute::Review(json!({ "type": "uncommittedChanges" })))
         );
@@ -5982,6 +6517,11 @@ mod tests {
         assert_eq!(route_slash_command(&text("/review-commit")), None);
         // Unknown command / plain text / bare slash / non-text first block → None.
         assert_eq!(route_slash_command(&text("/frobnicate now")), None);
+        assert_eq!(
+            route_slash_command(&text("/$officecli analyze report.xlsx")),
+            None,
+            "dynamic skill commands pass through to codex unchanged"
+        );
         assert_eq!(route_slash_command(&text("hello")), None);
         assert_eq!(route_slash_command(&text("/")), None);
         assert_eq!(route_slash_command(&[]), None);
@@ -6018,21 +6558,32 @@ mod tests {
         // Names the advertised catalog claims codex supports.
         let advertised: BTreeSet<String> = builtin_slash_commands().into_iter().map(|c| c.name).collect();
 
-        // Every advertised name must actually route to a native op. `review-branch`
-        // / `review-commit` need a non-empty argument to satisfy their guards, so
-        // probe with an argument; a bare name would false-negative on those two.
+        // Every advertised name must actually route to either a native app-server
+        // operation or one of the local query handlers. `review-branch` /
+        // `review-commit` need a non-empty argument to satisfy their guards.
         for name in &advertised {
             let probe = format!("/{name} arg");
             assert!(
                 route_slash_command(&[ContentBlock::Text(probe.clone())]).is_some(),
-                "advertised command `{name}` does not route to a native op"
+                "advertised command `{name}` does not route to an implemented handler"
             );
         }
 
         // And the reverse: no name routes that the catalog fails to advertise.
         // Enumerate the full universe the route table recognizes today; if a new
         // arm is added to `route_slash_command`, add it here AND to the catalog.
-        let route_universe = ["review", "review-branch", "review-commit", "init", "compact", "logout"];
+        let route_universe = [
+            "mcp",
+            "skills",
+            "status",
+            "review",
+            "review-branch",
+            "review-commit",
+            "init",
+            "compact",
+            "goal",
+            "logout",
+        ];
         for name in route_universe {
             assert!(
                 route_slash_command(&[ContentBlock::Text(format!("/{name} arg"))]).is_some(),
@@ -6050,9 +6601,8 @@ mod tests {
         );
     }
 
-    /// #101/ELECTRON-3PX: codex advertises the bridge's static 6-command table
-    /// (codex-acp v0.14.0 thread.rs:2894 builtin_commands) so the in-session `/`
-    /// menu is no longer empty on the direct-CLI path.
+    /// The direct backend advertises every command it implements before dynamic
+    /// skills arrive, so the in-session `/` menu is useful immediately.
     #[test]
     fn capabilities_advertise_bridge_slash_commands() {
         let names: Vec<String> = codex_capabilities()
@@ -6062,7 +6612,18 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["review", "review-branch", "review-commit", "init", "compact", "logout"]
+            vec![
+                "mcp",
+                "skills",
+                "status",
+                "review",
+                "review-branch",
+                "review-commit",
+                "init",
+                "compact",
+                "goal",
+                "logout",
+            ]
         );
     }
 
@@ -7503,6 +8064,398 @@ mod tests {
             !written.contains(r#""method":"collaborationMode/list""#),
             "feature 012: handshake must NOT send collaborationMode/list, got: {written}"
         );
+        assert!(
+            written.contains(r#""method":"skills/list""#),
+            "handshake discovers native codex skills, got: {written}"
+        );
+    }
+
+    #[test]
+    fn skills_list_maps_enabled_skills_to_deduplicated_dollar_commands() {
+        // Shape generated by codex 0.144.1 `app-server generate-json-schema`:
+        // SkillsListResponse.data[].skills[] with interface.shortDescription,
+        // legacy shortDescription, description, enabled, name.
+        let result = json!({
+            "data": [
+                { "cwd": "/work", "errors": [], "skills": [
+                    {
+                        "name": "review-pdf", "description": "Long description", "enabled": true,
+                        "interface": { "shortDescription": "Review a PDF" }
+                    },
+                    {
+                        "name": "legacy", "description": "Fallback", "enabled": true,
+                        "shortDescription": "Legacy short"
+                    },
+                    { "name": "disabled", "description": "Hidden", "enabled": false }
+                ]},
+                { "cwd": "/other", "errors": [], "skills": [
+                    { "name": "review-pdf", "description": "Duplicate", "enabled": true }
+                ]}
+            ]
+        });
+
+        let commands = parse_skill_commands(&result);
+        assert_eq!(
+            commands.iter().map(|command| command.name.as_str()).collect::<Vec<_>>(),
+            vec!["$review-pdf", "$legacy"]
+        );
+        assert_eq!(commands[0].description.as_deref(), Some("Review a PDF"));
+        assert_eq!(commands[1].description.as_deref(), Some("Legacy short"));
+    }
+
+    #[test]
+    fn dynamic_skills_cannot_replace_builtin_commands() {
+        let merged = slash_commands_with_skills(&[
+            crate::capability::SlashCommandInfo {
+                name: "skills".into(),
+                description: Some("collision".into()),
+            },
+            crate::capability::SlashCommandInfo {
+                name: "$officecli".into(),
+                description: Some("Office files".into()),
+            },
+        ]);
+
+        assert_eq!(merged.iter().filter(|command| command.name == "skills").count(), 1);
+        assert!(merged.iter().any(|command| command.name == "$officecli"));
+        assert!(merged.iter().any(|command| command.name == "status"));
+        assert!(merged.iter().any(|command| command.name == "mcp"));
+    }
+
+    #[tokio::test]
+    async fn skills_discovery_response_updates_capabilities_and_broadcasts_catalog() {
+        use futures_util::StreamExt as _;
+
+        let response = r#"{"jsonrpc":"2.0","id":53,"result":{"data":[{"cwd":"/work","errors":[],"skills":[{"name":"officecli","description":"Office files","enabled":true,"path":"/work/.codex/skills/officecli/SKILL.md","scope":"repo"}]}]}}"#;
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(format!("{response}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-skills", Box::new(fake)).await;
+        backend.pending_discovery.lock().await.insert(53, DiscoveryKind::Skills);
+        let mut events = backend.events();
+        release();
+
+        let catalog = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::CatalogUpdated { slash_commands, .. } = env.event {
+                    return slash_commands;
+                }
+            }
+            Vec::new()
+        })
+        .await
+        .expect("skills catalog event");
+        assert!(catalog.iter().any(|command| command.name == "$officecli"));
+        assert!(
+            backend
+                .capabilities()
+                .slash_commands
+                .iter()
+                .any(|command| command.name == "$officecli")
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_changed_requests_a_forced_reload() {
+        let notification = r#"{"jsonrpc":"2.0","method":"skills/changed","params":{}}"#;
+        let fake = FakeAgentIo::never_exits(format!("{notification}\n").into_bytes());
+        let captured = fake.captured_stdin();
+        let _backend = CodexSessionBackend::build_with_io("codex-skills", Box::new(fake)).await;
+        let written = captured_str(&captured).await;
+
+        assert!(
+            written.contains(r#""method":"skills/list""#),
+            "reload request missing: {written}"
+        );
+        assert!(
+            written.contains(r#""forceReload":true"#),
+            "reload must bypass the cache: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skills_command_returns_text_and_a_clean_terminal() {
+        use futures_util::StreamExt as _;
+
+        let response = r#"{"jsonrpc":"2.0","id":1,"result":{"data":[{"cwd":"/work","errors":[],"skills":[{"name":"officecli","description":"Office files","enabled":true,"path":"/work/.codex/skills/officecli/SKILL.md","scope":"repo"}]}]}}"#;
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(format!("{response}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-skills", Box::new(fake)).await;
+        let mut events = backend.events();
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/skills".into())],
+                metadata: Default::default(),
+            })
+            .await
+            .expect("/skills accepted");
+        release();
+
+        let mut text = None;
+        let mut terminal = None;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while terminal.is_none() {
+                let Some(env) = events.next().await else { break };
+                match env.event {
+                    SessionEvent::MessageDelta { text: value, .. } => text = Some(value),
+                    SessionEvent::TurnResult { is_error, .. } => terminal = Some(is_error),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("/skills response lifecycle");
+        let written = captured_str(&captured).await;
+        assert!(matches!(receipt.admission, Admission::Started));
+        assert!(written.contains(r#""method":"skills/list""#));
+        assert!(
+            text.as_deref()
+                .is_some_and(|value| value.contains("officecli: Office files"))
+        );
+        assert_eq!(terminal, Some(false));
+    }
+
+    #[test]
+    fn mcp_command_formats_inventory_and_handles_empty_results() {
+        let populated = json!({
+            "data": [{
+                "name": "filesystem",
+                "tools": { "read_file": {}, "write_file": {} },
+                "resources": [{ "name": "root", "uri": "file:///work" }],
+                "authStatus": "unsupported"
+            }]
+        });
+        assert_eq!(
+            format_mcp_message(&populated),
+            "Configured MCP servers:\n- filesystem: 2 tools, 1 resources, auth=unsupported"
+        );
+        assert_eq!(format_mcp_message(&json!({ "data": [] })), "No MCP servers configured.");
+    }
+
+    #[tokio::test]
+    async fn status_command_finishes_without_sending_a_prompt_to_codex() {
+        use futures_util::StreamExt as _;
+
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let mut backend = CodexSessionBackend::build_with_io("codex-status", Box::new(fake)).await;
+        backend.wake.config.cwd = Some("/work/project".into());
+        backend.capabilities.current_model = Some("gpt-5.5".into());
+        backend.capabilities.current_mode = Some("auto".into());
+        backend.seed_thread_binding_for_test("thread-1").await;
+        let mut events = backend.events();
+
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/status".into())],
+                metadata: Default::default(),
+            })
+            .await
+            .expect("/status accepted");
+
+        let mut message = None;
+        let mut terminal = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !terminal {
+                let Some(env) = events.next().await else { break };
+                match env.event {
+                    SessionEvent::MessageDelta { text, .. } => message = Some(text),
+                    SessionEvent::TurnResult { is_error, .. } => terminal = !is_error,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("/status response lifecycle");
+
+        let message = message.expect("status text");
+        assert!(message.contains("**Model:** gpt-5.5"));
+        assert!(message.contains("**Directory:** /work/project"));
+        assert!(message.contains("**Session:** `thread-1`"));
+        assert!(
+            captured.lock().await.is_empty(),
+            "/status is local and writes no app-server frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_local_command_query_ends_the_turn_as_an_error() {
+        use futures_util::StreamExt as _;
+
+        let response = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"skills unavailable"}}"#;
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(format!("{response}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-skills-error", Box::new(fake)).await;
+        let mut events = backend.events();
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/skills".into())],
+                metadata: Default::default(),
+            })
+            .await
+            .expect("query admitted before the wire rejects it");
+        release();
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::TurnResult {
+                    is_error, result_text, ..
+                } = env.event
+                {
+                    return Some((is_error, result_text));
+                }
+            }
+            None
+        })
+        .await
+        .expect("error terminal")
+        .expect("turn result");
+        assert!(terminal.0);
+        assert!(terminal.1.contains("skills unavailable"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pending_local_query_discards_its_late_response() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let backend = CodexSessionBackend::build_with_io("codex-skills-cancel", Box::new(fake)).await;
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/skills".into())],
+                metadata: Default::default(),
+            })
+            .await
+            .expect("query admitted");
+        assert_eq!(backend.pending_local_commands.lock().await.len(), 1);
+
+        let receipt = backend
+            .dispatch(Command::Cancel {
+                target: CancelTarget::Turn,
+            })
+            .await
+            .expect("local query cancel accepted");
+        assert!(matches!(receipt.admission, Admission::NoTurn));
+        assert!(backend.pending_local_commands.lock().await.is_empty());
+        assert!(!backend.turn_in_flight.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn goal_set_uses_native_api_and_settles_when_codex_starts_no_turn() {
+        use futures_util::StreamExt as _;
+
+        let prefix = br#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread-goal"}}}
+"#
+        .to_vec();
+        let response = r#"{"jsonrpc":"2.0","id":1,"result":{"goal":{"threadId":"thread-goal","objective":"ship","status":"active","createdAt":1,"updatedAt":1,"tokensUsed":0,"timeUsedSeconds":0,"tokenBudget":null}}}"#;
+        let fake = FakeAgentIo::never_exits(prefix).with_gated_tail(format!("{response}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-goal", Box::new(fake)).await;
+        let mut events = backend.events();
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/goal ship".into())],
+                metadata: Default::default(),
+            })
+            .await
+            .expect("goal accepted");
+        release();
+
+        let mut message = None;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                match env.event {
+                    SessionEvent::MessageDelta { text, .. } => message = Some(text),
+                    SessionEvent::TurnResult { is_error, .. } => return Some(is_error),
+                    _ => {}
+                }
+            }
+            None
+        })
+        .await
+        .expect("goal no-turn grace settlement");
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""method":"thread/goal/set""#));
+        assert!(written.contains(r#""objective":"ship""#));
+        assert_eq!(message.as_deref(), Some("Goal updated."));
+        assert_eq!(terminal, Some(false));
+    }
+
+    #[tokio::test]
+    async fn goal_set_does_not_synthesize_a_second_terminal_when_a_turn_starts() {
+        use futures_util::StreamExt as _;
+
+        let prefix = br#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread-goal"}}}
+"#
+        .to_vec();
+        let tail = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"goal\":{\"threadId\":\"thread-goal\",\"objective\":\"ship\",\"status\":\"active\",\"createdAt\":1,\"updatedAt\":1,\"tokensUsed\":0,\"timeUsedSeconds\":0,\"tokenBudget\":null}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"turn/started\",\"params\":{\"threadId\":\"thread-goal\",\"turn\":{\"id\":\"turn-goal\"}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-goal\",\"turn\":{\"id\":\"turn-goal\",\"status\":\"completed\",\"items\":[]}}}\n"
+        );
+        let fake = FakeAgentIo::never_exits(prefix).with_gated_tail(tail.as_bytes().to_vec());
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-goal", Box::new(fake)).await;
+        let mut events = backend.events();
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/goal ship".into())],
+                metadata: Default::default(),
+            })
+            .await
+            .expect("goal accepted");
+        release();
+
+        let mut terminal_count = 0;
+        let mut synthetic_text = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1_200);
+        while let Ok(Some(env)) = tokio::time::timeout_at(deadline, events.next()).await {
+            match env.event {
+                SessionEvent::MessageDelta { text, .. } if text == "Goal updated." => synthetic_text = true,
+                SessionEvent::TurnResult { .. } => terminal_count += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(terminal_count, 1, "real goal turn must have one terminal");
+        assert!(!synthetic_text, "real turn cancels the no-turn grace settlement");
+    }
+
+    #[tokio::test]
+    async fn goal_pause_returns_a_local_confirmation_and_clean_terminal() {
+        use futures_util::StreamExt as _;
+
+        let prefix = br#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread-goal"}}}
+"#
+        .to_vec();
+        let response = r#"{"jsonrpc":"2.0","id":1,"result":{"goal":{"threadId":"thread-goal","objective":"ship","status":"paused","createdAt":1,"updatedAt":2,"tokensUsed":0,"timeUsedSeconds":0,"tokenBudget":null}}}"#;
+        let fake = FakeAgentIo::never_exits(prefix).with_gated_tail(format!("{response}\n").into_bytes());
+        let release = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-goal", Box::new(fake)).await;
+        let mut events = backend.events();
+        backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/goal pause".into())],
+                metadata: Default::default(),
+            })
+            .await
+            .expect("goal pause accepted");
+        release();
+
+        let mut text = None;
+        let mut clean_terminal = false;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !clean_terminal {
+                let Some(env) = events.next().await else { break };
+                match env.event {
+                    SessionEvent::MessageDelta { text: value, .. } => text = Some(value),
+                    SessionEvent::TurnResult { is_error, .. } => clean_terminal = !is_error,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("pause lifecycle");
+        assert_eq!(text.as_deref(), Some("Goal paused."));
+        assert!(clean_terminal);
     }
 
     #[tokio::test]
