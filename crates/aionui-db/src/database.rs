@@ -388,23 +388,6 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
 async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<(), DbError> {
     match DB_MIGRATOR.run(&mut *conn).await {
         Ok(()) => Ok(()),
-        // A newer AionUI may have already applied migrations that are not
-        // shipped by this compatibility build. SQLx can ignore only those
-        // unknown applied versions while still validating checksums for every
-        // migration known to this binary.
-        Err(sqlx::migrate::MigrateError::VersionMissing(_)) => {
-            let mut compatible_migrator = sqlx::migrate::Migrator {
-                migrations: DB_MIGRATOR.migrations.clone(),
-                ignore_missing: false,
-                locking: DB_MIGRATOR.locking,
-                no_tx: DB_MIGRATOR.no_tx,
-            };
-            compatible_migrator.set_ignore_missing(true);
-            compatible_migrator
-                .run(&mut *conn)
-                .await
-                .map_err(DbError::Migration)
-        }
         Err(e) if is_migrations_table_unique_conflict(&e) => {
             warn!("Concurrent migrator detected (UNIQUE conflict on _sqlx_migrations); retrying");
             DB_MIGRATOR.run(&mut *conn).await.map_err(DbError::Migration)

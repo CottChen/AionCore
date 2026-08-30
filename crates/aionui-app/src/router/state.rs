@@ -50,7 +50,6 @@ use aionui_team::{
 
 use crate::config::derive_encryption_key;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
-use crate::router::upload_workspace_resolver::AppUploadWorkspaceResolver;
 use crate::services::AppServices;
 
 #[derive(Debug)]
@@ -442,39 +441,10 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
     let file_service = Arc::new(FileService::new(broadcaster.clone(), allowed_roots.clone()));
     let watch_service = Arc::new(FileWatchService::new(broadcaster).map_err(file_watch_init_error)?);
     let snapshot_service = Arc::new(SnapshotService::new());
-<<<<<<< HEAD
-    let preference_repo = Arc::new(SqliteClientPreferenceRepository::new(services.database.pool().clone()));
-=======
-    // Shell-backed capabilities for `/api/fs/reveal` (open enclosing folder) and
-    // `/api/fs/open-system` (open with the default application): adapters over one
-    // shared shell service, injected as the file crate's ports so aionui-file stays
-    // free of a shell dependency.
-    let shell = Arc::new(aionui_shell::ShellService::new(Arc::new(
-        aionui_shell::DefaultSystemOpener,
-    )));
-    let revealer: aionui_file::ItemRevealerRef = Arc::new(super::item_revealer::ShellItemRevealer::new(shell.clone()));
-    let system_opener: aionui_file::SystemFileOpenerRef =
-        Arc::new(super::system_file_opener::ShellSystemFileOpener::new(shell.clone()));
-    // Clipboard capability for `/api/fs/copy-absolute-path`: the backend resolves
-    // the path and writes it to the clipboard itself, so the abs never returns.
-    let clipboard: aionui_file::ClipboardWriterRef =
-        Arc::new(super::clipboard_writer::ShellClipboardWriter::new(shell));
->>>>>>> a621ed88 (feat(fs): add copy-absolute-path endpoint that writes the clipboard server-side (#803))
     Ok(FileRouterState {
         file_service,
-        upload_workspace_resolver: Arc::new(AppUploadWorkspaceResolver::new(
-            services.conversation_repo.clone(),
-            preference_repo,
-        )),
         watch_service,
         snapshot_service,
-<<<<<<< HEAD
-=======
-        project: Arc::new(services.project_service.clone()),
-        revealer,
-        system_opener,
-        clipboard,
->>>>>>> a621ed88 (feat(fs): add copy-absolute-path endpoint that writes the clipboard server-side (#803))
         allowed_roots,
         browse_roots,
     })

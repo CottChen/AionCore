@@ -17,13 +17,7 @@ pub use routes::{BrowseRoots, FileRouterState, file_routes};
 pub use service::FileService;
 pub use snapshot_service::SnapshotService;
 pub use traits::{
-<<<<<<< HEAD
-    FileServiceRef, FileWatchServiceRef, IFileService, IFileWatchService, ISnapshotService, IUploadWorkspaceResolver,
-    SnapshotServiceRef, UploadWorkspaceResolverRef,
-=======
-    ClipboardWriterRef, FileServiceRef, IClipboardWriter, IFileService, IItemRevealer, ISnapshotService,
-    ISystemFileOpener, ItemRevealerRef, SnapshotServiceRef, SystemFileOpenerRef,
->>>>>>> a621ed88 (feat(fs): add copy-absolute-path endpoint that writes the clipboard server-side (#803))
+    FileServiceRef, FileWatchServiceRef, IFileService, IFileWatchService, ISnapshotService, SnapshotServiceRef,
 };
 pub use types::{
     CompareResult, ContentUpdateEvent, ContentUpdateOperation, CopyResult, DirOrFile, FileChangeInfo, FileMetadata,

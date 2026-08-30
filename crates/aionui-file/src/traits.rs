@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use aionui_common::FileChangeOperation;
@@ -6,21 +6,6 @@ use aionui_common::FileChangeOperation;
 use crate::error::FileError;
 
 use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotInfo, WorkspaceFlatFile, ZipEntry};
-
-/// Resolves whether an authenticated conversation upload should be stored in
-/// its workspace. Composition-layer implementations own preference and
-/// conversation lookups so the file domain stays independent of persistence.
-#[async_trait::async_trait]
-pub trait IUploadWorkspaceResolver: Send + Sync {
-    async fn resolve_workspace(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-        force_workspace: bool,
-    ) -> Result<Option<PathBuf>, FileError>;
-}
-
-pub type UploadWorkspaceResolverRef = Arc<dyn IUploadWorkspaceResolver>;
 
 /// Core file operations: directory browsing, file read/write, management,
 /// image processing, and ZIP packaging.
@@ -113,18 +98,6 @@ pub trait IFileService: Send + Sync {
         file_name: &str,
         data: &[u8],
         conversation_id: Option<&str>,
-    ) -> Result<String, FileError>;
-
-    /// Write an upload inside a conversation workspace.
-    ///
-    /// `relative_dir` must be a relative directory below `workspace`.
-    /// Symlinks that resolve outside the workspace are rejected.
-    async fn create_workspace_upload_file(
-        &self,
-        file_name: &str,
-        data: &[u8],
-        workspace: &Path,
-        relative_dir: &Path,
     ) -> Result<String, FileError>;
 
     // -- Image processing --
@@ -258,58 +231,3 @@ pub type FileWatchServiceRef = Arc<dyn IFileWatchService>;
 
 /// Convenience alias for an Arc-wrapped snapshot service.
 pub type SnapshotServiceRef = Arc<dyn ISnapshotService>;
-<<<<<<< HEAD
-=======
-
-/// Reveal an absolute filesystem path in the OS file manager (a "show item in
-/// folder" / "open enclosing folder" capability). Defined here as the narrow
-/// port the `/api/fs/reveal` route depends on; the composition layer supplies an
-/// adapter over the shell service, so this crate needs no shell dependency.
-#[async_trait::async_trait]
-pub trait IItemRevealer: Send + Sync {
-    /// Reveal `absolute_path` in the OS file manager. The path is the resolved,
-    /// contained absolute path from `resolve_reference` — never client input.
-    async fn reveal(&self, absolute_path: &str) -> Result<(), FileError>;
-}
-
-/// Convenience alias for an Arc-wrapped item revealer.
-pub type ItemRevealerRef = Arc<dyn IItemRevealer>;
-
-/// Open an absolute filesystem path with the OS default application (the
-/// "open in system editor" escape hatch preview offers for files it cannot
-/// render itself — oversized or unsupported formats). Sibling port to
-/// [`IItemRevealer`], which reveals the enclosing folder instead of opening the
-/// file; the composition layer supplies an adapter over the shell service so
-/// this crate needs no shell dependency.
-#[async_trait::async_trait]
-pub trait ISystemFileOpener: Send + Sync {
-    /// Open `absolute_path` with the OS default application. The path is the
-    /// resolved, contained absolute path from `resolve_chat_file_ref` — never
-    /// client input.
-    ///
-    /// **INV-OPEN**: implementations must not put the path (nor any string
-    /// derived from it) into the returned error. See the `/api/fs/open-system`
-    /// handler for the full invariant.
-    async fn open(&self, absolute_path: &str) -> Result<(), FileError>;
-}
-
-/// Convenience alias for an Arc-wrapped system file opener.
-pub type SystemFileOpenerRef = Arc<dyn ISystemFileOpener>;
-
-/// Write text to the OS clipboard. The `/api/fs/copy-absolute-path` route
-/// resolves the path server-side and writes it here, so — exactly like
-/// [`IItemRevealer`] / [`ISystemFileOpener`] — the backend performs the OS action
-/// itself and the resolved absolute path is never returned to the client. The
-/// composition layer supplies an adapter over the shell service, so this crate
-/// needs no shell dependency.
-#[async_trait::async_trait]
-pub trait IClipboardWriter: Send + Sync {
-    /// Write `text` (the resolved absolute path) to the OS clipboard. Errors on a
-    /// headless/no-clipboard environment rather than panicking; the error carries
-    /// no path.
-    async fn write_text(&self, text: &str) -> Result<(), FileError>;
-}
-
-/// Convenience alias for an Arc-wrapped clipboard writer.
-pub type ClipboardWriterRef = Arc<dyn IClipboardWriter>;
->>>>>>> a621ed88 (feat(fs): add copy-absolute-path endpoint that writes the clipboard server-side (#803))
