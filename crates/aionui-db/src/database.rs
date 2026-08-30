@@ -175,6 +175,7 @@ pub async fn init_database_memory() -> Result<Database, DbError> {
     // In-memory DBs are not shared across processes, so no advisory lock is
     // needed (and there is no on-disk path we could create one against).
     run_migrations(&pool).await?;
+    ensure_user_role_schema(&pool).await?;
     ensure_system_user(&pool).await?;
 
     info!("In-memory database initialized");
@@ -270,6 +271,9 @@ async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError
         .map_err(|e| DatabaseInitError::new("database.open", DbError::Query(e)))?;
 
     run_migrations_staged(&pool).await?;
+    ensure_user_role_schema(&pool)
+        .await
+        .map_err(|e| DatabaseInitError::new("database.schema_repair", e))?;
     ensure_system_user(&pool)
         .await
         .map_err(|e| DatabaseInitError::new("database.seed", e))?;
@@ -388,6 +392,22 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
 async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<(), DbError> {
     match DB_MIGRATOR.run(&mut *conn).await {
         Ok(()) => Ok(()),
+        // Allow a v0.1.50-based build to open a database that already has
+        // newer migrations. Unknown applied versions are ignored, while
+        // checksums for migrations known to this binary remain validated.
+        Err(sqlx::migrate::MigrateError::VersionMissing(_)) => {
+            let mut compatible_migrator = sqlx::migrate::Migrator {
+                migrations: DB_MIGRATOR.migrations.clone(),
+                ignore_missing: false,
+                locking: DB_MIGRATOR.locking,
+                no_tx: DB_MIGRATOR.no_tx,
+            };
+            compatible_migrator.set_ignore_missing(true);
+            compatible_migrator
+                .run(&mut *conn)
+                .await
+                .map_err(DbError::Migration)
+        }
         Err(e) if is_migrations_table_unique_conflict(&e) => {
             warn!("Concurrent migrator detected (UNIQUE conflict on _sqlx_migrations); retrying");
             DB_MIGRATOR.run(&mut *conn).await.map_err(DbError::Migration)
@@ -460,8 +480,45 @@ impl Drop for MigrateLockGuard {
 /// added after a table was first created may be missing. This function
 /// safely adds any missing columns via `ALTER TABLE ADD COLUMN`.
 async fn ensure_schema_columns(pool: &SqlitePool) -> Result<(), DbError> {
+    ensure_user_role_schema(pool).await?;
     reconcile_mcp_server_schema(pool).await?;
     crate::legacy_handoff::ensure_legacy_handoff_schema(pool).await?;
+    Ok(())
+}
+
+/// Add the role column without changing historical migration checksums.
+///
+/// The column is intentionally repaired before SQLx migrations run so both
+/// v0.1.50 databases and databases created by newer clients can be opened.
+async fn ensure_user_role_schema(pool: &SqlitePool) -> Result<(), DbError> {
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='users'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(DbError::Query)?;
+    if !table_exists {
+        return Ok(());
+    }
+
+    let has_is_admin: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('users') WHERE name = 'is_admin'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(DbError::Query)?;
+    if !has_is_admin {
+        sqlx::query("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+            .execute(pool)
+            .await
+            .map_err(DbError::Query)?;
+    }
+
+    // Preserve the existing local WebUI administrator identity.
+    sqlx::query("UPDATE users SET is_admin = 1 WHERE id = 'system_default_user'")
+        .execute(pool)
+        .await
+        .map_err(DbError::Query)?;
     Ok(())
 }
 
@@ -773,6 +830,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(fk_table, "conversations");
+    }
+
+    #[tokio::test]
+    async fn system_user_is_admin_after_schema_repair() {
+        let db = init_database_memory().await.unwrap();
+        let is_admin: bool = sqlx::query_scalar(
+            "SELECT is_admin FROM users WHERE id = 'system_default_user'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+
+        assert!(is_admin);
+    }
+
+    #[tokio::test]
+    async fn migration_compatibility_ignores_unknown_newer_versions() {
+        let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, success, checksum, execution_time) \
+             VALUES (999999, 'newer client migration', 1, x'00', 0)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        run_migrations(db.pool()).await.unwrap();
     }
 
     #[test]

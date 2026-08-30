@@ -48,6 +48,7 @@ fn login_response_serialization_matches_spec() {
         PublicUser {
             id: "auth_1712345678_abc".into(),
             username: "admin".into(),
+            is_admin: true,
         },
         "eyJhbGciOiJIUzI1NiJ9".into(),
     );

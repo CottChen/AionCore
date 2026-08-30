@@ -32,6 +32,9 @@ pub trait IUserRepository: Send + Sync {
     /// Returns `DbError::Conflict` if the username already exists.
     async fn create_user(&self, username: &str, password_hash: &str) -> Result<User, DbError>;
 
+    /// Deletes a non-system user by ID.
+    async fn delete_user(&self, user_id: &str) -> Result<(), DbError>;
+
     /// Finds a user by username.
     async fn find_by_username(&self, username: &str) -> Result<Option<User>, DbError>;
 

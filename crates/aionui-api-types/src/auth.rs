@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct PublicUser {
     pub id: String,
     pub username: String,
+    #[serde(default)]
+    pub is_admin: bool,
 }
 
 /// Login request body for `POST /login`.
@@ -141,6 +143,7 @@ mod tests {
         let user = PublicUser {
             id: "auth_1712345678_abc".into(),
             username: "admin".into(),
+            is_admin: true,
         };
         let json = serde_json::to_value(&user).unwrap();
         assert_eq!(json["id"], "auth_1712345678_abc");
@@ -167,6 +170,7 @@ mod tests {
         let user = PublicUser {
             id: "user_1".into(),
             username: "admin".into(),
+            is_admin: true,
         };
         let resp = LoginResponse::new(user.clone(), "jwt_token".into());
         assert!(resp.success);
@@ -181,6 +185,7 @@ mod tests {
             PublicUser {
                 id: "auth_123".into(),
                 username: "admin".into(),
+                is_admin: true,
             },
             "eyJhbGciOi".into(),
         );

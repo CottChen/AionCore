@@ -32,6 +32,32 @@ use crate::rate_limit::{
 use crate::validation::{validate_password, validate_username};
 use crate::{CookieConfig, JwtService};
 
+#[derive(Debug, serde::Serialize)]
+struct AdminUserView {
+    id: String,
+    username: String,
+    is_admin: bool,
+    created_at: i64,
+    updated_at: i64,
+    last_login: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminCreateUserRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminResetPasswordRequest {
+    new_password: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AdminResetPasswordResponse {
+    new_password: String,
+}
+
 impl From<AuthError> for ApiError {
     fn from(err: AuthError) -> Self {
         match err {
@@ -190,6 +216,30 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .route("/logout", post(logout_handler))
         .route("/api/auth/user", get(user_handler))
         .route("/api/auth/change-password", post(change_password_handler))
+        .route(
+            "/api/auth/admin/users",
+            get(admin_list_users_handler).post(admin_create_user_handler),
+        )
+        .route(
+            "/api/auth/admin/users/{id}",
+            axum::routing::delete(admin_delete_user_handler),
+        )
+        .route(
+            "/api/auth/admin/users/{id}/reset-password",
+            post(admin_reset_password_handler),
+        )
+        .route(
+            "/api/webui/users",
+            get(admin_list_users_handler).post(admin_create_user_handler),
+        )
+        .route(
+            "/api/webui/users/{id}",
+            axum::routing::delete(admin_delete_user_handler),
+        )
+        .route(
+            "/api/webui/users/{id}/reset-password",
+            post(admin_reset_password_handler),
+        )
         .route("/api/ws-token", get(ws_token_handler))
         .route_layer(from_fn_with_state(
             action_limiter.clone(),
@@ -285,6 +335,7 @@ async fn login_handler(
         PublicUser {
             id: user.id,
             username: user.username,
+            is_admin: user.is_admin,
         },
         token,
     );
@@ -478,6 +529,7 @@ async fn user_handler(Extension(user): Extension<CurrentUser>) -> Json<UserInfoR
         user: PublicUser {
             id: user.id,
             username: user.username,
+            is_admin: user.is_admin,
         },
     })
 }
@@ -537,6 +589,95 @@ async fn change_password_handler(
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     Ok(Json(ApiResponse::message("Password changed successfully")))
+}
+
+fn require_admin(user: &CurrentUser) -> Result<(), ApiError> {
+    if user.is_admin {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden("Administrator access required".into()))
+    }
+}
+
+async fn admin_list_users_handler(
+    State(state): State<AuthRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<Vec<AdminUserView>>>, ApiError> {
+    require_admin(&current_user)?;
+    let users = state.user_repo.list_users().await.map_err(db_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(
+        users
+            .into_iter()
+            .map(|user| AdminUserView {
+                id: user.id,
+                username: user.username,
+                is_admin: user.is_admin,
+                created_at: user.created_at,
+                updated_at: user.updated_at,
+                last_login: user.last_login,
+            })
+            .collect(),
+    )))
+}
+
+async fn admin_create_user_handler(
+    State(state): State<AuthRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+    body: Result<Json<AdminCreateUserRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<AdminUserView>>, ApiError> {
+    require_admin(&current_user)?;
+    let Json(req) = body.map_err(ApiError::from)?;
+    validate_username(&req.username)?;
+    validate_password(&req.password)?;
+    let password = req.password.clone();
+    let hash = tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
+    let user = state.user_repo.create_user(&req.username, &hash).await.map_err(db_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(AdminUserView {
+        id: user.id,
+        username: user.username,
+        is_admin: user.is_admin,
+        created_at: user.created_at,
+        updated_at: user.updated_at,
+        last_login: user.last_login,
+    })))
+}
+
+async fn admin_delete_user_handler(
+    State(state): State<AuthRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    require_admin(&current_user)?;
+    if id == current_user.id || id == "system_default_user" {
+        return Err(ApiError::BadRequest("Cannot delete the current or system user".into()));
+    }
+    state.user_repo.delete_user(&id).await.map_err(db_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+async fn admin_reset_password_handler(
+    State(state): State<AuthRouterState>,
+    Extension(current_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Option<Json<AdminResetPasswordRequest>>,
+) -> Result<Json<ApiResponse<AdminResetPasswordResponse>>, ApiError> {
+    require_admin(&current_user)?;
+    let password = body
+        .map(|Json(req)| req.new_password)
+        .unwrap_or_else(|| generate_password(16));
+    validate_password(&password)?;
+    let hash = tokio::task::spawn_blocking({
+        let password = password.clone();
+        move || hash_password(&password)
+    })
+        .await
+        .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))??;
+    state.user_repo.update_password(&id, &hash).await.map_err(db_error_to_api_error)?;
+    Ok(Json(ApiResponse::ok(AdminResetPasswordResponse {
+        new_password: password,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +772,7 @@ async fn qr_login_handler(
         PublicUser {
             id: user.id,
             username: user.username,
+            is_admin: user.is_admin,
         },
         token,
     );

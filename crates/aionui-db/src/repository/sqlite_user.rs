@@ -78,8 +78,8 @@ impl IUserRepository for SqliteUserRepository {
         let now = aionui_common::now_ms();
 
         sqlx::query(
-            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO users (id, username, is_admin, password_hash, created_at, updated_at) \
+             VALUES (?, ?, 0, ?, ?, ?)",
         )
         .bind(&id)
         .bind(username)
@@ -98,6 +98,7 @@ impl IUserRepository for SqliteUserRepository {
         Ok(User {
             id,
             username: username.to_string(),
+            is_admin: false,
             email: None,
             password_hash: password_hash.to_string(),
             avatar_path: None,
@@ -106,6 +107,20 @@ impl IUserRepository for SqliteUserRepository {
             updated_at: now,
             last_login: None,
         })
+    }
+
+    async fn delete_user(&self, user_id: &str) -> Result<(), DbError> {
+        if user_id == "system_default_user" {
+            return Err(DbError::Conflict("system user cannot be deleted".to_owned()));
+        }
+        let result = sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("User '{user_id}' not found")));
+        }
+        Ok(())
     }
 
     async fn find_by_username(&self, username: &str) -> Result<Option<User>, DbError> {

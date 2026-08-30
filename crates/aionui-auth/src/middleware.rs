@@ -22,6 +22,8 @@ pub struct CurrentUser {
     pub id: String,
     /// Username.
     pub username: String,
+    /// Whether this user may access administrator-only routes.
+    pub is_admin: bool,
 }
 
 /// Shared state for the authentication middleware.
@@ -54,6 +56,7 @@ pub async fn auth_middleware(
         request.extensions_mut().insert(CurrentUser {
             id: "system_default_user".to_string(),
             username: "system_default_user".to_string(),
+            is_admin: true,
         });
         return Ok(next.run(request).await);
     }
@@ -79,6 +82,7 @@ pub async fn auth_middleware(
     request.extensions_mut().insert(CurrentUser {
         id: user.id,
         username: user.username,
+        is_admin: user.is_admin,
     });
 
     Ok(next.run(request).await)
@@ -92,6 +96,7 @@ pub async fn local_auth_middleware(mut request: Request, next: Next) -> Response
     request.extensions_mut().insert(CurrentUser {
         id: "system_default_user".to_string(),
         username: "system_default_user".to_string(),
+        is_admin: true,
     });
     next.run(request).await
 }

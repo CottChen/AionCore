@@ -132,6 +132,7 @@ fn diagnostics_request(uri: &str) -> Request<Body> {
     req.extensions_mut().insert(CurrentUser {
         id: "system_default_user".to_owned(),
         username: "system_default_user".to_owned(),
+        is_admin: true,
     });
     req
 }
