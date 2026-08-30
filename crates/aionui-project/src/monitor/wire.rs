@@ -359,6 +359,20 @@ pub fn fs_error_to_rpc(err: &FsError) -> (i64, &'static str) {
     }
 }
 
+/// Return the underlying provider failure for diagnostics without changing the
+/// stable protocol error returned to clients. Absolute resource URIs are
+/// intentionally omitted; callers log the project-relative identity instead.
+pub fn fs_error_detail(err: &FsError) -> &str {
+    match err {
+        FsError::Io { message, .. } => message,
+        FsError::UnsupportedScheme { scheme } => scheme,
+        FsError::NotFound { .. } => "resource not found",
+        FsError::AlreadyExists { .. } => "resource already exists",
+        FsError::PermissionDenied { .. } => "permission denied",
+        FsError::NotADirectory { .. } => "not a directory",
+    }
+}
+
 #[cfg(test)]
 #[path = "wire_test.rs"]
 mod wire_test;

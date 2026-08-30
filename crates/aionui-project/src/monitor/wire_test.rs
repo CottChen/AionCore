@@ -349,3 +349,30 @@ fn fs_error_maps_to_protocol_codes() {
         (CODE_PROVIDER_UNAVAILABLE, "provider_unavailable")
     );
 }
+
+#[test]
+fn fs_error_detail_surfaces_the_cause_the_protocol_code_hides() {
+    assert_eq!(
+        fs_error_detail(&FsError::Io {
+            uri: "file:///x".into(),
+            message: "No space left on device (os error 28)".into(),
+        }),
+        "No space left on device (os error 28)"
+    );
+    assert_eq!(
+        fs_error_detail(&FsError::NotADirectory {
+            uri: "file:///x".into()
+        }),
+        "not a directory"
+    );
+    assert_eq!(
+        fs_error_detail(&FsError::UnsupportedScheme { scheme: "ssh".into() }),
+        "ssh"
+    );
+    assert!(
+        !fs_error_detail(&FsError::NotFound {
+            uri: "file:///secret/path".into()
+        })
+        .contains("secret")
+    );
+}

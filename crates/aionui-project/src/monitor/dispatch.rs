@@ -130,8 +130,13 @@ impl FsMonitorActor {
         }
 
         // Phase 2: subscribe each; the subscribe reply carries every snapshot.
+        // Unlike phase 1 this is not atomic: mounting arms an OS watch, so one
+        // target can fail for reasons unrelated to its siblings. Keep every
+        // snapshot that mounted and fail the request only when none did.
         let now = self.now();
         let mut snapshots: Vec<Value> = Vec::new();
+        let mut failed: usize = 0;
+        let mut first_failure: Option<(i64, &'static str, Value)> = None;
         for (target, canonical) in plan {
             let sub = Subscriber {
                 session: session.to_owned(),
@@ -147,18 +152,33 @@ impl FsMonitorActor {
                     }
                 }
                 Err(err) => {
+                    failed += 1;
                     let (code, message) = wire::fs_error_to_rpc(&err);
-                    tracing::warn!(session, user_id, code = message, pe_id = %target.pe_id, "fs subscribe rejected");
-                    self.push(session, wire::error(id.clone(), code, message, ref_data(&target)));
-                    return;
+                    tracing::warn!(
+                        session,
+                        user_id,
+                        code = message,
+                        pe_id = %target.pe_id,
+                        rel = %target.relative_path,
+                        reason = wire::fs_error_detail(&err),
+                        "fs subscribe: target mount failed"
+                    );
+                    first_failure.get_or_insert_with(|| (code, message, ref_data(&target)));
                 }
             }
+        }
+        if snapshots.is_empty()
+            && let Some((code, message, data)) = first_failure
+        {
+            self.push(session, wire::error(id, code, message, data));
+            return;
         }
         // Subscription registration succeeded — lifecycle boundary (low volume).
         tracing::info!(
             session,
             targets = target_count,
             snapshots = snapshots.len(),
+            failed,
             "fs subscribe"
         );
         self.push(session, wire::success(id, json!({ "snapshots": snapshots })));

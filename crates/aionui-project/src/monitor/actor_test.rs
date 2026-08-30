@@ -264,6 +264,62 @@ async fn subscribe_parent_escape_is_invalid_relative_path() {
 }
 
 #[tokio::test]
+async fn subscribe_keeps_mounted_targets_when_one_target_fails() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src").join("main.ts"), b"x").unwrap();
+    std::fs::write(dir.path().join("notadir"), b"x").unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                4,
+                "fs/subscribe",
+                json!({"targets":[dir_ref(&pe, "notadir"), dir_ref(&pe, ""), dir_ref(&pe, "src")]}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert!(
+        reply.get("error").is_none(),
+        "partially mountable batch failed: {reply}"
+    );
+    let snaps = reply["result"]["snapshots"].as_array().unwrap();
+    assert_eq!(snaps.len(), 2);
+    assert_eq!(snaps[0]["target"], dir_ref(&pe, ""));
+    assert_eq!(snaps[1]["target"], dir_ref(&pe, "src"));
+}
+
+#[tokio::test]
+async fn subscribe_all_targets_failing_to_mount_still_errors() {
+    let (mut actor, _rx, push, pe, dir, _db) = setup().await;
+    std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+    std::fs::write(dir.path().join("b.txt"), b"x").unwrap();
+
+    actor
+        .dispatch_frame(
+            "1",
+            "system_default_user",
+            request(
+                5,
+                "fs/subscribe",
+                json!({"targets":[dir_ref(&pe, "a.txt"), dir_ref(&pe, "b.txt")]}),
+            ),
+        )
+        .await;
+
+    let reply = push.last_for("1").unwrap();
+    assert!(reply.get("result").is_none());
+    assert_eq!(reply["error"]["code"], -32006);
+    assert_eq!(reply["error"]["message"], "provider_unavailable");
+    assert_eq!(reply["error"]["data"]["pe_id"], pe);
+    assert_eq!(reply["error"]["data"]["relative_path"], "a.txt");
+}
+
+#[tokio::test]
 async fn mkdir_then_remove_roundtrip() {
     let (mut actor, _rx, push, pe, dir, _db) = setup().await;
     actor
