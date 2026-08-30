@@ -2,7 +2,7 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Json, Multipart, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, Query, State};
 use axum::routing::{get, post};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -16,12 +16,21 @@ use aionui_api_types::{
     SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest,
     SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipRequest,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_common::constants::UPLOAD_MAX_SIZE;
 
 use crate::browse;
 use crate::error::FileError;
-use crate::traits::{FileServiceRef, FileWatchServiceRef, SnapshotServiceRef};
+<<<<<<< HEAD
+use crate::traits::{FileServiceRef, FileWatchServiceRef, SnapshotServiceRef, UploadWorkspaceResolverRef};
+=======
+use crate::traits::{ClipboardWriterRef, FileServiceRef, ItemRevealerRef, SnapshotServiceRef, SystemFileOpenerRef};
+
+/// Request-body cap for `PUT /api/fs/content`, aligned with the 256 MB read cap
+/// so large files can be saved (the 10 MB global limit would otherwise 413).
+const CONTENT_MAX_SIZE: usize = 256 * 1024 * 1024;
+>>>>>>> a621ed88 (feat(fs): add copy-absolute-path endpoint that writes the clipboard server-side (#803))
 use crate::types::{
     CompareResult, CopyResult, DirOrFile, FileChangeInfo, FileMetadata, SnapshotInfo, SnapshotMode, WorkspaceFlatFile,
     ZipEntry,
@@ -91,8 +100,25 @@ impl Default for BrowseRoots {
 #[derive(Clone)]
 pub struct FileRouterState {
     pub file_service: FileServiceRef,
+    pub upload_workspace_resolver: UploadWorkspaceResolverRef,
     pub watch_service: FileWatchServiceRef,
     pub snapshot_service: SnapshotServiceRef,
+<<<<<<< HEAD
+=======
+    /// Resolves pe-addressed copy/reveal targets (`/api/fs/copy`,
+    /// `/api/fs/reveal`) to absolute paths.
+    pub project: Arc<aionui_project::ProjectService>,
+    /// Reveals a resolved absolute path in the OS file manager
+    /// (`/api/fs/reveal`). Injected by composition over the shell service.
+    pub revealer: ItemRevealerRef,
+    /// Opens a resolved absolute path with the OS default application
+    /// (`/api/fs/open-system`). Injected by composition over the shell service.
+    pub system_opener: SystemFileOpenerRef,
+    /// Writes a resolved absolute path to the OS clipboard
+    /// (`/api/fs/copy-absolute-path`). Injected by composition over the shell
+    /// service; the path is written server-side and never returned to the client.
+    pub clipboard: ClipboardWriterRef,
+>>>>>>> a621ed88 (feat(fs): add copy-absolute-path endpoint that writes the clipboard server-side (#803))
     pub allowed_roots: Vec<std::path::PathBuf>,
     /// Roots permitted by the shallow `/api/fs/browse` endpoint. This is
     /// typically wider than `allowed_roots` (it includes `cwd`, Windows
@@ -130,9 +156,15 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/read-buffer", post(read_file_buffer))
         .route("/api/fs/write", post(write_file))
         .route("/api/fs/copy", post(copy_files))
+<<<<<<< HEAD
         .route("/api/fs/remove", post(remove_entry))
         .route("/api/fs/rename", post(rename_entry))
         .route("/api/fs/temp", post(create_temp_file))
+=======
+        .route("/api/fs/reveal", post(reveal_item))
+        .route("/api/fs/open-system", post(open_system_file))
+        .route("/api/fs/copy-absolute-path", post(copy_absolute_path))
+>>>>>>> a621ed88 (feat(fs): add copy-absolute-path endpoint that writes the clipboard server-side (#803))
         .route("/api/fs/image-base64", post(get_image_base64))
         .route("/api/fs/fetch-remote-image", post(fetch_remote_image))
         .route("/api/fs/zip", post(create_zip))
@@ -299,7 +331,128 @@ async fn remove_entry(
     Ok(Json(ApiResponse::success()))
 }
 
+<<<<<<< HEAD
 async fn rename_entry(
+=======
+/// Reveal the resolved absolute path via the revealer port. Split from the
+/// handler so the resolve → reveal wiring (and its no-local-path / reveal-failed
+/// error mapping) is unit-testable with a mock revealer, independent of the
+/// project service (`resolve_reference` is covered in `aionui-project`).
+async fn reveal_resolved(
+    revealer: &dyn crate::traits::IItemRevealer,
+    absolute_path: Option<String>,
+) -> Result<(), FileError> {
+    let abs = absolute_path.ok_or_else(|| FileError::BadRequest("reveal target is not a local path".to_owned()))?;
+    revealer.reveal(&abs).await
+}
+
+/// `POST /api/fs/copy-absolute-path` — resolve a pe-addressed file/dir to its
+/// absolute device path and write it to the OS clipboard, for the Explorer "copy
+/// absolute path" action. Returns void.
+///
+/// Mirrors `/api/fs/reveal` / `/api/fs/open-system`: the backend resolves the
+/// path server-side and performs the OS action (here: a clipboard write) itself,
+/// so the absolute path is NEVER returned to the client — the no-abs-to-client
+/// posture and INV-OPEN hold unchanged (the error branch carries coded errors
+/// only, no path). A non-local reference (a folder root that no longer resolves)
+/// yields a path-free BadRequest.
+async fn copy_absolute_path(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<RevealItemRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let resolved = state
+        .project
+        .resolve_reference(
+            &user.id,
+            aionui_project::ReferenceInput {
+                pe_id: req.pe_id,
+                relative_path: req.relative_path,
+                op: aionui_project::FileOp::Read,
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+    copy_absolute_path_resolved(state.clipboard.as_ref(), resolved.absolute_path).await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+/// Write the resolved absolute path to the clipboard via the clipboard port, or
+/// fail with a path-free `BadRequest` when the reference is not a local path.
+/// Split from the handler so the resolve → clipboard wiring (no-local-path /
+/// clipboard-failure mapping) is unit-testable with a mock writer, independent of
+/// the project service (`resolve_reference` is covered in `aionui-project`).
+/// Symmetric with [`reveal_resolved`].
+async fn copy_absolute_path_resolved(
+    clipboard: &dyn crate::traits::IClipboardWriter,
+    absolute_path: Option<String>,
+) -> Result<(), FileError> {
+    let abs = absolute_path.ok_or_else(|| FileError::BadRequest("copy target is not a local path".to_owned()))?;
+    clipboard.write_text(&abs).await
+}
+
+/// Collapse a `ChatFileRef` resolution failure into a path-free API error.
+///
+/// Shared by every `ChatFileRef`-addressed endpoint (content read/write, metadata,
+/// stream, open-system). The shared `From<ProjectError> for ApiError` mapping is
+/// **not** usable for these: it renders the error's `Display` as the public message
+/// *and* repeats the path under `details.path`, while several variants
+/// (`ChatFileMissing`, `LocalPathNotReadable`, `UploadPathOutsideRoot`) carry the
+/// absolute path. Both outlets have to be closed — sealing only the message leaves
+/// `details` as a second channel.
+///
+/// These callers address files by identity, so the absolute path is resolved
+/// server-side and the client has never seen it; disclosing it in an error would be
+/// telling the client something it had no way to know. Endpoints keyed on
+/// client-supplied paths are a different case (echoing back what the caller sent
+/// reveals nothing) and keep using the shared mapping.
+///
+/// Resolution failures collapse to one code deliberately: from the client's side
+/// "we could not resolve what you named" is a single outcome, and splitting it
+/// further would start signalling *why* — which is where path detail creeps back
+/// in. Internal failures stay `INTERNAL_ERROR`, whose public message is already
+/// fixed.
+fn chat_file_resolve_error(err: aionui_project::ProjectError) -> ApiError {
+    let code = err.code();
+    tracing::warn!(target: "chat_file", error = %err, code, "could not resolve chat file reference");
+    match err {
+        aionui_project::ProjectError::Database(_) => ApiError::Internal("failed to resolve target".to_owned()),
+        _ => ApiError::coded(
+            axum::http::StatusCode::NOT_FOUND,
+            "FILE_NOT_FOUND",
+            "The requested file no longer exists.",
+            None::<serde_json::Value>,
+        ),
+    }
+}
+
+/// `POST /api/fs/open-system` — open a `ChatFileRef`-addressed file with the OS
+/// default application ("open in system editor"). Preview surfaces this as the
+/// escape hatch for files it declines to render (oversized or unsupported
+/// formats), so it accepts all three preview sources rather than only project
+/// files the way `/api/fs/reveal` does.
+///
+/// # INV-OPEN (invariant — do not weaken)
+///
+/// This endpoint's sole effect is invoking the system opener **on the backend
+/// host**. It must never return the resolved absolute path to the client in any
+/// form:
+///
+/// - success → empty body;
+/// - failure → a stable error code plus a message that says nothing about the
+///   path (no `message`, no `details`, no code carrying a path fragment).
+///
+/// The client addressed this by identity and has no absolute path of its own; the
+/// one resolved here is server-side knowledge. Both failure sources are therefore
+/// narrowed on purpose: [`chat_file_resolve_error`] discards the resolver's
+/// path-bearing context, and the opener adapter logs its cause instead of
+/// returning it ([`FileError::TargetNotFound`] has no payload to fill). The
+/// earlier reveal implementation threaded a shell error's path through
+/// `NotFound(String)` into the response body; leaving nothing to forward is what
+/// stops that recurring.
+async fn open_system_file(
+>>>>>>> a621ed88 (feat(fs): add copy-absolute-path endpoint that writes the clipboard server-side (#803))
     State(state): State<FileRouterState>,
     body: Result<Json<RenameRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RenameResponse>>, ApiError> {
@@ -332,6 +485,7 @@ struct UploadMultipartFields {
     file_name: Option<String>,
     dispo_file_name: Option<String>,
     conversation_id: Option<String>,
+    workspace_relative_path: Option<String>,
 }
 
 /// Strip any directory component from a file name and reject empty results.
@@ -352,6 +506,7 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
     let mut file_name: Option<String> = None;
     let mut dispo_file_name: Option<String> = None;
     let mut conversation_id: Option<String> = None;
+    let mut workspace_relative_path: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -392,6 +547,13 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
                     conversation_id = Some(trimmed.to_owned());
                 }
             }
+            "workspace_relative_path" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("failed to read workspace_relative_path: {e}")))?;
+                workspace_relative_path = Some(text);
+            }
             _ => {}
         }
     }
@@ -403,11 +565,13 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
         file_name,
         dispo_file_name,
         conversation_id,
+        workspace_relative_path,
     })
 }
 
 async fn upload_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let fields = extract_upload_multipart(multipart).await?;
@@ -416,10 +580,34 @@ async fn upload_file(
         ApiError::BadRequest("missing file name: provide 'file_name' or a multipart filename".to_owned())
     })?;
 
-    let path = state
-        .file_service
-        .create_upload_file(&file_name, &fields.file_data, fields.conversation_id.as_deref())
-        .await?;
+    let force_workspace = fields.workspace_relative_path.is_some();
+    let workspace = match fields.conversation_id.as_deref() {
+        Some(conversation_id) => {
+            state
+                .upload_workspace_resolver
+                .resolve_workspace(&user.id, conversation_id, force_workspace)
+                .await?
+        }
+        None if force_workspace => {
+            return Err(ApiError::BadRequest(
+                "workspace upload requires conversation_id".to_owned(),
+            ));
+        }
+        None => None,
+    };
+
+    let path = if let Some(workspace) = workspace {
+        let relative_dir = fields.workspace_relative_path.as_deref().unwrap_or("uploads");
+        state
+            .file_service
+            .create_workspace_upload_file(&file_name, &fields.file_data, &workspace, Path::new(relative_dir))
+            .await?
+    } else {
+        state
+            .file_service
+            .create_upload_file(&file_name, &fields.file_data, fields.conversation_id.as_deref())
+            .await?
+    };
     Ok(Json(ApiResponse::ok(path)))
 }
 
@@ -774,6 +962,237 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+<<<<<<< HEAD
+=======
+    #[tokio::test]
+    async fn system_opener_receives_the_resolved_absolute_path() {
+        // The port takes the trusted absolute path resolved from the identity — the
+        // handler must not hand it anything client-derived.
+        let mock = MockSystemOpener::new(false);
+        let result = crate::traits::ISystemFileOpener::open(&mock, "/abs/target.docx").await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert_eq!(*mock.calls.lock().unwrap(), vec!["/abs/target.docx".to_owned()]);
+    }
+
+    /// INV-OPEN end to end at the seam: a failure carrying a path-shaped input must
+    /// still render a response with no trace of it.
+    #[tokio::test]
+    async fn system_open_failure_response_is_path_free() {
+        let mock = MockSystemOpener::new(true);
+        let err = crate::traits::ISystemFileOpener::open(&mock, "/Users/someone/secret-dir/private.docx")
+            .await
+            .expect_err("must fail");
+
+        let api_err = ApiError::from(err);
+        assert_eq!(api_err.error_code(), "FILE_NOT_FOUND");
+        let public = api_err.public_message();
+        let details = format!("{:?}", api_err.error_details());
+        for haystack in [&public, &details] {
+            assert!(
+                !haystack.contains("secret-dir") && !haystack.contains("private.docx"),
+                "response must not disclose the resolved path, got {haystack:?}"
+            );
+        }
+    }
+
+    // -- reveal_resolved: resolve → reveal wiring (mock revealer seam) ---------
+
+    /// Records the absolute paths handed to `reveal`, and optionally fails.
+    struct MockRevealer {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+    impl MockRevealer {
+        fn new(fail: bool) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                fail,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::traits::IItemRevealer for MockRevealer {
+        async fn reveal(&self, absolute_path: &str) -> Result<(), FileError> {
+            self.calls.lock().unwrap().push(absolute_path.to_owned());
+            if self.fail {
+                Err(FileError::RevealFailed("mock reveal failed".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reveal_resolved_passes_absolute_path_to_revealer() {
+        let mock = MockRevealer::new(false);
+        let result = reveal_resolved(&mock, Some("/abs/target.txt".to_owned())).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert_eq!(
+            *mock.calls.lock().unwrap(),
+            vec!["/abs/target.txt".to_owned()],
+            "revealer must receive the resolved absolute path"
+        );
+    }
+
+    #[tokio::test]
+    async fn reveal_resolved_without_local_path_is_bad_request_and_skips_reveal() {
+        let mock = MockRevealer::new(false);
+        let result = reveal_resolved(&mock, None).await;
+        assert!(
+            matches!(result, Err(FileError::BadRequest(_))),
+            "non-local target must be BadRequest, got {result:?}"
+        );
+        assert!(mock.calls.lock().unwrap().is_empty(), "revealer must not be called");
+    }
+
+    #[tokio::test]
+    async fn reveal_resolved_propagates_reveal_failure() {
+        let mock = MockRevealer::new(true);
+        let result = reveal_resolved(&mock, Some("/abs/x".to_owned())).await;
+        assert!(
+            matches!(result, Err(FileError::RevealFailed(_))),
+            "reveal failure must propagate, got {result:?}"
+        );
+    }
+
+    // -- copy_absolute_path_resolved: resolve → clipboard wiring (mock seam) ----
+
+    /// Records the text handed to `write_text`, and optionally fails.
+    struct MockClipboardWriter {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+    impl MockClipboardWriter {
+        fn new(fail: bool) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                fail,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl crate::traits::IClipboardWriter for MockClipboardWriter {
+        async fn write_text(&self, text: &str) -> Result<(), FileError> {
+            self.calls.lock().unwrap().push(text.to_owned());
+            if self.fail {
+                Err(FileError::Internal("mock clipboard failed".to_owned()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_absolute_path_resolved_writes_the_absolute_path_to_the_clipboard() {
+        // The backend performs the OS action (clipboard write) itself; the abs is
+        // never returned — the handler returns void on success.
+        let mock = MockClipboardWriter::new(false);
+        let result = copy_absolute_path_resolved(&mock, Some("/abs/target.txt".to_owned())).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert_eq!(
+            *mock.calls.lock().unwrap(),
+            vec!["/abs/target.txt".to_owned()],
+            "clipboard must receive the resolved absolute path"
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_absolute_path_resolved_without_local_path_is_bad_request_and_skips_clipboard() {
+        let mock = MockClipboardWriter::new(false);
+        let result = copy_absolute_path_resolved(&mock, None).await;
+        assert!(
+            matches!(result, Err(FileError::BadRequest(_))),
+            "non-local target must be BadRequest, got {result:?}"
+        );
+        assert!(mock.calls.lock().unwrap().is_empty(), "clipboard must not be called");
+    }
+
+    #[tokio::test]
+    async fn copy_absolute_path_resolved_propagates_clipboard_failure() {
+        let mock = MockClipboardWriter::new(true);
+        let result = copy_absolute_path_resolved(&mock, Some("/abs/x".to_owned())).await;
+        assert!(result.is_err(), "clipboard failure must propagate, got {result:?}");
+    }
+
+    /// The resolver seam shared by every `ChatFileRef`-addressed endpoint — the leak
+    /// the shared `From<ProjectError>` mapping introduces. Verified against it
+    /// directly: that mapping renders `ChatFileMissing`'s `Display` as the public
+    /// message ("attached file does not exist: /Users/…/private.docx") *and* repeats
+    /// the path under `details.path`. Both outlets are asserted, because sealing only
+    /// the message would leave `details` as a second channel.
+    #[test]
+    fn chat_file_resolve_error_is_path_free_for_path_bearing_variants() {
+        let secret = "/Users/someone/secret-dir/private.docx";
+        let variants = [
+            aionui_project::ProjectError::ChatFileMissing {
+                path: secret.to_owned(),
+            },
+            aionui_project::ProjectError::LocalPathNotReadable {
+                path: secret.to_owned(),
+            },
+            aionui_project::ProjectError::UploadPathOutsideRoot {
+                path: secret.to_owned(),
+            },
+        ];
+
+        for err in variants {
+            let api_err = chat_file_resolve_error(err);
+            assert_eq!(api_err.error_code(), "FILE_NOT_FOUND");
+            assert_eq!(api_err.status_code(), axum::http::StatusCode::NOT_FOUND);
+
+            let public = api_err.public_message();
+            let details = format!("{:?}", api_err.error_details());
+            for haystack in [&public, &details] {
+                assert!(
+                    !haystack.contains("secret-dir") && !haystack.contains("private.docx"),
+                    "resolve failure must not disclose the path, got {haystack:?}"
+                );
+            }
+        }
+    }
+
+    /// Every `ChatFileRef`-addressed handler must route its resolver failure through
+    /// [`chat_file_resolve_error`], not the shared `From<ProjectError>` mapping.
+    ///
+    /// Asserted against the source text because the alternative — spinning up five
+    /// authenticated handlers with a real `ProjectService` — would not actually pin
+    /// this: the wiring is a single `map_err` per handler, and a future edit swapping
+    /// one back to `ApiError::from` is exactly the regression worth catching. The
+    /// count guards against a sixth such endpoint being added without a decision:
+    /// bump it deliberately, having checked the new one addresses files by identity.
+    #[test]
+    fn every_chat_file_ref_endpoint_uses_the_sealed_resolver_mapping() {
+        // Scan handler code only. This test module mentions both needles in its own
+        // assertions, and counting those would inflate the totals.
+        let source = include_str!("routes.rs");
+        let handlers = source
+            .split_once("\n#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("routes.rs has a #[cfg(test)] module");
+
+        let resolve_calls = handlers.matches(".resolve_chat_file_ref(").count();
+        let sealed = handlers.matches(".map_err(chat_file_resolve_error)?").count();
+
+        assert_eq!(
+            resolve_calls, 5,
+            "expected 5 ChatFileRef-addressed endpoints (content read/write, metadata, stream, \
+             open-system); found {resolve_calls} — a new one must be checked for identity \
+             addressing and sealed before bumping this"
+        );
+        assert_eq!(
+            sealed, resolve_calls,
+            "every resolve_chat_file_ref call must map its error through \
+             chat_file_resolve_error; {sealed} of {resolve_calls} do. A handler using \
+             ApiError::from leaks the resolved absolute path in message and details."
+        );
+    }
+
+    /// The `Database` arm (reachable through `resolve_reference`) is deliberately
+    /// not covered here: constructing a `DbError` would mean adding `aionui-db` as a
+    /// dependency of this crate purely for a test. Its correctness rests on
+    /// `ApiError::Internal`'s public message being a fixed string, which
+    /// `aionui-common` already tests.
+>>>>>>> a621ed88 (feat(fs): add copy-absolute-path endpoint that writes the clipboard server-side (#803))
     #[test]
     fn dir_or_file_response_conversion_file() {
         let d = DirOrFile {

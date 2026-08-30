@@ -129,7 +129,14 @@ notify = "8"
 walkdir = "2"
 ignore = "0.4"
 zip = "2"
+<<<<<<< HEAD
 git2 = { version = "0.20", default-features = false }
+=======
+git2 = { version = "0.21.0", default-features = false }
+# Source-control discard sends untracked files to the platform trash instead of
+# unlinking them (mac/win/linux, x64 + arm64).
+trash = "5"
+>>>>>>> a621ed88 (feat(fs): add copy-absolute-path endpoint that writes the clipboard server-side (#803))
 mime_guess = "2"
 rust-embed = "8"
 
@@ -145,6 +152,12 @@ chrono-tz = "0.10"
 # Shell
 open = "5"
 which = "7"
+# Text-only clipboard. default-features off: `image-data` pulls `image`/`zune-jpeg`
+# which we don't use and currently fails to build. No `wayland-data-control` either:
+# it pulls wl-clipboard-rs → wayland-scanner (build-time) → the vulnerable quick-xml
+# 0.39 (RUSTSEC-2026-0194/0195). Without it, arboard uses its unconditional x11rb
+# backend on Linux (works under X11/XWayland); macOS/Windows unaffected.
+arboard = { version = "3", default-features = false }
 
 # Office
 calamine = "0.36"

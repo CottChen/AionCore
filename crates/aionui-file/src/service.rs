@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
@@ -349,6 +349,132 @@ fn split_base_ext(name: &str) -> (&str, &str) {
     match name.rfind('.') {
         Some(idx) if idx > 0 => name.split_at(idx),
         _ => (name, ""),
+    }
+}
+
+fn validate_upload_file_name(file_name: &str) -> Result<(), FileError> {
+    if file_name.is_empty() {
+        return Err(FileError::BadRequest("file name must not be empty".to_owned()));
+    }
+    if has_traversal(file_name) {
+        return Err(FileError::BadRequest(format!(
+            "file name '{}' contains invalid traversal patterns",
+            file_name
+        )));
+    }
+    if file_name.contains('/') || file_name.contains('\\') {
+        return Err(FileError::BadRequest(format!(
+            "file name '{}' must not contain path separators",
+            file_name
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_workspace_upload_dir(workspace: &Path, relative_dir: &Path) -> Result<PathBuf, FileError> {
+    let workspace = std::fs::canonicalize(workspace).map_err(|e| {
+        FileError::NotFound(format!(
+            "conversation workspace '{}' is unavailable: {e}",
+            workspace.display()
+        ))
+    })?;
+    if !workspace.is_dir() {
+        return Err(FileError::BadRequest(format!(
+            "conversation workspace '{}' is not a directory",
+            workspace.display()
+        )));
+    }
+
+    let mut current = workspace.clone();
+    for component in relative_dir.components() {
+        let segment = match component {
+            Component::Normal(segment) => segment,
+            Component::CurDir => continue,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(FileError::BadRequest(format!(
+                    "workspace upload path '{}' must be relative and must not contain traversal",
+                    relative_dir.display()
+                )));
+            }
+        };
+
+        let next = current.join(segment);
+        if next.exists() {
+            let canonical_next = std::fs::canonicalize(&next).map_err(|e| {
+                FileError::Internal(format!(
+                    "cannot resolve workspace upload directory '{}': {e}",
+                    next.display()
+                ))
+            })?;
+            if !canonical_next.starts_with(&workspace) {
+                return Err(FileError::Forbidden(format!(
+                    "workspace upload directory '{}' resolves outside the conversation workspace",
+                    next.display()
+                )));
+            }
+            if !canonical_next.is_dir() {
+                return Err(FileError::BadRequest(format!(
+                    "workspace upload target '{}' is not a directory",
+                    next.display()
+                )));
+            }
+            current = canonical_next;
+        } else {
+            std::fs::create_dir(&next).map_err(|e| {
+                FileError::Internal(format!(
+                    "cannot create workspace upload directory '{}': {e}",
+                    next.display()
+                ))
+            })?;
+            current = std::fs::canonicalize(&next).map_err(|e| {
+                FileError::Internal(format!(
+                    "cannot resolve created workspace upload directory '{}': {e}",
+                    next.display()
+                ))
+            })?;
+        }
+    }
+
+    Ok(current)
+}
+
+fn write_upload_file_sync(dir: &Path, name: &str, bytes: &[u8]) -> Result<String, FileError> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| FileError::Internal(format!("cannot create upload directory '{}': {e}", dir.display())))?;
+
+    let (base, ext) = split_base_ext(name);
+    let mut candidate = name.to_owned();
+    let mut counter: u32 = 2;
+    loop {
+        let file_path = dir.join(&candidate);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file_path)
+        {
+            Ok(mut file) => {
+                file.write_all(bytes).map_err(|e| {
+                    FileError::Internal(format!("cannot write upload file '{}': {e}", file_path.display()))
+                })?;
+                return Ok(file_path.to_string_lossy().into_owned());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if counter > 1000 {
+                    return Err(FileError::Internal(format!(
+                        "too many name collisions for upload file '{}'",
+                        name
+                    )));
+                }
+                candidate = format!("{base}({counter}){ext}");
+                counter += 1;
+            }
+            Err(error) => {
+                return Err(FileError::Internal(format!(
+                    "cannot write upload file '{}': {error}",
+                    file_path.display()
+                )));
+            }
+        }
     }
 }
 
@@ -917,21 +1043,7 @@ impl crate::traits::IFileService for FileService {
         data: &[u8],
         conversation_id: Option<&str>,
     ) -> Result<String, FileError> {
-        if file_name.is_empty() {
-            return Err(FileError::BadRequest("file name must not be empty".to_owned()));
-        }
-        if has_traversal(file_name) {
-            return Err(FileError::BadRequest(format!(
-                "file name '{}' contains invalid traversal patterns",
-                file_name
-            )));
-        }
-        if file_name.contains('/') || file_name.contains('\\') {
-            return Err(FileError::BadRequest(format!(
-                "file name '{}' must not contain path separators",
-                file_name
-            )));
-        }
+        validate_upload_file_name(file_name)?;
 
         // Validate optional conversation_id: no separators / traversal.
         let conv_id = match conversation_id {
@@ -957,46 +1069,32 @@ impl crate::traits::IFileService for FileService {
             } else {
                 dir = dir.join("general");
             }
-            std::fs::create_dir_all(&dir)
-                .map_err(|e| FileError::Internal(format!("cannot create upload directory: {e}")))?;
-
-            let (base, ext) = split_base_ext(&name);
-            let mut candidate = name.clone();
-            let mut counter: u32 = 2;
-            loop {
-                let file_path = dir.join(&candidate);
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&file_path)
-                {
-                    Ok(mut f) => {
-                        f.write_all(&bytes).map_err(|e| {
-                            FileError::Internal(format!("cannot write upload file '{}': {e}", file_path.display()))
-                        })?;
-                        return Ok(file_path.to_string_lossy().into_owned());
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        if counter > 1000 {
-                            return Err(FileError::Internal(format!(
-                                "too many name collisions for upload file '{}'",
-                                name
-                            )));
-                        }
-                        candidate = format!("{base}({counter}){ext}");
-                        counter += 1;
-                    }
-                    Err(e) => {
-                        return Err(FileError::Internal(format!(
-                            "cannot write upload file '{}': {e}",
-                            file_path.display()
-                        )));
-                    }
-                }
-            }
+            write_upload_file_sync(&dir, &name, &bytes)
         })
         .await
         .map_err(|e| FileError::Internal(format!("create upload file task failed: {e}")))?
+    }
+
+    async fn create_workspace_upload_file(
+        &self,
+        file_name: &str,
+        data: &[u8],
+        workspace: &Path,
+        relative_dir: &Path,
+    ) -> Result<String, FileError> {
+        validate_upload_file_name(file_name)?;
+
+        let workspace = workspace.to_path_buf();
+        let relative_dir = relative_dir.to_path_buf();
+        let name = file_name.to_owned();
+        let bytes = data.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let dir = resolve_workspace_upload_dir(&workspace, &relative_dir)?;
+            write_upload_file_sync(&dir, &name, &bytes)
+        })
+        .await
+        .map_err(|e| FileError::Internal(format!("create workspace upload file task failed: {e}")))?
     }
 
     async fn get_image_base64(&self, path: &str, extra_root: Option<&Path>) -> Result<String, FileError> {
