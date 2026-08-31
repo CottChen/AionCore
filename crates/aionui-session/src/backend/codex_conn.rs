@@ -3196,6 +3196,7 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
             | "fileChange"
             | "webSearch"
             | "imageGeneration"
+            | "image_generation_call"
     );
     if bracketed && !completed {
         out.push(SessionEvent::ItemStarted {
@@ -3226,7 +3227,13 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                 });
             }
         }
-        "commandExecution" | "mcpToolCall" | "dynamicToolCall" | "fileChange" | "webSearch" | "imageGeneration" => {
+        "commandExecution"
+        | "mcpToolCall"
+        | "dynamicToolCall"
+        | "fileChange"
+        | "webSearch"
+        | "imageGeneration"
+        | "image_generation_call" => {
             if completed {
                 // 009 R7/H3: a codex tool is failed when status==failed OR a command
                 // exited non-zero — carry it so a failed tool is not shown as success.
@@ -3266,7 +3273,7 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                 // decoded bytes as Image. SessionAgentTask materializes that transient
                 // Image inside the conversation workspace before persistence, keeping
                 // base64 out of the WebSocket and SQLite paths.
-                if item_type == "imageGeneration"
+                if is_codex_image_generation_item(item_type)
                     && let Some(path) = item.get("savedPath").and_then(Value::as_str)
                 {
                     content.push(crate::event::ToolResultContent::FilePath {
@@ -3275,7 +3282,7 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                         old_text: None,
                         new_text: None,
                     });
-                } else if item_type == "imageGeneration"
+                } else if is_codex_image_generation_item(item_type)
                     && let Some(image) = parse_codex_image_generation_result(item.get("result"))
                 {
                     content.push(image);
@@ -3425,9 +3432,13 @@ fn item_kind_for(item_type: &str) -> crate::event::ItemKind {
     match item_type {
         "agentMessage" => ItemKind::Text,
         "reasoning" => ItemKind::Thinking,
-        "imageGeneration" => ItemKind::Image,
+        item_type if is_codex_image_generation_item(item_type) => ItemKind::Image,
         _ => ItemKind::Tool,
     }
+}
+
+fn is_codex_image_generation_item(item_type: &str) -> bool {
+    matches!(item_type, "imageGeneration" | "image_generation_call")
 }
 
 /// thread/tokenUsage/updated → UsageDelta. codex gives BOTH total (cumulative)
@@ -3788,12 +3799,18 @@ fn parse_codex_image_generation_result(result: Option<&Value>) -> Option<crate::
     } else {
         raw
     };
+    let encoded: String = encoded
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect();
     if encoded.is_empty() {
         return None;
     }
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded))
+        .decode(&encoded)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&encoded))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&encoded))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&encoded))
         .ok()?;
     let media_type = image_media_type(&bytes)?;
     Some(ToolResultContent::Image {
@@ -5157,7 +5174,7 @@ mod tests {
                     t.as_str(),
                     "agentMessage" | "reasoning" | "commandExecution" | "mcpToolCall"
                         | "dynamicToolCall" | "fileChange" | "userMessage" | "collabAgent"
-                        | "webSearch" | "imageGeneration"
+                        | "webSearch" | "imageGeneration" | "image_generation_call"
                 );
                 if !t.is_empty() && !is_known {
                     prop_assert!(
@@ -9723,6 +9740,37 @@ mod tests {
                 "id": "call_base64",
                 "status": "completed",
                 "result": base64::engine::general_purpose::STANDARD.encode(png)
+            }
+        });
+
+        let events = map_item(&params, true);
+        let content: Vec<&crate::event::ToolResultContent> = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ToolResult { content, .. } => Some(content.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        assert!(content.iter().any(|content| matches!(content,
+            crate::event::ToolResultContent::Image { media_type, data }
+                if media_type == "image/png" && data == png
+        )));
+    }
+
+    #[test]
+    fn raw_codex_image_generation_call_reaches_inline_image() {
+        use base64::Engine as _;
+
+        let png = b"\x89PNG\r\n\x1a\nraw-image";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(png);
+        let params = serde_json::json!({
+            "item": {
+                "type": "image_generation_call",
+                "id": "call_raw",
+                "status": "completed",
+                "result": format!("data:image/png;base64,{}\n", encoded)
             }
         });
 
