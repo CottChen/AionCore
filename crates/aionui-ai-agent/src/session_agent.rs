@@ -4238,12 +4238,15 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
 fn tool_result_text(content: &[ToolResultContent]) -> Option<String> {
     let mut buf = String::new();
     for part in content {
-        if let ToolResultContent::Text(t) = part {
-            if !buf.is_empty() {
-                buf.push('\n');
-            }
-            buf.push_str(t);
+        let value = match part {
+            ToolResultContent::Text(text) => text,
+            ToolResultContent::FilePath { path, .. } => path,
+            _ => continue,
+        };
+        if !buf.is_empty() {
+            buf.push('\n');
         }
+        buf.push_str(value);
     }
     if buf.is_empty() { None } else { Some(buf) }
 }
@@ -4795,6 +4798,21 @@ mod translate_tests {
     use super::*;
     use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
     use aionui_session::PermissionKind;
+
+    #[test]
+    fn tool_result_text_preserves_generated_file_paths() {
+        let content = vec![ToolResultContent::FilePath {
+            path: "/Users/test/.codex/generated_images/session/ig_test_image.png".into(),
+            mime: None,
+            old_text: None,
+            new_text: None,
+        }];
+
+        assert_eq!(
+            tool_result_text(&content).as_deref(),
+            Some("/Users/test/.codex/generated_images/session/ig_test_image.png")
+        );
+    }
 
     fn usage_frame(total: u64, cost: Option<f64>, window: Option<u64>) -> serde_json::Value {
         let events = translate_event(
