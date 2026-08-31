@@ -3261,13 +3261,11 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                         });
                     }
                 }
-                // imageGeneration writes the produced image to disk and reports its
-                // path in `savedPath` (source-verified: v2/item.rs:372-380
-                // ImageGeneration{result:String(base64), saved_path:Option<AbsolutePathBuf>}
-                // → wire key `savedPath`). Previously DROPPED — we only read
-                // aggregatedOutput (a commandExecution-only field imageGeneration lacks),
-                // so the image card was empty. Carry the path as FilePath (NOT the
-                // base64 `result` as Text — that would dump megabytes of bytes).
+                // Newer Codex builds can omit `savedPath` and return only the image
+                // bytes in `result`. Prefer the path when it exists; otherwise carry
+                // decoded bytes as Image. SessionAgentTask materializes that transient
+                // Image inside the conversation workspace before persistence, keeping
+                // base64 out of the WebSocket and SQLite paths.
                 if item_type == "imageGeneration"
                     && let Some(path) = item.get("savedPath").and_then(Value::as_str)
                 {
@@ -3277,6 +3275,10 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                         old_text: None,
                         new_text: None,
                     });
+                } else if item_type == "imageGeneration"
+                    && let Some(image) = parse_codex_image_generation_result(item.get("result"))
+                {
+                    content.push(image);
                 }
                 if let Some(text) = item.get("aggregatedOutput").and_then(Value::as_str)
                     && !text.is_empty()
@@ -3771,6 +3773,47 @@ fn parse_codex_mcp_result(result: Option<&Value>) -> Vec<crate::event::ToolResul
         out.push(ToolResultContent::Text(s));
     }
     out
+}
+
+/// Decode the base64 payload returned by `imageGeneration` when Codex does not
+/// provide `savedPath`. The app-server schema calls this field a plain `String`,
+/// so reject non-image bytes instead of treating arbitrary tool output as a file.
+fn parse_codex_image_generation_result(result: Option<&Value>) -> Option<crate::event::ToolResultContent> {
+    use crate::event::ToolResultContent;
+    use base64::Engine as _;
+
+    let raw = result?.as_str()?;
+    let encoded = if let Some(data_url) = raw.strip_prefix("data:image/") {
+        data_url.split_once(',')?.1
+    } else {
+        raw
+    };
+    if encoded.is_empty() {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(encoded))
+        .ok()?;
+    let media_type = image_media_type(&bytes)?;
+    Some(ToolResultContent::Image {
+        media_type: media_type.to_string(),
+        data: bytes,
+    })
+}
+
+fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 /// Parse a completed `dynamicToolCall` item's `contentItems[]`
@@ -9667,6 +9710,36 @@ mod tests {
                 crate::event::ToolResultContent::Text(t) if t.contains("iVBORw0KGgo"))),
             "the base64 `result` bytes must NOT be dumped as Text, got {content:?}"
         );
+    }
+
+    #[test]
+    fn codex_imagegeneration_base64_reaches_inline_image() {
+        use base64::Engine as _;
+
+        let png = b"\x89PNG\r\n\x1a\nminimal-png";
+        let params = serde_json::json!({
+            "item": {
+                "type": "imageGeneration",
+                "id": "call_base64",
+                "status": "completed",
+                "result": base64::engine::general_purpose::STANDARD.encode(png)
+            }
+        });
+
+        let events = map_item(&params, true);
+        let content: Vec<&crate::event::ToolResultContent> = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::ToolResult { content, .. } => Some(content.iter()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+
+        assert!(content.iter().any(|content| matches!(content,
+            crate::event::ToolResultContent::Image { media_type, data }
+                if media_type == "image/png" && data == png
+        )));
     }
 
     /// LC-8a: codex `turn/plan/updated` → `SessionEvent::Plan`. step→content,

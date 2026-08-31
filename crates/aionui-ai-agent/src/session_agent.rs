@@ -455,6 +455,7 @@ impl SessionAgentTask {
             runtime.clone(),
             conversation_id.clone(),
             user_id.clone(),
+            workspace.clone(),
             session_repo.clone(),
             broadcaster,
         );
@@ -2333,6 +2334,7 @@ fn spawn_event_pump(
     runtime: Arc<SessionRuntime>,
     conversation_id: String,
     user_id: String,
+    workspace: String,
     session_repo: Option<Arc<dyn IAcpSessionRepository>>,
     broadcaster: Option<Arc<dyn EventBroadcaster>>,
 ) {
@@ -3019,7 +3021,8 @@ fn spawn_event_pump(
             if let (Some(bus), Some(_)) = (broadcaster.as_ref(), informative_usage(&env.event)) {
                 broadcast_usage_frame(bus.as_ref(), &conversation_id, &user_id, &env.event);
             }
-            for mut ev in translate_event(env.event, &conversation_id, terminal_result_seen) {
+            let event = materialize_inline_tool_images(env.event, &workspace, &conversation_id).await;
+            for mut ev in translate_event(event, &conversation_id, terminal_result_seen) {
                 // Keep the tool name alive across a call's multi-frame lifecycle (see
                 // `stamp_tool_name`): the terminal ToolResult frame leaves the name
                 // empty, and the upsert-by-call_id persistence would otherwise clobber
@@ -4233,6 +4236,107 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
     }
 }
 
+const MAX_INLINE_TOOL_IMAGE_BYTES: usize = 50 * 1024 * 1024;
+
+/// Persist inline tool images before the event is serialized into the origin
+/// tool-call format. The direct session protocol carries image bytes transiently,
+/// while the renderer expects a local path and the message store must not retain
+/// multi-megabyte base64 payloads.
+async fn materialize_inline_tool_images(event: SessionEvent, workspace: &str, conversation_id: &str) -> SessionEvent {
+    let SessionEvent::ToolResult {
+        tool_use_id,
+        is_error,
+        content,
+        parent_tool_use_id,
+    } = event
+    else {
+        return event;
+    };
+
+    let mut materialized = Vec::with_capacity(content.len());
+    for item in content {
+        match item {
+            ToolResultContent::Image { media_type, data } => {
+                match persist_inline_tool_image(workspace, conversation_id, &tool_use_id, &media_type, &data).await {
+                    Ok(path) => materialized.push(ToolResultContent::FilePath {
+                        path,
+                        mime: Some(media_type),
+                        old_text: None,
+                        new_text: None,
+                    }),
+                    Err(error) => tracing::warn!(
+                        conversation_id,
+                        tool_use_id,
+                        error = %error,
+                        "failed to persist inline tool image"
+                    ),
+                }
+            }
+            other => materialized.push(other),
+        }
+    }
+
+    SessionEvent::ToolResult {
+        tool_use_id,
+        is_error,
+        content: materialized,
+        parent_tool_use_id,
+    }
+}
+
+async fn persist_inline_tool_image(
+    workspace: &str,
+    conversation_id: &str,
+    tool_use_id: &str,
+    media_type: &str,
+    data: &[u8],
+) -> Result<String, std::io::Error> {
+    if data.len() > MAX_INLINE_TOOL_IMAGE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("inline image exceeds {MAX_INLINE_TOOL_IMAGE_BYTES} byte limit"),
+        ));
+    }
+
+    let extension = image_extension(media_type).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported inline image media type: {media_type}"),
+        )
+    })?;
+    let directory = std::path::Path::new(workspace)
+        .join(".aionui")
+        .join("generated-images")
+        .join(safe_path_component(conversation_id));
+    tokio::fs::create_dir_all(&directory).await?;
+    let path = directory.join(format!("{}.{}", safe_path_component(tool_use_id), extension));
+    tokio::fs::write(&path, data).await?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn image_extension(media_type: &str) -> Option<&'static str> {
+    match media_type {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        _ => None,
+    }
+}
+
+fn safe_path_component(value: &str) -> String {
+    let component: String = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .take(128)
+        .collect();
+    if component.is_empty() {
+        "generated".into()
+    } else {
+        component
+    }
+}
+
 /// Flatten a tool result's content parts into a single text string for the
 /// `ToolCallEventData.output` field (origin renders that).
 fn tool_result_text(content: &[ToolResultContent]) -> Option<String> {
@@ -4812,6 +4916,41 @@ mod translate_tests {
             tool_result_text(&content).as_deref(),
             Some("/Users/test/.codex/generated_images/session/ig_test_image.png")
         );
+    }
+
+    #[tokio::test]
+    async fn inline_tool_images_are_persisted_as_conversation_local_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let event = SessionEvent::ToolResult {
+            tool_use_id: "call/image:1".into(),
+            is_error: false,
+            content: vec![ToolResultContent::Image {
+                media_type: "image/png".into(),
+                data: b"\x89PNG\r\n\x1a\nimage".to_vec(),
+            }],
+            parent_tool_use_id: None,
+        };
+
+        let event = materialize_inline_tool_images(event, workspace.path().to_str().unwrap(), "conversation/one").await;
+        let SessionEvent::ToolResult { ref content, .. } = event else {
+            panic!("tool result should remain a tool result");
+        };
+        let ToolResultContent::FilePath { path, mime, .. } = &content[0] else {
+            panic!("inline image should become a file path: {content:?}");
+        };
+
+        assert_eq!(mime.as_deref(), Some("image/png"));
+        assert!(path.ends_with(".aionui/generated-images/conversationone/callimage1.png"));
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"\x89PNG\r\n\x1a\nimage");
+        let persisted_path = path.clone();
+
+        let output = translate_event(event, "conversation/one", false)
+            .into_iter()
+            .find_map(|event| match event {
+                AgentStreamEvent::ToolCall(data) => data.output,
+                _ => None,
+            });
+        assert_eq!(output.as_deref(), Some(persisted_path.as_str()));
     }
 
     fn usage_frame(total: u64, cost: Option<f64>, window: Option<u64>) -> serde_json::Value {
