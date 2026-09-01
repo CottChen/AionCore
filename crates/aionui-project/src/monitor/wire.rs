@@ -10,7 +10,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::runtime::{Change, DeltaBatch, EntryFact, FsError, Kind, SearchMatchKind, SearchMode, Snapshot};
+use crate::runtime::{
+    Change, DeltaBatch, EntryFact, FsError, Kind, SearchLimitReason, SearchMatchKind, SearchMode, SearchProgress,
+    Snapshot,
+};
 use crate::types::ProjectError;
 
 /// JSON-RPC version string carried on every frame.
@@ -106,6 +109,33 @@ pub struct SearchParams {
     pub mode: SearchMode,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Opaque provider continuation checkpoint returned by a prior page.
+    /// It has no authority implications: roots are resolved and authorized again
+    /// for every request.
+    #[serde(default)]
+    pub cursor: Option<SearchCursor>,
+}
+
+/// Per-root opaque continuation state. The token is created and consumed by the
+/// filesystem provider; the monitor only carries it between pages.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SearchCursor {
+    pub roots: Vec<SearchCursorRoot>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SearchCursorRoot {
+    pub pe_id: String,
+    pub cursor: String,
+}
+
+impl SearchCursor {
+    pub fn cursor_for(&self, pe_id: &str) -> Option<&str> {
+        self.roots
+            .iter()
+            .find(|root| root.pe_id == pe_id)
+            .map(|root| root.cursor.as_str())
+    }
 }
 
 /// `fs/searchCancel` notification params. `search_id` echoes the originating
@@ -138,11 +168,23 @@ pub fn search_match_params(search_id: &Value, matches: &[SearchHit]) -> Value {
     })
 }
 
-/// Build the `fs/search` terminal response `result` (`{ limit_reached, total }`).
-pub fn search_result(limit_reached: bool, total: usize) -> Value {
+/// Build the `fs/search` terminal response. The legacy fields stay intact while
+/// diagnostics tell the UI which bound fired and whether another page exists.
+pub fn search_result(
+    limit_reached: bool,
+    total: usize,
+    reasons: Vec<SearchLimitReason>,
+    progress: SearchProgress,
+    next_cursor: Option<SearchCursor>,
+) -> Value {
     json!({
         "limit_reached": limit_reached,
         "total": total,
+        "limit_reasons": reasons,
+        "scanned_files": progress.scanned_files,
+        "searched_content_bytes": progress.searched_content_bytes,
+        "skipped_large_files": progress.skipped_large_files,
+        "next_cursor": next_cursor,
     })
 }
 

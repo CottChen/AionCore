@@ -15,7 +15,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::canonical;
-use crate::runtime::{Budget, CancellationToken, Command, MatchMode, SearchQuery, ShardOutput, Subscriber};
+use crate::runtime::{
+    Budget, CancellationToken, Command, DEFAULT_CONTENT_SEARCH_BYTES, MatchMode, SearchQuery, ShardOutput, Subscriber,
+};
 use crate::types::{FileOp, ReferenceInput, ResolvedResource};
 
 use super::actor::FsMonitorActor;
@@ -307,6 +309,10 @@ impl FsMonitorActor {
                 Ok(resolved) => roots.push(SearchRoot {
                     root_uri: resolved.resource_uri,
                     pe_id: root.pe_id.clone(),
+                    cursor: p
+                        .cursor
+                        .as_ref()
+                        .and_then(|cursor| cursor.cursor_for(&root.pe_id).map(str::to_owned)),
                 }),
                 Err((code, message)) => {
                     tracing::warn!(session, user_id, code = message, pe_id = %root.pe_id, "fs search rejected");
@@ -330,7 +336,10 @@ impl FsMonitorActor {
         };
 
         let query = SearchQuery::new(&p.query, p.mode, MatchMode::Substring);
-        let budget = Budget::new(p.limit.unwrap_or(search::DEFAULT_SEARCH_LIMIT));
+        let budget = Budget::with_content_byte_limit(
+            p.limit.unwrap_or(search::DEFAULT_SEARCH_LIMIT),
+            DEFAULT_CONTENT_SEARCH_BYTES,
+        );
         let cancel = CancellationToken::new();
         // Supersede any prior in-flight search on this connection (cancels it).
         self.register_search(

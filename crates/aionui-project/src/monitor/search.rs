@@ -21,7 +21,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::runtime::{Budget, CancellationToken, IFsSearchProvider, ProviderSearchHit, SearchQuery, SearchSink};
 
 use super::port::FsWirePush;
-use super::wire::{self, SearchHit};
+use super::wire::{self, SearchCursor, SearchCursorRoot, SearchHit};
 
 /// Default global hit budget when the request omits `limit`.
 pub(super) const DEFAULT_SEARCH_LIMIT: usize = 1000;
@@ -46,6 +46,7 @@ pub(super) struct ActiveSearch {
 pub(super) struct SearchRoot {
     pub(super) root_uri: String,
     pub(super) pe_id: String,
+    pub(super) cursor: Option<String>,
 }
 
 /// One search's coordinator inputs (beyond the shared provider/push handles):
@@ -132,8 +133,14 @@ impl MatchCollector {
     }
 
     /// Push the terminal `fs/search` response for the originating request `id`.
-    fn emit_terminal(&self, limit_reached: bool) {
-        let result = wire::search_result(limit_reached, self.total());
+    fn emit_terminal(&self, limit_reached: bool, next_cursor: Option<SearchCursor>, budget: &Budget) {
+        let result = wire::search_result(
+            limit_reached,
+            self.total(),
+            budget.limit_reasons(),
+            budget.progress(),
+            next_cursor,
+        );
         self.push
             .push(&self.session, wire::success(Some(self.search_id.clone()), result));
     }
@@ -189,19 +196,29 @@ pub(super) async fn run_search(
         let query = Arc::clone(&query);
         let budget = budget.clone();
         let cancel = cancel.clone();
+        let pe_id = root.pe_id;
         let sink: Arc<dyn SearchSink> = Arc::new(RootSink {
-            pe_id: root.pe_id,
+            pe_id: pe_id.clone(),
             collector: Arc::clone(&collector),
         });
         let root_uri = root.root_uri;
+        let cursor = root.cursor;
         handles.push(tokio::spawn(async move {
-            provider.search(&root_uri, &query, &sink, &budget, &cancel).await
+            provider
+                .search(&root_uri, &query, &sink, &budget, &cancel, cursor.as_deref())
+                .await
+                .map(|outcome| (pe_id, outcome))
         }));
     }
 
+    let mut cursor_roots = Vec::new();
     for handle in handles {
         match handle.await {
-            Ok(Ok(())) => {}
+            Ok(Ok((pe_id, outcome))) => {
+                if let Some(cursor) = outcome.next_after {
+                    cursor_roots.push(SearchCursorRoot { pe_id, cursor });
+                }
+            }
             // A single root failing (unreadable, provider error) must not sink
             // the others or the terminal frame — surface and continue.
             Ok(Err(err)) => tracing::warn!(error = %err, "fs search: root walk failed"),
@@ -220,7 +237,19 @@ pub(super) async fn run_search(
 
     collector.flush();
     let limit_reached = budget.limit_reached();
-    tracing::info!(session = %session, total = collector.total(), limit_reached, "fs search complete");
+    cursor_roots.sort_by(|a, b| a.pe_id.cmp(&b.pe_id));
+    let next_cursor = (!cursor_roots.is_empty()).then_some(SearchCursor { roots: cursor_roots });
+    let progress = budget.progress();
+    tracing::info!(
+        session = %session,
+        total = collector.total(),
+        limit_reached,
+        scanned_files = progress.scanned_files,
+        searched_content_bytes = progress.searched_content_bytes,
+        skipped_large_files = progress.skipped_large_files,
+        resumable = next_cursor.is_some(),
+        "fs search complete"
+    );
 
     // Signal completion to the actor BEFORE the terminal frame: the actor clears
     // its active-search entry first, so a client that reacts to the terminal by
@@ -241,7 +270,7 @@ pub(super) async fn run_search(
     // already-finished search is a no-op and `active_searches` removal is
     // idempotent.
     let _ = done.send(SearchDone { session, search_id });
-    collector.emit_terminal(limit_reached);
+    collector.emit_terminal(limit_reached, next_cursor, &budget);
 }
 
 #[cfg(test)]

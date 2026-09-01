@@ -12,13 +12,19 @@
 //! Feature semantics / engine / chat-ref identity: `formal/runtime/search.md`;
 //! protocol: `formal/runtime/protocol.md` `fs/search`.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::error::FsError;
+
+/// Total file-content bytes one interactive search page may read across all
+/// roots. Individual providers may impose a lower per-file ceiling.
+pub const DEFAULT_CONTENT_SEARCH_BYTES: u64 = 128 * 1024 * 1024;
 
 /// How the cheap backend filename predicate matches a candidate name against the
 /// query. Backend only *bounds* the hit set cheaply; final fuzzy ranking is the
@@ -48,6 +54,35 @@ pub enum SearchMatchKind {
     Name,
     Content,
     Both,
+}
+
+/// A safety bound that made a search incomplete, or caused eligible files to
+/// be skipped. Kept separate from the hit count so clients can explain whether
+/// refining the query, continuing, or changing file-size settings will help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchLimitReason {
+    ResultLimit,
+    ScanLimit,
+    ContentByteLimit,
+    FileSizeLimit,
+}
+
+/// Metadata collected during one search page. It deliberately contains no
+/// paths or query text, so it is safe to place on the monitor wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchProgress {
+    pub scanned_files: usize,
+    pub searched_content_bytes: u64,
+    pub skipped_large_files: usize,
+}
+
+/// The outcome of searching one root. `next_after` is an opaque provider-owned
+/// continuation token when the page stopped early; `None` means the root was
+/// exhausted. The monitor forwards it unchanged and never interprets it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchWalkResult {
+    pub next_after: Option<String>,
 }
 
 /// A precompiled, cheap filename predicate derived from the search `query`.
@@ -113,6 +148,10 @@ impl SearchQuery {
     pub fn needle(&self) -> &str {
         &self.needle
     }
+
+    pub fn mode(&self) -> SearchMode {
+        self.mode
+    }
 }
 
 /// Whether every char of `needle` appears in `hay` in order (both prelowered).
@@ -143,6 +182,11 @@ struct BudgetInner {
     /// Set once a walk tried to emit while `remaining == 0` — distinguishes
     /// "hit exactly the cap and there were more" from "found fewer than cap".
     hit_cap: AtomicBool,
+    remaining_content_bytes: AtomicU64,
+    scanned_files: AtomicUsize,
+    searched_content_bytes: AtomicU64,
+    skipped_large_files: AtomicUsize,
+    reasons: Mutex<BTreeSet<SearchLimitReason>>,
 }
 
 impl Budget {
@@ -151,7 +195,21 @@ impl Budget {
         Self(Arc::new(BudgetInner {
             remaining: AtomicUsize::new(limit),
             hit_cap: AtomicBool::new(false),
+            remaining_content_bytes: AtomicU64::new(u64::MAX),
+            scanned_files: AtomicUsize::new(0),
+            searched_content_bytes: AtomicU64::new(0),
+            skipped_large_files: AtomicUsize::new(0),
+            reasons: Mutex::new(BTreeSet::new()),
         }))
+    }
+
+    /// A hit budget with a shared upper bound on bytes read for content search.
+    /// The budget is global across roots, preventing a multi-root query from
+    /// multiplying the configured resource use.
+    pub fn with_content_byte_limit(limit: usize, content_bytes: u64) -> Self {
+        let budget = Self::new(limit);
+        budget.0.remaining_content_bytes.store(content_bytes, Ordering::Relaxed);
+        budget
     }
 
     /// Reserve one emit slot. Returns `true` if a slot was taken; `false` when
@@ -164,19 +222,71 @@ impl Budget {
             .is_ok();
         if !taken {
             self.0.hit_cap.store(true, Ordering::Relaxed);
+            self.mark_limit_reached(SearchLimitReason::ResultLimit);
         }
         taken
     }
 
     /// Whether any walk was forced to stop because the cap was reached.
     pub fn limit_reached(&self) -> bool {
-        self.0.hit_cap.load(Ordering::Relaxed)
+        self.0.hit_cap.load(Ordering::Relaxed) || !self.limit_reasons().is_empty()
     }
 
-    /// Record that a non-hit safety bound (for example scanned-file count)
-    /// stopped a walk before it naturally completed.
-    pub fn mark_limit_reached(&self) {
+    /// Record a named safety bound. A single search can hit more than one
+    /// reason across different roots, so reasons are accumulated.
+    pub fn mark_limit_reached(&self, reason: SearchLimitReason) {
         self.0.hit_cap.store(true, Ordering::Relaxed);
+        self.0
+            .reasons
+            .lock()
+            .expect("search budget reasons mutex poisoned")
+            .insert(reason);
+    }
+
+    /// Reserve bytes before reading one content file. A failed reservation
+    /// stops that root page before the file, making the returned cursor safe to
+    /// resume from without skipping the candidate.
+    pub fn try_take_content_bytes(&self, bytes: u64) -> bool {
+        let taken = self
+            .0
+            .remaining_content_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(bytes)
+            })
+            .is_ok();
+        if taken {
+            self.0.searched_content_bytes.fetch_add(bytes, Ordering::Relaxed);
+        } else {
+            self.mark_limit_reached(SearchLimitReason::ContentByteLimit);
+        }
+        taken
+    }
+
+    pub fn record_scanned_file(&self) {
+        self.0.scanned_files.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_skipped_large_file(&self) {
+        self.0.skipped_large_files.fetch_add(1, Ordering::Relaxed);
+        self.mark_limit_reached(SearchLimitReason::FileSizeLimit);
+    }
+
+    pub fn progress(&self) -> SearchProgress {
+        SearchProgress {
+            scanned_files: self.0.scanned_files.load(Ordering::Relaxed),
+            searched_content_bytes: self.0.searched_content_bytes.load(Ordering::Relaxed),
+            skipped_large_files: self.0.skipped_large_files.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn limit_reasons(&self) -> Vec<SearchLimitReason> {
+        self.0
+            .reasons
+            .lock()
+            .expect("search budget reasons mutex poisoned")
+            .iter()
+            .copied()
+            .collect()
     }
 }
 
@@ -235,7 +345,8 @@ pub trait IFsSearchProvider: Send + Sync {
         sink: &Arc<dyn SearchSink>,
         budget: &Budget,
         cancel: &CancellationToken,
-    ) -> Result<(), FsError>;
+        cursor: Option<&str>,
+    ) -> Result<SearchWalkResult, FsError>;
 }
 
 #[cfg(test)]

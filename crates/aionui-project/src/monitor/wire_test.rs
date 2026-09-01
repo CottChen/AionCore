@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::runtime::{Change, DeltaBatch, EntryFact, FsError, Kind, Snapshot};
+use crate::runtime::{Change, DeltaBatch, EntryFact, FsError, Kind, SearchLimitReason, SearchProgress, Snapshot};
 use crate::types::ProjectError;
 
 use super::*;
@@ -241,6 +241,22 @@ fn search_params_parse_roots_query_and_default_limit() {
 
     let content: SearchParams = serde_json::from_value(json!({"roots":[],"query":"design","mode":"content"})).unwrap();
     assert_eq!(content.mode, SearchMode::Content);
+
+    let continued: SearchParams = serde_json::from_value(json!({
+        "roots": [],
+        "query": "design",
+        "cursor": {"roots": [{"pe_id": "pe1", "cursor": "session-token"}]}
+    }))
+    .unwrap();
+    assert_eq!(
+        continued.cursor,
+        Some(SearchCursor {
+            roots: vec![SearchCursorRoot {
+                pe_id: "pe1".to_owned(),
+                cursor: "session-token".to_owned(),
+            }],
+        })
+    );
 }
 
 #[test]
@@ -284,8 +300,41 @@ fn search_match_params_batches_hits_under_search_id() {
 
 #[test]
 fn search_result_carries_limit_reached_and_total() {
-    assert_eq!(search_result(false, 2), json!({"limit_reached":false,"total":2}));
-    assert_eq!(search_result(true, 200), json!({"limit_reached":true,"total":200}));
+    assert_eq!(
+        search_result(false, 2, vec![], SearchProgress::default(), None),
+        json!({
+            "limit_reached": false,
+            "total": 2,
+            "limit_reasons": [],
+            "scanned_files": 0,
+            "searched_content_bytes": 0,
+            "skipped_large_files": 0,
+            "next_cursor": null,
+        })
+    );
+    assert_eq!(
+        search_result(
+            true,
+            200,
+            vec![SearchLimitReason::ResultLimit],
+            SearchProgress::default(),
+            Some(SearchCursor {
+                roots: vec![SearchCursorRoot {
+                    pe_id: "pe1".to_owned(),
+                    cursor: "session-token".to_owned(),
+                }],
+            }),
+        ),
+        json!({
+            "limit_reached": true,
+            "total": 200,
+            "limit_reasons": ["result_limit"],
+            "scanned_files": 0,
+            "searched_content_bytes": 0,
+            "skipped_large_files": 0,
+            "next_cursor": {"roots":[{"pe_id":"pe1","cursor":"session-token"}]},
+        })
+    );
 }
 
 // ── error mapping ─────────────────────────────────────────────────────────

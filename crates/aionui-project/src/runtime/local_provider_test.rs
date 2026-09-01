@@ -7,11 +7,11 @@ use crate::canonical::{self, Canonical};
 use crate::runtime::error::FsError;
 use crate::runtime::provider::{IFsProvider, Kind};
 use crate::runtime::search::{
-    Budget, CancellationToken, IFsSearchProvider, MatchMode, ProviderSearchHit, SearchMatchKind, SearchMode,
-    SearchQuery, SearchSink,
+    Budget, CancellationToken, IFsSearchProvider, MatchMode, ProviderSearchHit, SearchLimitReason, SearchMatchKind,
+    SearchMode, SearchQuery, SearchSink,
 };
 
-use super::LocalFsProvider;
+use super::{LocalFsProvider, MAX_SEARCH_FILE_BYTES};
 
 /// Canonical `file:` URI for a filesystem path (test helper).
 fn canon(path: &Path) -> Canonical {
@@ -308,7 +308,7 @@ async fn search_collect_mode(
     let budget = Budget::new(limit);
     let cancel = CancellationToken::new();
     provider
-        .search(canon(root).as_str(), &query, &sink, &budget, &cancel)
+        .search(canon(root).as_str(), &query, &sink, &budget, &cancel, None)
         .await
         .unwrap();
     let mut hits = collect.hits();
@@ -414,7 +414,7 @@ async fn search_cancelled_before_start_emits_nothing() {
     let cancel = CancellationToken::new();
     cancel.cancel(); // cancelled up front
     provider
-        .search(canon(root).as_str(), &query, &sink, &budget, &cancel)
+        .search(canon(root).as_str(), &query, &sink, &budget, &cancel, None)
         .await
         .unwrap();
     // The very first stride check (index 0) sees the cancel and returns.
@@ -462,4 +462,124 @@ async fn content_search_skips_binary_and_non_utf8_files() {
 
     let (hits, _) = search_collect_mode(root, "design", MatchMode::Substring, SearchMode::Content, 100).await;
     assert!(hits.is_empty());
+}
+
+#[tokio::test]
+async fn search_continues_after_a_result_page_without_duplicate_hits() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    for index in 0..7 {
+        std::fs::write(root.join(format!("file-{index:02}.txt")), b"x").unwrap();
+    }
+
+    let provider = LocalFsProvider::new();
+    let query = SearchQuery::new("", SearchMode::Name, MatchMode::Substring);
+    let cancel = CancellationToken::new();
+    let mut cursor = None;
+    let mut all_paths = Vec::new();
+    let mut scanned_per_page = Vec::new();
+
+    for _ in 0..3 {
+        let collect = Arc::new(CollectSink::default());
+        let sink: Arc<dyn SearchSink> = collect.clone();
+        let budget = Budget::new(3);
+        let outcome = provider
+            .search(canon(root).as_str(), &query, &sink, &budget, &cancel, cursor.as_deref())
+            .await
+            .unwrap();
+        all_paths.extend(collect.hits().into_iter().map(|hit| hit.relative_path));
+        scanned_per_page.push(budget.progress().scanned_files);
+        cursor = outcome.next_after;
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    all_paths.sort();
+    assert_eq!(all_paths.len(), 7);
+    assert!(all_paths.windows(2).all(|pair| pair[0] != pair[1]));
+    assert_eq!(all_paths.first().map(String::as_str), Some("file-00.txt"));
+    assert_eq!(all_paths.last().map(String::as_str), Some("file-06.txt"));
+    assert_eq!(scanned_per_page, vec![7, 0, 0]);
+}
+
+#[tokio::test]
+async fn content_byte_budget_returns_an_initial_cursor_for_continuation() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("match.txt"), "find this content").unwrap();
+
+    let provider = LocalFsProvider::new();
+    let collect = Arc::new(CollectSink::default());
+    let sink: Arc<dyn SearchSink> = collect.clone();
+    let query = SearchQuery::new("find", SearchMode::Content, MatchMode::Substring);
+    let budget = Budget::with_content_byte_limit(100, 4);
+    let outcome = provider
+        .search(
+            canon(root).as_str(),
+            &query,
+            &sink,
+            &budget,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(collect.hits().is_empty());
+    assert!(outcome.next_after.is_some());
+    assert_ne!(outcome.next_after.as_deref(), Some(""));
+    assert_eq!(budget.limit_reasons(), vec![SearchLimitReason::ContentByteLimit]);
+}
+
+#[tokio::test]
+async fn search_rejects_an_unknown_or_expired_continuation_token() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("match.txt"), "find this content").unwrap();
+
+    let provider = LocalFsProvider::new();
+    let sink: Arc<dyn SearchSink> = Arc::new(CollectSink::default());
+    let query = SearchQuery::new("find", SearchMode::Content, MatchMode::Substring);
+    let err = provider
+        .search(
+            canon(root).as_str(),
+            &query,
+            &sink,
+            &Budget::new(100),
+            &CancellationToken::new(),
+            Some("missing-session-token"),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, FsError::Io { message, .. } if message.contains("continuation expired")));
+}
+
+#[tokio::test]
+async fn content_search_reports_large_files_instead_of_silently_skipping_them() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("large.txt"), vec![b'x'; MAX_SEARCH_FILE_BYTES as usize + 1]).unwrap();
+
+    let provider = LocalFsProvider::new();
+    let collect = Arc::new(CollectSink::default());
+    let sink: Arc<dyn SearchSink> = collect.clone();
+    let query = SearchQuery::new("needle", SearchMode::Content, MatchMode::Substring);
+    let budget = Budget::new(100);
+    provider
+        .search(
+            canon(root).as_str(),
+            &query,
+            &sink,
+            &budget,
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(collect.hits().is_empty());
+    assert_eq!(budget.progress().skipped_large_files, 1);
+    assert_eq!(budget.limit_reasons(), vec![SearchLimitReason::FileSizeLimit]);
 }

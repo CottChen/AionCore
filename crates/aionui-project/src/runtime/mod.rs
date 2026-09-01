@@ -25,8 +25,9 @@ pub use error::FsError;
 pub use fs_runtime::{FsRuntimeRegistry, IFsRuntime, IoDispatch, LocalFsRuntime};
 pub use provider::{EntryFact, IFsProvider, Kind};
 pub use search::{
-    Budget, CancellationToken, IFsSearchProvider, MatchMode, NameMatcher, ProviderSearchHit, SearchMatchKind,
-    SearchMode, SearchQuery, SearchSink,
+    Budget, CancellationToken, DEFAULT_CONTENT_SEARCH_BYTES, IFsSearchProvider, MatchMode, NameMatcher,
+    ProviderSearchHit, SearchLimitReason, SearchMatchKind, SearchMode, SearchProgress, SearchQuery, SearchSink,
+    SearchWalkResult,
 };
 // Note: the concrete `file:` impls `LocalFsProvider` / `LocalWatcher` are
 // `pub(crate)` (internal) — external callers build via `LocalFsRuntime` and see

@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::unbounded_channel;
 
-use crate::runtime::{FsError, MatchMode, ProviderSearchHit, SearchMatchKind, SearchMode, SearchQuery};
+use crate::runtime::{
+    FsError, MatchMode, ProviderSearchHit, SearchMatchKind, SearchMode, SearchQuery, SearchWalkResult,
+};
 
 use super::*;
 
@@ -49,20 +51,21 @@ impl IFsSearchProvider for ScriptedProvider {
         sink: &Arc<dyn SearchSink>,
         budget: &Budget,
         cancel: &CancellationToken,
-    ) -> Result<(), FsError> {
+        _after: Option<&str>,
+    ) -> Result<SearchWalkResult, FsError> {
         let Some(hits) = self.by_root.get(root_uri) else {
-            return Ok(());
+            return Ok(SearchWalkResult::default());
         };
         let mut emitted = 0usize;
         for (rel, name) in hits {
             if cancel.is_cancelled() {
-                return Ok(());
+                return Ok(SearchWalkResult::default());
             }
             if !query.matches_name(name) {
                 continue;
             }
             if !budget.try_take() {
-                return Ok(());
+                return Ok(SearchWalkResult::default());
             }
             sink.emit(ProviderSearchHit {
                 relative_path: rel.clone(),
@@ -76,7 +79,7 @@ impl IFsSearchProvider for ScriptedProvider {
                 cancel.cancel();
             }
         }
-        Ok(())
+        Ok(SearchWalkResult::default())
     }
 }
 
@@ -105,7 +108,27 @@ fn one_root(uri: &str, pe_id: &str) -> Vec<SearchRoot> {
     vec![SearchRoot {
         root_uri: uri.to_owned(),
         pe_id: pe_id.to_owned(),
+        cursor: None,
     }]
+}
+
+struct CursorProvider;
+
+#[async_trait]
+impl IFsSearchProvider for CursorProvider {
+    async fn search(
+        &self,
+        _root_uri: &str,
+        _query: &SearchQuery,
+        _sink: &Arc<dyn SearchSink>,
+        _budget: &Budget,
+        _cancel: &CancellationToken,
+        _after: Option<&str>,
+    ) -> Result<SearchWalkResult, FsError> {
+        Ok(SearchWalkResult {
+            next_after: Some("src/last-processed.rs".to_owned()),
+        })
+    }
 }
 
 #[tokio::test]
@@ -125,10 +148,12 @@ async fn merges_roots_stamps_pe_id_sends_terminal_and_signals_done() {
         SearchRoot {
             root_uri: "file:///a".to_owned(),
             pe_id: "pe1".to_owned(),
+            cursor: None,
         },
         SearchRoot {
             root_uri: "file:///b".to_owned(),
             pe_id: "pe2".to_owned(),
+            cursor: None,
         },
     ];
 
@@ -161,12 +186,41 @@ async fn merges_roots_stamps_pe_id_sends_terminal_and_signals_done() {
     // Terminal response for the originating id, total = hits, not capped.
     let term = terminal(&frames).expect("terminal frame");
     assert_eq!(term["id"], 7);
-    assert_eq!(term["result"], json!({"limit_reached": false, "total": 2}));
+    assert_eq!(term["result"]["limit_reached"], false);
+    assert_eq!(term["result"]["total"], 2);
+    assert_eq!(term["result"]["limit_reasons"], json!([]));
+    assert_eq!(term["result"]["next_cursor"], Value::Null);
 
     // Natural completion signals done for exactly this session + search_id.
     let done = done_rx.try_recv().expect("done signal");
     assert_eq!(done.session, "sess");
     assert_eq!(done.search_id, json!(7));
+}
+
+#[tokio::test]
+async fn terminal_carries_a_resumable_cursor_from_an_incomplete_root() {
+    let push = Arc::new(CapturePush::default());
+    let (done_tx, _done_rx) = unbounded_channel();
+
+    run_search(
+        Arc::new(CursorProvider),
+        push.clone(),
+        SearchJob {
+            session: "sess".to_owned(),
+            search_id: json!(9),
+            roots: one_root("file:///a", "pe1"),
+            query: SearchQuery::new("needle", SearchMode::Content, MatchMode::Substring),
+            budget: Budget::new(100),
+            cancel: CancellationToken::new(),
+        },
+        done_tx,
+    )
+    .await;
+
+    assert_eq!(
+        terminal(&push.frames()).unwrap()["result"]["next_cursor"],
+        json!({"roots": [{"pe_id": "pe1", "cursor": "src/last-processed.rs"}]})
+    );
 }
 
 #[tokio::test]
@@ -193,10 +247,12 @@ async fn multi_root_shares_one_global_budget() {
                 SearchRoot {
                     root_uri: "file:///a".to_owned(),
                     pe_id: "pe1".to_owned(),
+                    cursor: None,
                 },
                 SearchRoot {
                     root_uri: "file:///b".to_owned(),
                     pe_id: "pe2".to_owned(),
+                    cursor: None,
                 },
             ],
             query: SearchQuery::new("", SearchMode::Name, MatchMode::Substring),
@@ -213,10 +269,10 @@ async fn multi_root_shares_one_global_budget() {
         3,
         "global budget caps total across roots"
     );
-    assert_eq!(
-        terminal(&frames).unwrap()["result"],
-        json!({"limit_reached": true, "total": 3})
-    );
+    let result = &terminal(&frames).unwrap()["result"];
+    assert_eq!(result["limit_reached"], true);
+    assert_eq!(result["total"], 3);
+    assert_eq!(result["limit_reasons"], json!(["result_limit"]));
 }
 
 #[tokio::test]

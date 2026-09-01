@@ -9,13 +9,17 @@
 //! Folder root — belongs on the command path and is deferred to the WS handler
 //! stage. This provider currently performs no realpath containment.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ignore::WalkBuilder;
+use uuid::Uuid;
 
 use crate::canonical;
 
@@ -23,23 +27,59 @@ use super::error::FsError;
 use super::noise::should_hide;
 use super::provider::{EntryFact, IFsProvider, Kind};
 use super::search::{
-    Budget, CancellationToken, IFsSearchProvider, ProviderSearchHit, SearchMatchKind, SearchQuery, SearchSink,
+    Budget, CancellationToken, IFsSearchProvider, ProviderSearchHit, SearchLimitReason, SearchMatchKind, SearchQuery,
+    SearchSink, SearchWalkResult,
 };
 
 /// How often, in walked entries, the blocking walk re-checks the cancel token
 /// (checking every entry would be needless overhead on a large tree).
 const CANCEL_CHECK_STRIDE: usize = 128;
-const MAX_SEARCH_SCANNED_FILES: usize = 5000;
-const MAX_SEARCH_FILE_BYTES: u64 = 512 * 1024;
+/// Filename-only search never reads a file, so it can safely cover large source
+/// trees before offering the user a continuation page.
+const MAX_SEARCH_SCANNED_FILES: usize = 100_000;
+const MAX_SEARCH_SESSIONS: usize = 4;
+const MAX_SEARCH_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+const SEARCH_SESSION_TTL: Duration = Duration::from_secs(120);
+/// Keep one pathological generated/log file from dominating an interactive
+/// content search. The shared page byte budget is enforced separately.
+const MAX_SEARCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const CONTENT_PREVIEW_CHARS: usize = 240;
 
 /// Local-disk provider for the `file:` scheme.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct LocalFsProvider;
+#[derive(Debug, Clone)]
+pub(crate) struct LocalFsProvider {
+    search_sessions: Arc<Mutex<SearchSessionStore>>,
+}
+
+#[derive(Debug)]
+struct SearchSessionStore {
+    sessions: HashMap<String, SearchSession>,
+}
+
+#[derive(Debug)]
+struct SearchSession {
+    root: PathBuf,
+    entries: Vec<String>,
+    next_index: usize,
+    query: String,
+    mode: super::search::SearchMode,
+    truncated: bool,
+    updated_at: Instant,
+}
 
 impl LocalFsProvider {
     pub fn new() -> Self {
-        Self
+        Self {
+            search_sessions: Arc::new(Mutex::new(SearchSessionStore {
+                sessions: HashMap::new(),
+            })),
+        }
+    }
+}
+
+impl Default for LocalFsProvider {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -263,32 +303,79 @@ impl IFsSearchProvider for LocalFsProvider {
         sink: &Arc<dyn SearchSink>,
         budget: &Budget,
         cancel: &CancellationToken,
-    ) -> Result<(), FsError> {
+        cursor: Option<&str>,
+    ) -> Result<SearchWalkResult, FsError> {
         let root = path_of(root_uri)?;
-        // The `ignore` walk is synchronous and CPU/IO-bound; run it off the async
-        // worker so it never blocks the actor's event loop. Shared budget/cancel
-        // are cheap Arc handles moved into the blocking task.
-        let (query, sink, budget, cancel) = (query.clone(), Arc::clone(sink), budget.clone(), cancel.clone());
-        tokio::task::spawn_blocking(move || walk_search(&root, &query, &sink, &budget, &cancel))
+        // Enumeration and content reads are synchronous and CPU/IO-bound; run
+        // them off the async worker. A continuation retains only a bounded list
+        // of relative paths, never previous file contents or emitted hits.
+        let (query, sink, budget, cancel, cursor, sessions) = (
+            query.clone(),
+            Arc::clone(sink),
+            budget.clone(),
+            cancel.clone(),
+            cursor.map(str::to_owned),
+            Arc::clone(&self.search_sessions),
+        );
+        tokio::task::spawn_blocking(move || search_page(&root, &query, &sink, &budget, &cancel, cursor, sessions))
             .await
             .map_err(|e| FsError::Io {
                 uri: root_uri.to_owned(),
                 message: format!("search walk task join failed: {e}"),
-            })
+            })?
     }
 }
 
-/// The blocking `ignore` tree walk backing [`LocalFsProvider::search`].
-/// Honors `.gitignore` / git excludes (same walker ripgrep uses); emits matching
-/// files, stopping on budget exhaustion, scan bounds, or cancellation.
-fn walk_search(
+/// Build or resume one bounded search session, then process a single result
+/// page. Subsequent pages reuse `entries` and `next_index`; they do not walk or
+/// sort the directory again.
+fn search_page(
     root: &Path,
     query: &SearchQuery,
     sink: &Arc<dyn SearchSink>,
     budget: &Budget,
     cancel: &CancellationToken,
-) {
-    let walker = WalkBuilder::new(root)
+    cursor: Option<String>,
+    sessions: Arc<Mutex<SearchSessionStore>>,
+) -> Result<SearchWalkResult, FsError> {
+    let mut session = match cursor.as_deref() {
+        Some(token) => take_search_session(&sessions, token, root, query)?,
+        None => {
+            let (entries, truncated) = collect_search_entries(root, budget, cancel);
+            SearchSession {
+                root: root.to_path_buf(),
+                entries,
+                next_index: 0,
+                query: query.needle().to_owned(),
+                mode: query.mode(),
+                truncated,
+                updated_at: Instant::now(),
+            }
+        }
+    };
+    if session.truncated {
+        budget.mark_limit_reached(SearchLimitReason::ScanLimit);
+    }
+
+    let outcome = search_catalog(&mut session, query, sink, budget, cancel);
+    if cancel.is_cancelled() || outcome.next_after.is_none() {
+        return Ok(outcome);
+    }
+
+    let token = cursor.unwrap_or_else(|| Uuid::now_v7().to_string());
+    session.updated_at = Instant::now();
+    store_search_session(&sessions, token.clone(), session);
+    Ok(SearchWalkResult {
+        next_after: Some(token),
+    })
+}
+
+/// Enumerate a stable, bounded catalog once. The list contains only relative
+/// paths, so continuation memory is proportional to file names rather than
+/// file size or result count.
+fn collect_search_entries(root: &Path, budget: &Budget, cancel: &CancellationToken) -> (Vec<String>, bool) {
+    let mut builder = WalkBuilder::new(root);
+    builder
         .hidden(false)
         .git_ignore(true)
         .git_global(false)
@@ -297,14 +384,18 @@ fn walk_search(
         // Hide OS-junk / VCS-internal noise, matching the tree listing. On a
         // directory this also prevents descent, so `.git` internals never leak
         // into search results (the `ignore` crate does not skip `.git` itself).
-        .filter_entry(|entry| entry.file_name().to_str().map(|n| !should_hide(n)).unwrap_or(true))
-        .build();
+        .filter_entry(|entry| entry.file_name().to_str().map(|n| !should_hide(n)).unwrap_or(true));
+    // A stable path order makes the catalog deterministic while the session is
+    // alive. It is paid once on the first page, never on continuation pages.
+    builder.sort_by_file_path(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+    let walker = builder.build();
 
     let mut scanned_files = 0usize;
+    let mut entries = Vec::new();
+    let mut catalog_bytes = 0usize;
     for (seen, entry) in walker.enumerate() {
-        // Periodic cancel check so a large no-hit subtree still bails promptly.
         if seen.is_multiple_of(CANCEL_CHECK_STRIDE) && cancel.is_cancelled() {
-            return;
+            return (Vec::new(), false);
         }
         let entry = match entry {
             Ok(e) => e,
@@ -319,31 +410,104 @@ fn walk_search(
         if entry.file_type().is_none_or(|ft| ft.is_dir()) {
             continue;
         }
-        scanned_files += 1;
-        if scanned_files > MAX_SEARCH_SCANNED_FILES {
-            budget.mark_limit_reached();
-            return;
+        if scanned_files >= MAX_SEARCH_SCANNED_FILES {
+            return (entries, true);
         }
-        let path = entry.path();
-        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        scanned_files += 1;
+        budget.record_scanned_file();
+        // Keep only the forward-slash relative path. It is sufficient to build
+        // the native path later and avoids retaining duplicate name strings.
+        let relative_path = rel_path(root, entry.path());
+        if catalog_bytes.saturating_add(relative_path.len()) > MAX_SEARCH_CATALOG_BYTES {
+            return (entries, true);
+        }
+        catalog_bytes += relative_path.len();
+        entries.push(relative_path);
+    }
+    (entries, false)
+}
+
+fn take_search_session(
+    sessions: &Arc<Mutex<SearchSessionStore>>,
+    token: &str,
+    root: &Path,
+    query: &SearchQuery,
+) -> Result<SearchSession, FsError> {
+    let mut store = sessions.lock().expect("search session store mutex poisoned");
+    prune_search_sessions(&mut store);
+    let Some(session) = store.sessions.remove(token) else {
+        return Err(FsError::Io {
+            uri: root.to_string_lossy().into_owned(),
+            message: "search continuation expired or is no longer available".to_owned(),
+        });
+    };
+    if session.root != root || session.query != query.needle() || session.mode != query.mode() {
+        return Err(FsError::Io {
+            uri: root.to_string_lossy().into_owned(),
+            message: "search continuation does not match this request".to_owned(),
+        });
+    }
+    Ok(session)
+}
+
+fn store_search_session(sessions: &Arc<Mutex<SearchSessionStore>>, token: String, session: SearchSession) {
+    let mut store = sessions.lock().expect("search session store mutex poisoned");
+    prune_search_sessions(&mut store);
+    while store.sessions.len() >= MAX_SEARCH_SESSIONS {
+        let Some(oldest) = store
+            .sessions
+            .iter()
+            .min_by_key(|(_, session)| session.updated_at)
+            .map(|(token, _)| token.clone())
+        else {
+            break;
+        };
+        store.sessions.remove(&oldest);
+    }
+    store.sessions.insert(token, session);
+}
+
+fn prune_search_sessions(store: &mut SearchSessionStore) {
+    let now = Instant::now();
+    store
+        .sessions
+        .retain(|_, session| now.duration_since(session.updated_at) <= SEARCH_SESSION_TTL);
+}
+
+fn search_catalog(
+    session: &mut SearchSession,
+    query: &SearchQuery,
+    sink: &Arc<dyn SearchSink>,
+    budget: &Budget,
+    cancel: &CancellationToken,
+) -> SearchWalkResult {
+    while session.next_index < session.entries.len() {
+        if cancel.is_cancelled() {
+            return SearchWalkResult::default();
+        }
+        let relative_path = &session.entries[session.next_index];
+        let path = session.root.join(relative_path);
+        let Some(name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
+            session.next_index += 1;
             continue;
         };
         let name_matches = query.matches_name(&name);
         let content_match = if query.searches_content() {
-            search_file_content(path, query.needle())
+            match search_file_content(&path, query.needle(), budget) {
+                ContentSearch::Match(found) => Some(found),
+                ContentSearch::NoMatch => None,
+                ContentSearch::BudgetExhausted => return incomplete_search_page(),
+            }
         } else {
             None
         };
+        session.next_index += 1;
         if !name_matches && content_match.is_none() {
             continue;
         }
-        if cancel.is_cancelled() {
-            return;
-        }
-        // Reserve a hit slot from the shared global budget; failure = cap reached
-        // (budget records `limit_reached`) → stop this root's walk.
         if !budget.try_take() {
-            return;
+            session.next_index -= 1;
+            return incomplete_search_page();
         }
         let (content_match_count, content_preview) = content_match
             .map(|(count, preview)| (Some(count), preview))
@@ -355,36 +519,62 @@ fn walk_search(
             (false, false) => continue,
         };
         sink.emit(ProviderSearchHit {
-            relative_path: rel_path(root, path),
+            relative_path: relative_path.clone(),
             name,
             match_kind,
             content_match_count,
             content_preview,
         });
     }
+    SearchWalkResult::default()
 }
 
-fn search_file_content(path: &Path, needle: &str) -> Option<(usize, Option<String>)> {
-    let metadata = std::fs::metadata(path).ok()?;
+fn incomplete_search_page() -> SearchWalkResult {
+    SearchWalkResult {
+        // Marker only; `search_page` replaces it with an opaque session token.
+        next_after: Some(String::new()),
+    }
+}
+
+enum ContentSearch {
+    NoMatch,
+    Match((usize, Option<String>)),
+    BudgetExhausted,
+}
+
+fn search_file_content(path: &Path, needle: &str, budget: &Budget) -> ContentSearch {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return ContentSearch::NoMatch;
+    };
     if !metadata.is_file() || metadata.len() > MAX_SEARCH_FILE_BYTES {
-        return None;
+        if metadata.is_file() {
+            budget.record_skipped_large_file();
+        }
+        return ContentSearch::NoMatch;
     }
-    let bytes = std::fs::read(path).ok()?;
+    if !budget.try_take_content_bytes(metadata.len()) {
+        return ContentSearch::BudgetExhausted;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return ContentSearch::NoMatch;
+    };
     if bytes.iter().take(8192).any(|byte| *byte == 0) {
-        return None;
+        return ContentSearch::NoMatch;
     }
-    let content = String::from_utf8(bytes).ok()?;
+    let Ok(content) = String::from_utf8(bytes) else {
+        return ContentSearch::NoMatch;
+    };
     let lowered = content.to_lowercase();
     let count = lowered.matches(needle).count();
     if count == 0 {
-        return None;
+        return ContentSearch::NoMatch;
     }
     let preview = content
         .lines()
         .find(|line| line.to_lowercase().contains(needle))
         .map(|line| line.trim().chars().take(CONTENT_PREVIEW_CHARS).collect::<String>())
         .filter(|line| !line.is_empty());
-    Some((count, preview))
+    ContentSearch::Match((count, preview))
 }
 
 /// Root-relative path, forward-slash normalized, no leading slash (wire form).

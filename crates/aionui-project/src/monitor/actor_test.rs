@@ -13,8 +13,8 @@ use crate::canonical::to_file_uri;
 use crate::monitor::{FsInbound, FsMonitorActor, FsWirePush};
 use crate::runtime::{
     Budget, CancellationToken, EntryFact, FsError, IFsRuntime, IFsSearchProvider, Kind, LocalFsRuntime, MatchMode,
-    ProviderSearchHit, RawEvent, SearchMatchKind, SearchMode, SearchQuery, SearchSink, ShardOutput, Snapshot,
-    Subscriber,
+    ProviderSearchHit, RawEvent, SearchMatchKind, SearchMode, SearchQuery, SearchSink, SearchWalkResult, ShardOutput,
+    Snapshot, Subscriber,
 };
 
 use super::super::search::{ActiveSearch, SearchDone, SearchJob, SearchRoot, run_search};
@@ -994,7 +994,8 @@ impl IFsSearchProvider for BarrierSearchProvider {
         sink: &Arc<dyn SearchSink>,
         budget: &Budget,
         _cancel: &CancellationToken,
-    ) -> Result<(), FsError> {
+        _after: Option<&str>,
+    ) -> Result<SearchWalkResult, FsError> {
         self.entered.notify_one(); // tell the test the search is in-flight
         self.release.notified().await; // park until released
         if budget.try_take() {
@@ -1006,7 +1007,7 @@ impl IFsSearchProvider for BarrierSearchProvider {
                 content_preview: None,
             });
         }
-        Ok(())
+        Ok(SearchWalkResult::default())
     }
 }
 
@@ -1100,6 +1101,7 @@ async fn completion_signals_done_actor_clears_and_later_cancel_is_noop() {
             roots: vec![SearchRoot {
                 root_uri: to_file_uri(dir.path()).unwrap(),
                 pe_id: pe.clone(),
+                cursor: None,
             }],
             query: SearchQuery::new("", SearchMode::Name, MatchMode::Substring),
             budget: Budget::new(100),
