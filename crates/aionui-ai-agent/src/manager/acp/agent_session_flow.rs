@@ -7,6 +7,7 @@ use crate::protocol::events::{
     TipsEventData,
 };
 use crate::protocol::send_error::AgentSendError;
+use crate::services::AgentSessionInspectionService;
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::v1::{
@@ -363,7 +364,13 @@ impl AcpAgentManager {
         // a turn once Finish is seen. The session event tracker only observes
         // CLI notifications, not runtime-emitted frames, so the snapshot
         // (which backs GET /usage) is updated here directly.
-        if let Some(mut frame) = end_turn_usage_frame_from_response(&prompt_response) {
+        let end_turn_usage = end_turn_usage_frame_from_response(&prompt_response);
+        let pi_local_usage = if end_turn_usage.is_none() && self.params.metadata.backend.as_deref() == Some("pi") {
+            AgentSessionInspectionService::new().pi_context_usage(sid).await
+        } else {
+            None
+        };
+        if let Some(mut frame) = end_turn_usage.or(pi_local_usage) {
             if let Ok(mut update) = serde_json::from_value::<UsageUpdate>(frame.clone()) {
                 let mut session = self.session.write().await;
                 // Agents like OpenCode report through BOTH channels: a mid-turn

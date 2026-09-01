@@ -4,6 +4,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aionui_api_types::{
     AgentSessionBackend, AgentSessionChildTask, AgentSessionItem, AgentSessionItemKind, AgentSessionScope,
@@ -19,6 +20,8 @@ const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_LIST_LIMIT: usize = 500;
 const MAX_ITEMS: usize = 4_000;
 const MAX_VALUE_CHARS: usize = 100_000;
+const PI_USAGE_READ_ATTEMPTS: usize = 3;
+const PI_USAGE_RETRY_DELAY: Duration = Duration::from_millis(75);
 
 #[derive(Debug, Clone)]
 pub struct AgentSessionInspectionService {
@@ -92,6 +95,30 @@ impl AgentSessionInspectionService {
         })
         .await
         .map_err(|error| AgentError::internal(format!("CLI session reader stopped unexpectedly: {error}")))?
+    }
+
+    /// Read Pi's local end-of-turn usage when its ACP adapter did not forward it.
+    ///
+    /// Pi writes the assistant message to JSONL near the end of `prompt()`. A
+    /// short retry makes that asynchronous flush race harmless without making a
+    /// missing or unreadable local history affect the agent response.
+    pub async fn pi_context_usage(&self, id: &str) -> Option<Value> {
+        validate_session_id(id).ok()?;
+        for attempt in 0..PI_USAGE_READ_ATTEMPTS {
+            let service = self.clone();
+            let id = id.to_owned();
+            let usage = tokio::task::spawn_blocking(move || service.read_pi_context_usage(&id))
+                .await
+                .ok()
+                .flatten();
+            if usage.is_some() {
+                return usage;
+            }
+            if attempt + 1 < PI_USAGE_READ_ATTEMPTS {
+                tokio::time::sleep(PI_USAGE_RETRY_DELAY).await;
+            }
+        }
+        None
     }
 
     fn list_codex(&self, scope: AgentSessionScope, limit: usize) -> Result<Vec<AgentSessionSummary>, AgentError> {
@@ -334,6 +361,24 @@ impl AgentSessionInspectionService {
             }
         }
         Err(AgentError::not_found(format!("Pi session '{id}' was not found")))
+    }
+
+    fn read_pi_context_usage(&self, id: &str) -> Option<Value> {
+        let session_dir = self.pi_agent_dir.join("sessions");
+        if !session_dir.is_dir() {
+            return None;
+        }
+        for path in pi_session_files(&session_dir) {
+            let filename_matches = pi_id_from_filename(&path).as_deref() == Some(id);
+            let header_matches = filename_matches || pi_session_file_matches_id(&path, id).unwrap_or(false);
+            if !header_matches {
+                continue;
+            }
+            if let Ok(Some(usage)) = parse_pi_context_usage(&path, &self.pi_agent_dir) {
+                return Some(usage);
+            }
+        }
+        None
     }
 }
 
@@ -806,6 +851,131 @@ fn pi_session_files(session_dir: &Path) -> impl Iterator<Item = PathBuf> {
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file() && entry.path().extension().is_some_and(|ext| ext == "jsonl"))
         .map(|entry| entry.into_path())
+}
+
+fn pi_session_file_matches_id(path: &Path, id: &str) -> Result<bool, AgentError> {
+    let file = File::open(path).map_err(|error| io_error("open Pi session", error))?;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| io_error("read Pi session", error))?;
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(Value::as_str) == Some("session") {
+            return Ok(entry.get("id").and_then(Value::as_str) == Some(id));
+        }
+    }
+    Ok(false)
+}
+
+struct PiContextUsage {
+    used: u64,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    reasoning: u64,
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+fn parse_pi_context_usage(path: &Path, pi_agent_dir: &Path) -> Result<Option<Value>, AgentError> {
+    let file = File::open(path).map_err(|error| io_error("open Pi session", error))?;
+    let mut provider = None::<String>;
+    let mut model = None::<String>;
+    let mut latest = None::<PiContextUsage>;
+
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| io_error("read Pi session", error))?;
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(Value::as_str) == Some("model_change") {
+            provider = entry
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(provider);
+            model = entry
+                .get("modelId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or(model);
+            continue;
+        }
+        if entry.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let message = &entry["message"];
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        provider = message
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or(provider);
+        model = message
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or(model);
+        let usage = &message["usage"];
+        let Some(used) = usage
+            .get("totalTokens")
+            .and_then(Value::as_u64)
+            .filter(|used| *used > 0)
+        else {
+            continue;
+        };
+        latest = Some(PiContextUsage {
+            used,
+            input: usage.get("input").and_then(Value::as_u64).unwrap_or(0),
+            output: usage.get("output").and_then(Value::as_u64).unwrap_or(0),
+            cache_read: usage.get("cacheRead").and_then(Value::as_u64).unwrap_or(0),
+            cache_write: usage.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0),
+            reasoning: usage.get("reasoning").and_then(Value::as_u64).unwrap_or(0),
+            provider: provider.clone(),
+            model: model.clone(),
+        });
+    }
+    Ok(latest.map(|usage| {
+        json!({
+            "used": usage.used,
+            "size": pi_model_context_window(pi_agent_dir, usage.provider.as_deref(), usage.model.as_deref()),
+            "_meta": {
+                "input_tokens": usage.input,
+                "output_tokens": usage.output,
+                "cached_read_tokens": usage.cache_read,
+                "cached_write_tokens": usage.cache_write,
+                "thought_tokens": usage.reasoning,
+            },
+        })
+    }))
+}
+
+fn pi_model_context_window(pi_agent_dir: &Path, provider: Option<&str>, model: Option<&str>) -> u64 {
+    let (Some(provider), Some(model)) = (provider, model) else {
+        return 0;
+    };
+    let Ok(models) = fs::read_to_string(pi_agent_dir.join("models.json")) else {
+        return 0;
+    };
+    let Ok(models) = serde_json::from_str::<Value>(&models) else {
+        return 0;
+    };
+    models
+        .get("providers")
+        .and_then(|providers| providers.get(provider))
+        .and_then(|provider| provider.get("models"))
+        .and_then(Value::as_array)
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(model))
+        })
+        .and_then(|model| model.get("contextWindow"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
 }
 
 fn parse_pi_summary(path: &Path) -> Result<Option<AgentSessionSummary>, AgentError> {
@@ -1419,5 +1589,60 @@ mod tests {
             .unwrap();
         assert_eq!(snapshot.session.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(snapshot.turns[0].items[1].status.as_deref(), Some("completed"));
+    }
+
+    #[tokio::test]
+    async fn reads_the_latest_pi_usage_for_the_matching_session_only() {
+        let codex = TempDir::new().unwrap();
+        let opencode = TempDir::new().unwrap();
+        let pi = TempDir::new().unwrap();
+        let sessions = pi.path().join("sessions").join("workspace");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            pi.path().join("models.json"),
+            json!({"providers":{"provider-a":{"models":[{"id":"model-a","contextWindow":128000}]}}}).to_string(),
+        )
+        .unwrap();
+        let target = sessions.join("history.jsonl");
+        let mut target_file = File::create(target).unwrap();
+        writeln!(target_file, "{}", json!({"type":"session","id":"pi-target"})).unwrap();
+        writeln!(
+            target_file,
+            "{}",
+            json!({"type":"model_change","provider":"provider-a","modelId":"model-a"})
+        )
+        .unwrap();
+        writeln!(target_file, "{}", json!({"type":"message","message":{"role":"assistant","usage":{"input":100,"output":20,"cacheRead":10,"cacheWrite":5,"reasoning":7,"totalTokens":135}}})).unwrap();
+        writeln!(target_file, "{}", json!({"type":"message","message":{"role":"assistant","usage":{"input":200,"output":30,"cacheRead":20,"cacheWrite":0,"reasoning":11,"totalTokens":250}}})).unwrap();
+        let mut other_file = File::create(sessions.join("other_pi-other.jsonl")).unwrap();
+        writeln!(other_file, "{}", json!({"type":"session","id":"pi-other"})).unwrap();
+        writeln!(
+            other_file,
+            "{}",
+            json!({"type":"message","message":{"role":"assistant","usage":{"totalTokens":999}}})
+        )
+        .unwrap();
+
+        let service = AgentSessionInspectionService::with_roots(
+            codex.path().to_owned(),
+            opencode.path().to_owned(),
+            pi.path().to_owned(),
+        );
+
+        assert_eq!(
+            service.pi_context_usage("pi-target").await,
+            Some(json!({
+                "used": 250,
+                "size": 128000,
+                "_meta": {
+                    "input_tokens": 200,
+                    "output_tokens": 30,
+                    "cached_read_tokens": 20,
+                    "cached_write_tokens": 0,
+                    "thought_tokens": 11,
+                },
+            }))
+        );
+        assert_eq!(service.read_pi_context_usage("pi-missing"), None);
     }
 }
