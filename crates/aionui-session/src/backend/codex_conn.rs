@@ -1485,6 +1485,10 @@ async fn reader_task(
     // wait so an unfollowed systemError still terminates the turn.
     let mut system_error_pending = false;
     let mut system_error_deadline: Option<tokio::time::Instant> = None;
+    // The app server can place a raw Responses image result immediately AFTER its
+    // turn/completed notification. Keep the successful terminal briefly pending so
+    // that late result is persisted before the conversation relay observes Finish.
+    let mut pending_turn_terminal: Option<(SessionEvent, tokio::time::Instant)> = None;
 
     let mut lines = BufReader::new(stdout).lines();
     // Unbounded mid-turn read (AGENTS.md §"出了问题必须查到根因": NO mid-turn
@@ -1493,34 +1497,48 @@ async fn reader_task(
     // agentMessage. A wedged turn is ended by user Cancel, per the no-auto-timeout
     // design; startup binding is the only thing bounded, via bound_thread_within).
     // A REAL fatal signal (error{willRetry:false}) still synthesizes a terminal below.
-    // The ONLY bounded read is the SYSTEM_ERROR_GRACE below, armed strictly AFTER
-    // codex has already declared the thread fatally errored (status→systemError) —
-    // it cannot false-kill a healthy turn.
+    // Bounded reads are armed only after Codex has already declared a turn terminal:
+    // SYSTEM_ERROR_GRACE preserves a rich failure, while CODEX_TERMINAL_DRAIN_GRACE
+    // waits for a late raw image result. Neither is a mid-turn watchdog.
     loop {
-        let next = match system_error_deadline {
-            Some(deadline) if system_error_pending && !terminated => {
-                match tokio::time::timeout_at(deadline, lines.next_line()).await {
-                    Ok(read) => read,
-                    Err(_elapsed) => {
-                        // Grace expired: no rich follow-up arrived after systemError
-                        // (never observed live — defensive bound). Fall back to the
-                        // opaque terminal so the FSM leaves Running.
-                        terminated = true;
-                        system_error_pending = false;
-                        system_error_deadline = None;
-                        *active_turn_id.lock().await = None;
-                        turn_in_flight.store(false, Ordering::SeqCst);
-                        emit(
-                            &event_tx,
-                            &session_id,
-                            turn_gen.load(Ordering::SeqCst),
-                            synth_error_terminal("codex reported a system error".into()),
-                        );
-                        continue;
+        let next = match pending_turn_terminal.as_ref() {
+            Some((_, deadline)) => match tokio::time::timeout_at(*deadline, lines.next_line()).await {
+                Ok(read) => read,
+                Err(_elapsed) => {
+                    let (terminal, _) = pending_turn_terminal
+                        .take()
+                        .expect("pending terminal exists while its grace timer is armed");
+                    *active_turn_id.lock().await = None;
+                    turn_in_flight.store(false, Ordering::SeqCst);
+                    emit(&event_tx, &session_id, turn_gen.load(Ordering::SeqCst), terminal);
+                    continue;
+                }
+            },
+            None => match system_error_deadline {
+                Some(deadline) if system_error_pending && !terminated => {
+                    match tokio::time::timeout_at(deadline, lines.next_line()).await {
+                        Ok(read) => read,
+                        Err(_elapsed) => {
+                            // Grace expired: no rich follow-up arrived after systemError
+                            // (never observed live — defensive bound). Fall back to the
+                            // opaque terminal so the FSM leaves Running.
+                            terminated = true;
+                            system_error_pending = false;
+                            system_error_deadline = None;
+                            *active_turn_id.lock().await = None;
+                            turn_in_flight.store(false, Ordering::SeqCst);
+                            emit(
+                                &event_tx,
+                                &session_id,
+                                turn_gen.load(Ordering::SeqCst),
+                                synth_error_terminal("codex reported a system error".into()),
+                            );
+                            continue;
+                        }
                     }
                 }
-            }
-            _ => lines.next_line().await,
+                _ => lines.next_line().await,
+            },
         };
         if !system_error_pending || terminated {
             system_error_deadline = None;
@@ -1609,6 +1627,14 @@ async fn reader_task(
                             }
                         }
                         if m == "turn/started" {
+                            // A new turn cannot belong to the prior terminal's late
+                            // image-result window. Flush the old terminal first so
+                            // every event stays attached to the correct turn.
+                            if let Some((terminal, _)) = pending_turn_terminal.take() {
+                                *active_turn_id.lock().await = None;
+                                turn_in_flight.store(false, Ordering::SeqCst);
+                                emit(&event_tx, &session_id, cur, terminal);
+                            }
                             *pending_goal_activation.lock().await = None;
                             terminated = false; // a new turn can terminate once (R8 reset)
                             idle_pending = false; // and a fresh turn has no deferred idle
@@ -1644,14 +1670,27 @@ async fn reader_task(
                                 &mut idle_pending,
                                 &mut system_error_pending,
                             ) {
-                                // Turn ended → clear the active turn id (a stale token
-                                // would make a later steer/interrupt target a dead turn).
-                                *active_turn_id.lock().await = None;
-                                *pending_goal_activation.lock().await = None;
-                                // F-4: turn terminal → clear the turn-active flag so the
-                                // idle timer may suspend the now-idle process.
-                                turn_in_flight.store(false, Ordering::SeqCst);
-                                emit(&event_tx, &session_id, cur, ev);
+                                if matches!(
+                                    ev,
+                                    SessionEvent::TurnResult {
+                                        is_error: false,
+                                        outcome: TurnOutcome::Completed { .. },
+                                        ..
+                                    }
+                                ) {
+                                    // A rawResponseItem/completed image can race behind
+                                    // this terminal. Do not let StreamRelay break before
+                                    // its ToolResult has been materialized and persisted.
+                                    pending_turn_terminal =
+                                        Some((ev, tokio::time::Instant::now() + CODEX_TERMINAL_DRAIN_GRACE));
+                                } else {
+                                    // Failed/interrupted turns are not delayed: callers
+                                    // need their terminal state and error immediately.
+                                    *active_turn_id.lock().await = None;
+                                    *pending_goal_activation.lock().await = None;
+                                    turn_in_flight.store(false, Ordering::SeqCst);
+                                    emit(&event_tx, &session_id, cur, ev);
+                                }
                             } else if system_error_pending && !was_pending {
                                 // systemError was just deferred: arm the bounded grace
                                 // for the rich follow-up (error{willRetry:false} /
@@ -1734,6 +1773,14 @@ async fn reader_task(
                         }
                         for ev in map_notification(m, params) {
                             emit(&event_tx, &session_id, cur, scope_notice_to_turn(ev, cur));
+                        }
+                        if raw_image_result_completed(m, params)
+                            && let Some((terminal, _)) = pending_turn_terminal.take()
+                        {
+                            *active_turn_id.lock().await = None;
+                            *pending_goal_activation.lock().await = None;
+                            turn_in_flight.store(false, Ordering::SeqCst);
+                            emit(&event_tx, &session_id, cur, terminal);
                         }
                     }
                     _ => {
@@ -2033,6 +2080,13 @@ async fn reader_task(
     // F-4: the reader loop ended (process exited / stdout EOF) → the turn (if any)
     // is terminal. Clear the turn-active flag so the idle timer is unblocked.
     turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // EOF can cut the grace window short. The already decoded late tool result
+    // must precede this terminal in the stream, preserving the image attachment.
+    if let Some((terminal, _)) = pending_turn_terminal.take() {
+        *active_turn_id.lock().await = None;
+        emit(&event_tx, &session_id, turn_gen.load(Ordering::SeqCst), terminal);
+    }
 
     // Deferred-systemError flush: the stream ended (EOF) before the rich follow-up
     // arrived. Emit the opaque error terminal so the turn still ends as an error —
@@ -3490,6 +3544,18 @@ fn is_codex_image_generation_item(item_type: &str) -> bool {
     matches!(item_type, "imageGeneration" | "image_generation_call")
 }
 
+/// Returns true when a notification contains a completed image-generation item.
+/// Both the normalized thread plane and the raw Responses compatibility plane can
+/// carry the only usable base64 image result.
+fn raw_image_result_completed(method: &str, params: &Value) -> bool {
+    matches!(method, "item/completed" | "rawResponseItem/completed")
+        && params
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(is_codex_image_generation_item)
+}
+
 fn image_media_type_from_path(path: &str) -> Option<&'static str> {
     let extension = std::path::Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
     match extension.as_str() {
@@ -3786,6 +3852,10 @@ fn synth_clean_terminal() -> SessionEvent {
 /// stream failure) shows the follow-ups arrive within milliseconds — this bound
 /// only exists so a hypothetical unfollowed systemError cannot hang the FSM.
 const SYSTEM_ERROR_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A short post-terminal drain for a raw Responses image result emitted after
+/// `turn/completed`. This affects successful Codex turns only, never an active turn.
+const CODEX_TERMINAL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
 
 fn synth_error_terminal(message: String) -> SessionEvent {
     SessionEvent::TurnResult {
@@ -7792,6 +7862,75 @@ mod tests {
             )),
             "the terminal is the rich Completed from turn/completed, not a synthesized fallback"
         );
+    }
+
+    /// Codex can publish the raw Responses image payload after turn/completed.
+    /// The image result must reach the session pump before TurnResult translates to
+    /// Finish, otherwise StreamRelay exits and the generated image is never saved.
+    #[tokio::test]
+    async fn codex_late_raw_image_result_precedes_terminal() {
+        let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"th1","turn":{"id":"t1"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th1","turn":{"id":"t1","status":"completed"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"rawResponseItem/completed","params":{"threadId":"th1","turnId":"t1","item":{"type":"image_generation_call","id":"ig-late","status":"completed","result":"iVBORw0KGgo="}}}"#,
+        ])
+        .await;
+
+        let image_index = events
+            .iter()
+            .position(|event| {
+                matches!(event, SessionEvent::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "ig-late" && content.iter().any(|part| matches!(
+                    part,
+                    crate::event::ToolResultContent::Image { media_type, .. } if media_type == "image/png"
+                )))
+            })
+            .expect("late raw image result must be surfaced");
+        let terminal_index = events
+            .iter()
+            .position(|event| matches!(event, SessionEvent::TurnResult { .. }))
+            .expect("completed turn must still terminate");
+        assert!(
+            image_index < terminal_index,
+            "the image result must precede terminal so StreamRelay can persist it, got {events:?}"
+        );
+    }
+
+    /// A successful turn with no late image must still complete on a persistent
+    /// app-server connection. Keep stdout open past the drain window so this
+    /// exercises the timer rather than the EOF flush path.
+    #[tokio::test]
+    async fn codex_completed_turn_without_late_image_exits_after_drain_grace() {
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![
+            concat!(
+                r#"{"jsonrpc":"2.0","method":"turn/started","params":{"turn":{"id":"t1"}}}"#,
+                "\n",
+                r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th1","turn":{"id":"t1","status":"completed"}}}"#,
+                "\n",
+            )
+            .as_bytes()
+            .to_vec(),
+            // Never released: the terminal must come from the drain timeout.
+            b"{}\n".to_vec(),
+        ]);
+        let releaser = fake.segment_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        backend.mark_turn_in_flight_for_test();
+        let mut events = backend.events();
+        releaser();
+
+        let terminal = tokio::time::timeout(CODEX_TERMINAL_DRAIN_GRACE + std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::TurnResult { is_error, .. } = env.event {
+                    return Some(is_error);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out waiting for completed turn after image drain grace")
+        .expect("completed turn must emit a terminal event");
+        assert!(!terminal, "completed turn must retain its successful outcome");
     }
 
     /// R8 — status→idle with NO turn/completed at all (a dropped/missing terminal).
