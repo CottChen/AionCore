@@ -2878,6 +2878,11 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
             vec![SessionEvent::ThoughtDelta { item_id, text }]
         }
         "item/started" | "item/completed" => map_item(params, method == "item/completed"),
+        // Codex sends the upstream Responses item in addition to its normalized
+        // ThreadItem stream. Image generation can arrive only on this compatibility
+        // plane, as `image_generation_call`, so preserve it as an ordinary image tool
+        // result instead of dropping it as AdapterSpecific.
+        "rawResponseItem/completed" => map_raw_response_item(params),
         // Live tool-output stream (codex `item/commandExecution/outputDelta`): the
         // incremental stdout of a RUNNING command, keyed by the owning tool's itemId.
         // PLAINTEXT (NOT base64 — the turn-scoped item stream; verified live 0.139.0).
@@ -3195,6 +3200,7 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
             | "dynamicToolCall"
             | "fileChange"
             | "webSearch"
+            | "imageView"
             | "imageGeneration"
             | "image_generation_call"
     );
@@ -3232,6 +3238,7 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
         | "dynamicToolCall"
         | "fileChange"
         | "webSearch"
+        | "imageView"
         | "imageGeneration"
         | "image_generation_call" => {
             if completed {
@@ -3273,12 +3280,21 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                 // decoded bytes as Image. SessionAgentTask materializes that transient
                 // Image inside the conversation workspace before persistence, keeping
                 // base64 out of the WebSocket and SQLite paths.
-                if is_codex_image_generation_item(item_type)
+                if item_type == "imageView"
+                    && let Some(path) = item.get("path").and_then(Value::as_str)
+                {
+                    content.push(crate::event::ToolResultContent::FilePath {
+                        path: path.to_string(),
+                        mime: image_media_type_from_path(path).map(str::to_string),
+                        old_text: None,
+                        new_text: None,
+                    });
+                } else if is_codex_image_generation_item(item_type)
                     && let Some(path) = item.get("savedPath").and_then(Value::as_str)
                 {
                     content.push(crate::event::ToolResultContent::FilePath {
                         path: path.to_string(),
-                        mime: None,
+                        mime: image_media_type_from_path(path).map(str::to_string),
                         old_text: None,
                         new_text: None,
                     });
@@ -3425,6 +3441,38 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
     out
 }
 
+/// Convert the raw Responses image-generation item into the same direct-tool
+/// lifecycle as normalized ThreadItems. The raw plane can be the only place a
+/// hosted image-generation result is emitted by a Codex version; emitting an
+/// initial ToolCall here guarantees that its terminal result has a stable name
+/// even when no normalized `item/started` frame accompanies it.
+fn map_raw_response_item(params: &Value) -> Vec<SessionEvent> {
+    let Some(item) = params.get("item") else {
+        return vec![SessionEvent::AdapterSpecific {
+            tag: "codex_raw_response_item_missing_item".into(),
+            payload: params.clone(),
+        }];
+    };
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    if item_type != "image_generation_call" {
+        return vec![SessionEvent::AdapterSpecific {
+            tag: format!("codex_raw_response_item:{item_type}"),
+            payload: item.clone(),
+        }];
+    }
+
+    let id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let mut events = vec![SessionEvent::ToolCall {
+        tool_use_id: id,
+        name: item_type.to_string(),
+        subagent: crate::event::SubagentKind::Inline,
+        input: item.clone(),
+        parent_tool_use_id: None,
+    }];
+    events.extend(map_item(params, true));
+    events
+}
+
 /// Map a codex item `type` → the canonical `ItemKind` for the partial-lifecycle
 /// bracket (GAP-E).
 fn item_kind_for(item_type: &str) -> crate::event::ItemKind {
@@ -3432,6 +3480,7 @@ fn item_kind_for(item_type: &str) -> crate::event::ItemKind {
     match item_type {
         "agentMessage" => ItemKind::Text,
         "reasoning" => ItemKind::Thinking,
+        "imageView" => ItemKind::Image,
         item_type if is_codex_image_generation_item(item_type) => ItemKind::Image,
         _ => ItemKind::Tool,
     }
@@ -3439,6 +3488,17 @@ fn item_kind_for(item_type: &str) -> crate::event::ItemKind {
 
 fn is_codex_image_generation_item(item_type: &str) -> bool {
     matches!(item_type, "imageGeneration" | "image_generation_call")
+}
+
+fn image_media_type_from_path(path: &str) -> Option<&'static str> {
+    let extension = std::path::Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
 }
 
 /// thread/tokenUsage/updated → UsageDelta. codex gives BOTH total (cumulative)
@@ -9787,6 +9847,62 @@ mod tests {
         assert!(content.iter().any(|content| matches!(content,
             crate::event::ToolResultContent::Image { media_type, data }
                 if media_type == "image/png" && data == png
+        )));
+    }
+
+    #[test]
+    fn raw_response_image_generation_call_is_emitted_as_a_named_tool() {
+        use base64::Engine as _;
+
+        let png = b"\x89PNG\r\n\x1a\nraw-response-image";
+        let params = serde_json::json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "type": "image_generation_call",
+                "id": "ig_raw_response",
+                "status": "completed",
+                "result": base64::engine::general_purpose::STANDARD.encode(png)
+            }
+        });
+
+        let events = map_notification("rawResponseItem/completed", &params);
+        assert!(events.iter().any(|event| matches!(event,
+            SessionEvent::ToolCall { tool_use_id, name, .. }
+                if tool_use_id == "ig_raw_response" && name == "image_generation_call"
+        )));
+        assert!(events.iter().any(|event| matches!(event,
+            SessionEvent::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "ig_raw_response" && content.iter().any(|part| matches!(part,
+                    crate::event::ToolResultContent::Image { media_type, data }
+                        if media_type == "image/png" && data == png
+                ))
+        )));
+    }
+
+    #[test]
+    fn codex_image_view_reaches_image_file_path() {
+        let params = serde_json::json!({
+            "item": {
+                "type": "imageView",
+                "id": "image_view_1",
+                "path": "/tmp/codex-view.png"
+            }
+        });
+
+        let started = map_item(&params, false);
+        assert!(started.iter().any(|event| matches!(event,
+            SessionEvent::ToolCall { tool_use_id, name, .. }
+                if tool_use_id == "image_view_1" && name == "imageView"
+        )));
+
+        let completed = map_item(&params, true);
+        assert!(completed.iter().any(|event| matches!(event,
+            SessionEvent::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "image_view_1" && content.iter().any(|part| matches!(part,
+                    crate::event::ToolResultContent::FilePath { path, mime, .. }
+                        if path == "/tmp/codex-view.png" && mime.as_deref() == Some("image/png")
+                ))
         )));
     }
 

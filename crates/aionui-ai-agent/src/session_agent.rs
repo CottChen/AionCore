@@ -4238,10 +4238,10 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
 
 const MAX_INLINE_TOOL_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 
-/// Persist inline tool images before the event is serialized into the origin
-/// tool-call format. The direct session protocol carries image bytes transiently,
-/// while the renderer expects a local path and the message store must not retain
-/// multi-megabyte base64 payloads.
+/// Persist direct-session tool images before the event is serialized into the
+/// origin tool-call format. The renderer can only read paths within its current
+/// workspace, while Codex may report a `savedPath` under `~/.codex`; both inline
+/// bytes and externally saved images therefore become conversation-local files.
 async fn materialize_inline_tool_images(event: SessionEvent, workspace: &str, conversation_id: &str) -> SessionEvent {
     let SessionEvent::ToolResult {
         tool_use_id,
@@ -4272,6 +4272,36 @@ async fn materialize_inline_tool_images(event: SessionEvent, workspace: &str, co
                     ),
                 }
             }
+            ToolResultContent::FilePath {
+                path,
+                mime: Some(media_type),
+                old_text,
+                new_text,
+            } if image_extension(&media_type).is_some() => {
+                match materialize_saved_tool_image(workspace, conversation_id, &tool_use_id, &path, &media_type).await {
+                    Ok(path) => materialized.push(ToolResultContent::FilePath {
+                        path,
+                        mime: Some(media_type),
+                        old_text,
+                        new_text,
+                    }),
+                    Err(error) => {
+                        tracing::warn!(
+                            conversation_id,
+                            tool_use_id,
+                            source_path = %path,
+                            error = %error,
+                            "failed to materialize Codex saved image"
+                        );
+                        materialized.push(ToolResultContent::FilePath {
+                            path,
+                            mime: Some(media_type),
+                            old_text,
+                            new_text,
+                        });
+                    }
+                }
+            }
             other => materialized.push(other),
         }
     }
@@ -4282,6 +4312,36 @@ async fn materialize_inline_tool_images(event: SessionEvent, workspace: &str, co
         content: materialized,
         parent_tool_use_id,
     }
+}
+
+async fn materialize_saved_tool_image(
+    workspace: &str,
+    conversation_id: &str,
+    tool_use_id: &str,
+    source_path: &str,
+    declared_media_type: &str,
+) -> Result<String, std::io::Error> {
+    let metadata = tokio::fs::metadata(source_path).await?;
+    if metadata.len() > MAX_INLINE_TOOL_IMAGE_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("saved image exceeds {MAX_INLINE_TOOL_IMAGE_BYTES} byte limit"),
+        ));
+    }
+    let data = tokio::fs::read(source_path).await?;
+    let detected_media_type = image_media_type(&data).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("saved image has unsupported content: {source_path}"),
+        )
+    })?;
+    if detected_media_type != declared_media_type {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("saved image MIME mismatch: declared {declared_media_type}, detected {detected_media_type}"),
+        ));
+    }
+    persist_inline_tool_image(workspace, conversation_id, tool_use_id, detected_media_type, &data).await
 }
 
 async fn persist_inline_tool_image(
@@ -4321,6 +4381,20 @@ fn image_extension(media_type: &str) -> Option<&'static str> {
         "image/gif" => Some("gif"),
         "image/webp" => Some("webp"),
         _ => None,
+    }
+}
+
+fn image_media_type(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
     }
 }
 
@@ -4951,6 +5025,40 @@ mod translate_tests {
                 _ => None,
             });
         assert_eq!(output.as_deref(), Some(persisted_path.as_str()));
+    }
+
+    #[tokio::test]
+    async fn saved_tool_images_are_copied_into_the_conversation_workspace() {
+        let source_root = tempfile::tempdir().unwrap();
+        let source_path = source_root.path().join("codex-generated.png");
+        tokio::fs::write(&source_path, b"\x89PNG\r\n\x1a\nsaved-image")
+            .await
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let event = SessionEvent::ToolResult {
+            tool_use_id: "ig-saved-1".into(),
+            is_error: false,
+            content: vec![ToolResultContent::FilePath {
+                path: source_path.to_string_lossy().into_owned(),
+                mime: Some("image/png".into()),
+                old_text: None,
+                new_text: None,
+            }],
+            parent_tool_use_id: None,
+        };
+
+        let event = materialize_inline_tool_images(event, workspace.path().to_str().unwrap(), "conversation-1").await;
+        let SessionEvent::ToolResult { content, .. } = event else {
+            panic!("tool result should remain a tool result");
+        };
+        let ToolResultContent::FilePath { path, mime, .. } = &content[0] else {
+            panic!("saved image should remain a file path: {content:?}");
+        };
+
+        assert_eq!(mime.as_deref(), Some("image/png"));
+        assert!(path.starts_with(workspace.path().to_string_lossy().as_ref()));
+        assert!(path.ends_with(".aionui/generated-images/conversation-1/ig-saved-1.png"));
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"\x89PNG\r\n\x1a\nsaved-image");
     }
 
     fn usage_frame(total: u64, cost: Option<f64>, window: Option<u64>) -> serde_json::Value {
