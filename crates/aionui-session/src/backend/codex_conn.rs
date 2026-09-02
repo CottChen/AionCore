@@ -1572,6 +1572,29 @@ async fn reader_task(
                 // response to our request has `id` + (`result`|`error`), no method.
                 let method = frame.get("method").and_then(Value::as_str);
                 let has_id = frame.get("id").is_some();
+                // Codex 0.144.x may expose image-generation completions on the
+                // rollout archive plane as `{type:"response_item",payload:{...}}`
+                // instead of an app-server notification. Keep this narrow: only
+                // image_generation_call payloads are promoted, all other archive
+                // records remain ignored so normal assistant text is not duplicated.
+                if method.is_none()
+                    && frame.get("type").and_then(Value::as_str) == Some("response_item")
+                    && let Some(payload) = frame.get("payload")
+                    && payload.get("type").and_then(Value::as_str) == Some("image_generation_call")
+                {
+                    let mut params = json!({ "item": payload });
+                    if let Some(thread_id) = thread_binding.lock().await.clone() {
+                        params["threadId"] = Value::String(thread_id);
+                    }
+                    if let Some(turn_id) = active_turn_id.lock().await.clone() {
+                        params["turnId"] = Value::String(turn_id);
+                    }
+                    let cur = turn_gen.load(Ordering::SeqCst);
+                    for event in map_raw_response_item(&params) {
+                        emit(&event_tx, &session_id, cur, event);
+                    }
+                    continue;
+                }
                 match (method, has_id) {
                     (Some(m), true) => {
                         // reverse-RPC (ServerRequest): infra → auto-reject to prevent
