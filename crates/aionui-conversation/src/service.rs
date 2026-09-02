@@ -20,10 +20,11 @@ use aionui_api_types::{
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
     ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
     ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationRatingResponse, ConversationRatingVote,
-    ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse,
-    ForkCapabilityView, ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse,
-    MessageResponse, MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, SessionMcpServer, SessionMcpTransport, SubmitConversationRatingRequest, TeamSessionBinding,
+    ConversationResponse, ConversationRuntimeSummary, ConversationTurnPreview, ConversationTurnPreviewListResponse,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
+    ListConversationTurnPreviewsQuery, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SessionMcpServer, SessionMcpTransport, SubmitConversationRatingRequest, TeamSessionBinding,
     UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version,
 };
@@ -39,7 +40,7 @@ use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRatingRepository, IConversationRepository, IMcpServerRepository,
-    MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, TurnPreviewPageParams,
     UpsertConversationAssistantSnapshotParams, UpsertConversationRatingParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
@@ -3098,6 +3099,9 @@ mod transfer_owner_tests {
 
 const DEFAULT_MESSAGE_PAGE_LIMIT: u32 = 50;
 const MAX_MESSAGE_PAGE_LIMIT: u32 = 200;
+const DEFAULT_TURN_PREVIEW_PAGE_LIMIT: u32 = 50;
+const MAX_TURN_PREVIEW_PAGE_LIMIT: u32 = 100;
+const TURN_PREVIEW_TEXT_CHARS: usize = 512;
 
 fn effective_message_limit(limit: Option<u32>) -> u32 {
     match limit.unwrap_or(DEFAULT_MESSAGE_PAGE_LIMIT) {
@@ -3110,6 +3114,41 @@ fn message_locator_count(query: &ListMessagesQuery) -> usize {
     usize::from(query.before.is_some())
         + usize::from(query.after.is_some())
         + usize::from(query.anchor_message_id.is_some())
+}
+
+fn compact_turn_preview(text: &str, keyword: Option<&str>) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= TURN_PREVIEW_TEXT_CHARS {
+        return text.to_owned();
+    }
+
+    let match_index = keyword
+        .filter(|value| !value.is_empty())
+        .and_then(|value| {
+            let lower_text = text.to_lowercase();
+            let lower_keyword = value.to_lowercase();
+            lower_text
+                .find(&lower_keyword)
+                .map(|byte_index| lower_text[..byte_index].chars().count())
+        })
+        .unwrap_or(0)
+        .min(chars.len());
+    let half_window = TURN_PREVIEW_TEXT_CHARS / 2;
+    let mut start = match_index.saturating_sub(half_window);
+    let end = (start + TURN_PREVIEW_TEXT_CHARS).min(chars.len());
+    if end == chars.len() {
+        start = end.saturating_sub(TURN_PREVIEW_TEXT_CHARS);
+    }
+
+    let mut preview = String::new();
+    if start > 0 {
+        preview.push_str("...");
+    }
+    preview.extend(chars[start..end].iter());
+    if end < chars.len() {
+        preview.push_str("...");
+    }
+    preview
 }
 
 impl ConversationService {
@@ -3211,6 +3250,95 @@ impl ConversationService {
             newest_cursor,
             has_more_before: page.has_more_before,
             has_more_after: page.has_more_after,
+        })
+    }
+
+    /// List lightweight turn previews without materializing unrelated tool or thinking messages.
+    pub async fn list_turn_previews(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        query: ListConversationTurnPreviewsQuery,
+    ) -> Result<ConversationTurnPreviewListResponse, ConversationError> {
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
+        let keyword = query
+            .keyword
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if keyword.is_some_and(|value| value.chars().count() > Self::MAX_SEARCH_KEYWORD_CHARS) {
+            return Err(ConversationError::BadRequest {
+                reason: format!("keyword must be at most {} characters", Self::MAX_SEARCH_KEYWORD_CHARS),
+            });
+        }
+        let turn_index = match query.turn_index {
+            Some(0) => return Err(ConversationError::bad_request("turn_index must be positive")),
+            Some(value) if value > i64::MAX as u64 => {
+                return Err(ConversationError::bad_request("turn_index is too large"));
+            }
+            value => value,
+        };
+
+        let limit = match query.limit.unwrap_or(DEFAULT_TURN_PREVIEW_PAGE_LIMIT) {
+            0 => DEFAULT_TURN_PREVIEW_PAGE_LIMIT,
+            value => value.min(MAX_TURN_PREVIEW_PAGE_LIMIT),
+        };
+        let after = query.after.as_deref().map(decode_message_cursor).transpose()?;
+        let page = self
+            .conversation_repo
+            .list_turn_previews(
+                user_id,
+                conversation_id,
+                &TurnPreviewPageParams {
+                    limit,
+                    after,
+                    keyword: keyword.map(ToOwned::to_owned),
+                    turn_index,
+                },
+            )
+            .await?;
+
+        let next_cursor = if page.has_more {
+            page.items
+                .last()
+                .map(|row| {
+                    encode_message_cursor(&MessagePageCursor {
+                        created_at: row.created_at,
+                        id: row.message_id.clone(),
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let items = page
+            .items
+            .into_iter()
+            .map(|row| {
+                let index = u64::try_from(row.turn_index)
+                    .map_err(|_| ConversationError::internal("invalid conversation turn index"))?;
+                Ok(ConversationTurnPreview {
+                    index,
+                    message_id: row.message_id,
+                    msg_id: row.msg_id,
+                    question: compact_turn_preview(&row.question, keyword),
+                    answer: compact_turn_preview(&row.answer, keyword),
+                    created_at: row.created_at,
+                })
+            })
+            .collect::<Result<Vec<_>, ConversationError>>()?;
+
+        Ok(ConversationTurnPreviewListResponse {
+            items,
+            total: page.total,
+            next_cursor,
+            has_more: page.has_more,
         })
     }
 

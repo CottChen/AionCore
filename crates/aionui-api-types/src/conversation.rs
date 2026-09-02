@@ -272,6 +272,15 @@ pub struct ListMessagesQuery {
     pub content_mode: Option<String>,
 }
 
+/// Query parameters for `GET /api/conversations/:id/turn-previews`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListConversationTurnPreviewsQuery {
+    pub limit: Option<u32>,
+    pub after: Option<String>,
+    pub keyword: Option<String>,
+    pub turn_index: Option<u64>,
+}
+
 /// Body for `PATCH /api/conversations/:id/artifacts/:artifact_id`.
 #[derive(Debug, Deserialize)]
 pub struct UpdateConversationArtifactRequest {
@@ -370,6 +379,26 @@ pub struct MessageListResponse {
     pub newest_cursor: Option<String>,
     pub has_more_before: bool,
     pub has_more_after: bool,
+}
+
+/// Lightweight user/assistant text pair used by in-conversation navigation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurnPreview {
+    pub index: u64,
+    pub message_id: String,
+    pub msg_id: Option<String>,
+    pub question: String,
+    pub answer: String,
+    pub created_at: TimestampMs,
+}
+
+/// Cursor-paginated turn previews for one conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurnPreviewListResponse {
+    pub items: Vec<ConversationTurnPreview>,
+    pub total: u64,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
 }
 
 /// Response for `GET /api/conversations/active-count`.
@@ -689,6 +718,21 @@ mod tests {
         assert!(q.after.is_none());
         assert!(q.anchor_message_id.is_none());
         assert_eq!(q.content_mode.as_deref(), Some("compact"));
+    }
+
+    #[test]
+    fn deserialize_turn_preview_query_with_search_and_cursor() {
+        let raw = json!({
+            "limit": 50,
+            "after": "v1.abc",
+            "keyword": "needle",
+            "turn_index": 12
+        });
+        let q: ListConversationTurnPreviewsQuery = serde_json::from_value(raw).unwrap();
+        assert_eq!(q.limit, Some(50));
+        assert_eq!(q.after.as_deref(), Some("v1.abc"));
+        assert_eq!(q.keyword.as_deref(), Some("needle"));
+        assert_eq!(q.turn_index, Some(12));
     }
 
     // ── SearchMessagesQuery ─────────────────────────────────────────

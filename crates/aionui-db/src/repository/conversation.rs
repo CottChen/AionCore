@@ -113,6 +113,18 @@ pub trait IConversationRepository: Send + Sync {
         params: &MessagePageParams,
     ) -> Result<MessagePageResult, DbError>;
 
+    /// Returns lightweight text previews for user turns in display order.
+    async fn list_turn_previews(
+        &self,
+        _user_id: &str,
+        _conv_id: &str,
+        _params: &TurnPreviewPageParams,
+    ) -> Result<TurnPreviewPageResult, DbError> {
+        Err(DbError::Init(
+            "turn previews are not supported by this repository".into(),
+        ))
+    }
+
     /// Returns a single message scoped to a conversation.
     async fn get_message(
         &self,
@@ -334,6 +346,31 @@ pub struct MessagePageResult {
     pub items: Vec<MessageRow>,
     pub has_more_before: bool,
     pub has_more_after: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnPreviewPageParams {
+    pub limit: u32,
+    pub after: Option<MessagePageCursor>,
+    pub keyword: Option<String>,
+    pub turn_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ConversationTurnPreviewRow {
+    pub turn_index: i64,
+    pub message_id: String,
+    pub msg_id: Option<String>,
+    pub question: String,
+    pub answer: String,
+    pub created_at: TimestampMs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnPreviewPageResult {
+    pub items: Vec<ConversationTurnPreviewRow>,
+    pub total: u64,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

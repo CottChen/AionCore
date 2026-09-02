@@ -8,9 +8,15 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
+    ConversationFilters, ConversationRowUpdate, ConversationTurnPreviewRow, IConversationRepository, MessagePageCursor,
+    MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    StaleRuntimeMessageRow, TurnPreviewPageParams, TurnPreviewPageResult,
 };
+
+fn escaped_like_pattern(keyword: &str) -> String {
+    let escaped = keyword.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    format!("%{escaped}%")
+}
 
 /// Bump `conversations.updated_at` so the conversation-list sort
 /// (ORDER BY conversations.updated_at DESC) floats a conversation with fresh
@@ -888,6 +894,115 @@ impl IConversationRepository for SqliteConversationRepository {
         };
         rows.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
         self.page_with_flags(user_id, conv_id, rows).await
+    }
+
+    async fn list_turn_previews(
+        &self,
+        user_id: &str,
+        conv_id: &str,
+        params: &TurnPreviewPageParams,
+    ) -> Result<TurnPreviewPageResult, DbError> {
+        self.ensure_conversation_for_user(user_id, conv_id).await?;
+
+        let total: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) \
+             FROM messages \
+             WHERE conversation_id = ? \
+               AND type = 'text' \
+               AND position = 'right' \
+               AND hidden = 0 \
+               AND json_type(content, '$.content') = 'text' \
+               AND TRIM(CAST(json_extract(content, '$.content') AS TEXT)) <> ''",
+        )
+        .bind(conv_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let keyword_pattern = params.keyword.as_deref().map(escaped_like_pattern);
+        let turn_index = params.turn_index.and_then(|value| i64::try_from(value).ok());
+        let after_created_at = params.after.as_ref().map(|cursor| cursor.created_at);
+        let after_id = params.after.as_ref().map(|cursor| cursor.id.as_str());
+        let fetch_limit = params.limit.max(1) as i64 + 1;
+
+        let mut rows = sqlx::query_as::<_, ConversationTurnPreviewRow>(
+            "WITH ordered_text AS ( \
+                 SELECT \
+                   SUM(CASE WHEN m.position = 'right' THEN 1 ELSE 0 END) OVER ( \
+                     ORDER BY m.created_at ASC, m.id ASC ROWS UNBOUNDED PRECEDING \
+                   ) AS turn_index, \
+                   m.id, \
+                   m.msg_id, \
+                   CAST(json_extract(m.content, '$.content') AS TEXT) AS text_content, \
+                   m.position, \
+                   m.created_at \
+                 FROM messages m \
+                 WHERE m.conversation_id = ? \
+                   AND m.type = 'text' \
+                   AND m.position IN ('left', 'right') \
+                   AND m.hidden = 0 \
+                   AND json_type(m.content, '$.content') = 'text' \
+                   AND TRIM(CAST(json_extract(m.content, '$.content') AS TEXT)) <> '' \
+             ), ranked_text AS ( \
+                 SELECT \
+                   *, \
+                   ROW_NUMBER() OVER ( \
+                     PARTITION BY turn_index, position ORDER BY created_at ASC, id ASC \
+                   ) AS position_rank \
+                 FROM ordered_text \
+                 WHERE turn_index > 0 \
+             ), turn_previews AS ( \
+                 SELECT \
+                   turn_index, \
+                   MAX(CASE WHEN position = 'right' THEN id END) AS message_id, \
+                   MAX(CASE WHEN position = 'right' THEN msg_id END) AS msg_id, \
+                   MAX(CASE WHEN position = 'right' THEN text_content END) AS question, \
+                   COALESCE(MAX(CASE WHEN position = 'left' AND position_rank = 1 THEN text_content END), '') \
+                     AS answer, \
+                   MAX(CASE WHEN position = 'right' THEN created_at END) AS created_at \
+                 FROM ranked_text \
+                 WHERE position = 'right' OR (position = 'left' AND position_rank = 1) \
+                 GROUP BY turn_index \
+             ) \
+             SELECT turn_index, message_id, msg_id, question, answer, created_at \
+             FROM turn_previews \
+             WHERE ( \
+                 (? IS NULL AND ? IS NULL) \
+                 OR question LIKE ? ESCAPE '\\' COLLATE NOCASE \
+                 OR answer LIKE ? ESCAPE '\\' COLLATE NOCASE \
+                 OR turn_index = ? \
+               ) \
+               AND ( \
+                 ? IS NULL \
+                 OR created_at > ? \
+                 OR (created_at = ? AND message_id > ?) \
+               ) \
+             ORDER BY created_at ASC, message_id ASC \
+             LIMIT ?",
+        )
+        .bind(conv_id)
+        .bind(keyword_pattern.as_deref())
+        .bind(turn_index)
+        .bind(keyword_pattern.as_deref())
+        .bind(keyword_pattern.as_deref())
+        .bind(turn_index)
+        .bind(after_created_at)
+        .bind(after_created_at)
+        .bind(after_created_at)
+        .bind(after_id)
+        .bind(fetch_limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let has_more = rows.len() > params.limit.max(1) as usize;
+        if has_more {
+            rows.truncate(params.limit.max(1) as usize);
+        }
+
+        Ok(TurnPreviewPageResult {
+            items: rows,
+            total: total.0.max(0) as u64,
+            has_more,
+        })
     }
 
     async fn get_message(&self, user_id: &str, conv_id: &str, message_id: &str) -> Result<Option<MessageRow>, DbError> {

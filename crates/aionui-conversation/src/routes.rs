@@ -10,11 +10,11 @@ use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse,
-    ConversationRatingResponse, ConversationResponse, CreateConversationRequest, EnsureConversationRuntimeResponse,
-    ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    SubmitConversationRatingRequest, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebuiTransferOwnerRequest,
+    ConversationRatingResponse, ConversationResponse, ConversationTurnPreviewListResponse, CreateConversationRequest,
+    EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationTurnPreviewsQuery,
+    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationRatingRequest,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebuiTransferOwnerRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -120,6 +120,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/fork", post(fork))
         .route("/api/conversations/{id}/associated", get(associated))
+        .route("/api/conversations/{id}/turn-previews", get(list_turn_previews))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
         .route("/api/conversations/{id}/ratings/{answerMessageId}", post(submit_rating))
@@ -436,6 +437,20 @@ async fn search_messages(
     let result = state
         .service
         .search_messages(&user.id, query)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn list_turn_previews(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<ListConversationTurnPreviewsQuery>,
+) -> Result<Json<ApiResponse<ConversationTurnPreviewListResponse>>, ApiError> {
+    let result = state
+        .service
+        .list_turn_previews(&user.id, &id, query)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))

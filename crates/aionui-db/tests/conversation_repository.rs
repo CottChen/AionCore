@@ -1,7 +1,7 @@
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, DbError, IConversationRepository, MessagePageCursor,
-    MessagePageDirection, MessagePageParams, MessageRowUpdate, SqliteConversationRepository, init_database_memory,
-    models::ConversationRow, models::MessageRow,
+    MessagePageDirection, MessagePageParams, MessageRowUpdate, SqliteConversationRepository, TurnPreviewPageParams,
+    init_database_memory, models::ConversationRow, models::MessageRow,
 };
 
 const USER_ID: &str = "system_default_user";
@@ -56,6 +56,21 @@ fn make_message(conv_id: &str, content: &str) -> MessageRow {
         status: Some("finish".to_string()),
         hidden: false,
         created_at: now,
+        backend_turn_id: None,
+    }
+}
+
+fn make_text_message(conv_id: &str, id: &str, position: &str, content: &str, created_at: i64) -> MessageRow {
+    MessageRow {
+        id: id.to_string(),
+        conversation_id: conv_id.to_string(),
+        msg_id: Some(format!("client-{id}")),
+        r#type: "text".to_string(),
+        content: serde_json::json!({ "content": content }).to_string(),
+        position: Some(position.to_string()),
+        status: Some("finish".to_string()),
+        hidden: false,
+        created_at,
         backend_turn_id: None,
     }
 }
@@ -854,6 +869,130 @@ async fn get_message_by_msg_id_triple() {
 }
 
 // ── Message search ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn turn_previews_page_user_turns_without_unrelated_message_payloads() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("turn-previews");
+    repo.create(&conv).await.unwrap();
+
+    for message in [
+        make_text_message(&conv.id, "user-1", "right", "first question", 1000),
+        make_text_message(&conv.id, "answer-1", "left", "first answer", 1100),
+        make_text_message(&conv.id, "answer-1-extra", "left", "ignored follow-up", 1200),
+        make_text_message(&conv.id, "user-2", "right", "second question", 2000),
+        make_text_message(&conv.id, "answer-2", "left", "second answer", 2100),
+    ] {
+        repo.insert_message(USER_ID, &message).await.unwrap();
+    }
+    let mut tool = make_text_message(&conv.id, "tool", "left", "large ignored payload", 1150);
+    tool.r#type = "tool_call".to_string();
+    repo.insert_message(USER_ID, &tool).await.unwrap();
+
+    let first = repo
+        .list_turn_previews(
+            USER_ID,
+            &conv.id,
+            &TurnPreviewPageParams {
+                limit: 1,
+                after: None,
+                keyword: None,
+                turn_index: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first.total, 2);
+    assert!(first.has_more);
+    assert_eq!(first.items[0].question, "first question");
+    assert_eq!(first.items[0].answer, "first answer");
+
+    let second = repo
+        .list_turn_previews(
+            USER_ID,
+            &conv.id,
+            &TurnPreviewPageParams {
+                limit: 1,
+                after: Some(MessagePageCursor {
+                    created_at: first.items[0].created_at,
+                    id: first.items[0].message_id.clone(),
+                }),
+                keyword: None,
+                turn_index: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(second.items[0].turn_index, 2);
+    assert_eq!(second.items[0].question, "second question");
+    assert!(!second.has_more);
+}
+
+#[tokio::test]
+async fn turn_previews_searches_answers_and_treats_like_wildcards_literally() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("turn-preview-search");
+    repo.create(&conv).await.unwrap();
+
+    for message in [
+        make_text_message(&conv.id, "user-1", "right", "progress is 100%", 1000),
+        make_text_message(&conv.id, "answer-1", "left", "ordinary response", 1100),
+        make_text_message(&conv.id, "user-2", "right", "second question", 2000),
+        make_text_message(&conv.id, "answer-2", "left", "contains answer needle", 2100),
+    ] {
+        repo.insert_message(USER_ID, &message).await.unwrap();
+    }
+
+    let answer_match = repo
+        .list_turn_previews(
+            USER_ID,
+            &conv.id,
+            &TurnPreviewPageParams {
+                limit: 20,
+                after: None,
+                keyword: Some("needle".to_string()),
+                turn_index: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer_match.items.len(), 1);
+    assert_eq!(answer_match.items[0].turn_index, 2);
+
+    let literal_percent = repo
+        .list_turn_previews(
+            USER_ID,
+            &conv.id,
+            &TurnPreviewPageParams {
+                limit: 20,
+                after: None,
+                keyword: Some("%".to_string()),
+                turn_index: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(literal_percent.items.len(), 1);
+    assert_eq!(literal_percent.items[0].message_id, "user-1");
+
+    let by_index = repo
+        .list_turn_previews(
+            USER_ID,
+            &conv.id,
+            &TurnPreviewPageParams {
+                limit: 20,
+                after: None,
+                keyword: None,
+                turn_index: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_index.items.len(), 1);
+    assert_eq!(by_index.items[0].message_id, "user-2");
+}
 
 #[tokio::test]
 async fn search_messages_across_conversations() {

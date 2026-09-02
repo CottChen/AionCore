@@ -34,6 +34,17 @@ async fn insert_message(
     content: &str,
     created_at: i64,
 ) {
+    insert_text_message(services, conv_id, msg_id, content, "right", created_at).await;
+}
+
+async fn insert_text_message(
+    services: &aionui_app::AppServices,
+    conv_id: &str,
+    msg_id: &str,
+    content: &str,
+    position: &str,
+    created_at: i64,
+) {
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
     let user_id = repo.owner_user_id(conv_id).await.unwrap().unwrap();
     let msg = aionui_db::models::MessageRow {
@@ -42,7 +53,7 @@ async fn insert_message(
         msg_id: None,
         r#type: "text".into(),
         content: serde_json::json!({"content": content}).to_string(),
-        position: Some("right".into()),
+        position: Some(position.into()),
         status: Some("finish".into()),
         hidden: false,
         created_at,
@@ -187,6 +198,76 @@ async fn t8_2_messages_pagination() {
     assert_eq!(json["data"]["items"].as_array().unwrap().len(), 3);
     assert_eq!(json["data"]["has_more_before"], true);
     assert_eq!(json["data"]["has_more_after"], true);
+}
+
+#[tokio::test]
+async fn t8_2a_turn_previews_are_cursor_paginated_and_search_answer_text() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Turn Preview Conv").await;
+    let long_answer = format!("{}needle{}", "before ".repeat(100), " after".repeat(100));
+
+    insert_message(&services, &conv_id, "user-1", "first question", 1000).await;
+    insert_text_message(&services, &conv_id, "answer-1", &long_answer, "left", 1100).await;
+    insert_message(&services, &conv_id, "user-2", "second question", 2000).await;
+    insert_text_message(&services, &conv_id, "answer-2", "second answer", "left", 2100).await;
+
+    let first = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conv_id}/turn-previews?limit=1"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = body_json(first).await;
+    assert_eq!(first["data"]["total"], 2);
+    assert_eq!(first["data"]["items"][0]["index"], 1);
+    assert_eq!(first["data"]["has_more"], true);
+    let cursor = first["data"]["next_cursor"].as_str().unwrap();
+
+    let second = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conv_id}/turn-previews?limit=1&after={cursor}"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let second = body_json(second).await;
+    assert_eq!(second["data"]["items"][0]["index"], 2);
+    assert_eq!(second["data"]["has_more"], false);
+
+    let searched = app
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conv_id}/turn-previews?keyword=needle"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let searched = body_json(searched).await;
+    let answer = searched["data"]["items"][0]["answer"].as_str().unwrap();
+    assert_eq!(searched["data"]["items"].as_array().unwrap().len(), 1);
+    assert!(answer.contains("needle"));
+    assert!(answer.chars().count() < long_answer.chars().count());
+}
+
+#[tokio::test]
+async fn t8_2aa_turn_previews_reject_invalid_cursor() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Invalid Preview Cursor").await;
+
+    let response = app
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conv_id}/turn-previews?after=invalid"),
+            &token,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
