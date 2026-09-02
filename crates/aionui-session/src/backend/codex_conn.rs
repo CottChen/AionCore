@@ -22,7 +22,8 @@
 //! `emit`) are now production-reachable via `open_session`'s live spawn (R4) and
 //! independently contract-tested via the `build_with_io` seam.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -860,6 +861,24 @@ struct Discovered {
     skills: Vec<crate::capability::SlashCommandInfo>,
 }
 
+/// Incremental cursor over Codex's authoritative rollout JSONL. Recent Codex
+/// versions can archive a completed image-generation response without exposing
+/// it as an app-server item notification, so the reader uses this cursor as a
+/// narrow fallback at the turn boundary. It is shared across idle wake/re-spawn
+/// so historical images are neither rescanned nor emitted twice.
+#[derive(Default)]
+struct RolloutImageCursor {
+    path: Option<PathBuf>,
+    offset: u64,
+    seen_image_ids: HashSet<String>,
+}
+
+struct PendingTurnTerminal {
+    event: SessionEvent,
+    deadline: tokio::time::Instant,
+    turn_id: Option<String>,
+}
+
 /// What `CodexSessionBackend::wake_handle` needs to re-spawn the codex app-server
 /// after an idle suspend and replay the resume handshake. `inert()` (no spawner)
 /// is used for test-built backends, which never suspend, so it is never consulted.
@@ -900,6 +919,7 @@ struct CodexReaderState {
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
+    rollout_images: Arc<Mutex<RolloutImageCursor>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     rpc_id: Arc<AtomicU64>,
     cwd: Option<String>,
@@ -937,6 +957,7 @@ fn start_codex_reader(
             state.pending_resume,
             state.resume_poison,
             state.pending_fork,
+            state.rollout_images,
             state.discovered,
             state.rpc_id,
             state.cwd,
@@ -1108,6 +1129,7 @@ impl CodexSessionBackend {
         let pending_resume = Arc::new(Mutex::new(None));
         let resume_poison = Arc::new(Mutex::new(None));
         let pending_fork = Arc::new(Mutex::new(None));
+        let rollout_images = Arc::new(Mutex::new(RolloutImageCursor::default()));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let rpc_id = Arc::new(AtomicU64::new(0));
@@ -1135,6 +1157,7 @@ impl CodexSessionBackend {
             pending_resume: pending_resume.clone(),
             resume_poison: resume_poison.clone(),
             pending_fork: pending_fork.clone(),
+            rollout_images,
             discovered: discovered.clone(),
             rpc_id: rpc_id.clone(),
             cwd: wake.config.cwd.clone(),
@@ -1446,6 +1469,7 @@ async fn reader_task(
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
+    rollout_images: Arc<Mutex<RolloutImageCursor>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     rpc_id: Arc<AtomicU64>,
     cwd: Option<String>,
@@ -1485,10 +1509,10 @@ async fn reader_task(
     // wait so an unfollowed systemError still terminates the turn.
     let mut system_error_pending = false;
     let mut system_error_deadline: Option<tokio::time::Instant> = None;
-    // The app server can place a raw Responses image result immediately AFTER its
-    // turn/completed notification. Keep the successful terminal briefly pending so
-    // that late result is persisted before the conversation relay observes Finish.
-    let mut pending_turn_terminal: Option<(SessionEvent, tokio::time::Instant)> = None;
+    // Keep a successful terminal briefly pending so a late app-server image event
+    // or a rollout-only image result is persisted before the conversation relay
+    // observes Finish.
+    let mut pending_turn_terminal: Option<PendingTurnTerminal> = None;
 
     let mut lines = BufReader::new(stdout).lines();
     // Unbounded mid-turn read (AGENTS.md §"出了问题必须查到根因": NO mid-turn
@@ -1502,15 +1526,19 @@ async fn reader_task(
     // waits for a late raw image result. Neither is a mid-turn watchdog.
     loop {
         let next = match pending_turn_terminal.as_ref() {
-            Some((_, deadline)) => match tokio::time::timeout_at(*deadline, lines.next_line()).await {
+            Some(pending) => match tokio::time::timeout_at(pending.deadline, lines.next_line()).await {
                 Ok(read) => read,
                 Err(_elapsed) => {
-                    let (terminal, _) = pending_turn_terminal
-                        .take()
-                        .expect("pending terminal exists while its grace timer is armed");
+                    emit_pending_terminal_with_rollout_images(
+                        &mut pending_turn_terminal,
+                        &rollout_images,
+                        &event_tx,
+                        &session_id,
+                        turn_gen.load(Ordering::SeqCst),
+                    )
+                    .await;
                     *active_turn_id.lock().await = None;
                     turn_in_flight.store(false, Ordering::SeqCst);
-                    emit(&event_tx, &session_id, turn_gen.load(Ordering::SeqCst), terminal);
                     continue;
                 }
             },
@@ -1572,11 +1600,9 @@ async fn reader_task(
                 // response to our request has `id` + (`result`|`error`), no method.
                 let method = frame.get("method").and_then(Value::as_str);
                 let has_id = frame.get("id").is_some();
-                // Codex 0.144.x may expose image-generation completions on the
-                // rollout archive plane as `{type:"response_item",payload:{...}}`
-                // instead of an app-server notification. Keep this narrow: only
-                // image_generation_call payloads are promoted, all other archive
-                // records remain ignored so normal assistant text is not duplicated.
+                // Defensive compatibility for wrappers that forward Codex rollout
+                // records on stdout. Official Codex 0.144.6 writes this shape only
+                // to thread.path; the terminal fallback below reads that JSONL.
                 if method.is_none()
                     && frame.get("type").and_then(Value::as_str) == Some("response_item")
                     && let Some(payload) = frame.get("payload")
@@ -1590,7 +1616,11 @@ async fn reader_task(
                         params["turnId"] = Value::String(turn_id);
                     }
                     let cur = turn_gen.load(Ordering::SeqCst);
-                    for event in map_raw_response_item(&params) {
+                    let events = map_raw_response_item(&params);
+                    if has_materializable_image_result(&events) {
+                        mark_image_result_seen(&rollout_images, payload).await;
+                    }
+                    for event in events {
                         emit(&event_tx, &session_id, cur, event);
                     }
                     continue;
@@ -1632,6 +1662,15 @@ async fn reader_task(
                             continue;
                         }
                         if m == "thread/started" {
+                            if let Some(thread) = params.get("thread") {
+                                capture_rollout_path(
+                                    &rollout_images,
+                                    thread,
+                                    turn_in_flight.load(Ordering::SeqCst),
+                                    &session_id,
+                                )
+                                .await;
+                            }
                             // bind threadId (backend transport key, kept private).
                             if let Some(tid) = params.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
                                 *thread_binding.lock().await = Some(tid.to_string());
@@ -1653,10 +1692,17 @@ async fn reader_task(
                             // A new turn cannot belong to the prior terminal's late
                             // image-result window. Flush the old terminal first so
                             // every event stays attached to the correct turn.
-                            if let Some((terminal, _)) = pending_turn_terminal.take() {
+                            if pending_turn_terminal.is_some() {
+                                emit_pending_terminal_with_rollout_images(
+                                    &mut pending_turn_terminal,
+                                    &rollout_images,
+                                    &event_tx,
+                                    &session_id,
+                                    cur,
+                                )
+                                .await;
                                 *active_turn_id.lock().await = None;
                                 turn_in_flight.store(false, Ordering::SeqCst);
-                                emit(&event_tx, &session_id, cur, terminal);
                             }
                             *pending_goal_activation.lock().await = None;
                             terminated = false; // a new turn can terminate once (R8 reset)
@@ -1704,8 +1750,19 @@ async fn reader_task(
                                     // A rawResponseItem/completed image can race behind
                                     // this terminal. Do not let StreamRelay break before
                                     // its ToolResult has been materialized and persisted.
-                                    pending_turn_terminal =
-                                        Some((ev, tokio::time::Instant::now() + CODEX_TERMINAL_DRAIN_GRACE));
+                                    let turn_id = match params
+                                        .get("turn")
+                                        .and_then(|turn| turn.get("id"))
+                                        .and_then(Value::as_str)
+                                    {
+                                        Some(turn_id) => Some(turn_id.to_string()),
+                                        None => active_turn_id.lock().await.clone(),
+                                    };
+                                    pending_turn_terminal = Some(PendingTurnTerminal {
+                                        event: ev,
+                                        deadline: tokio::time::Instant::now() + CODEX_TERMINAL_DRAIN_GRACE,
+                                        turn_id,
+                                    });
                                 } else {
                                     // Failed/interrupted turns are not delayed: callers
                                     // need their terminal state and error immediately.
@@ -1794,16 +1851,15 @@ async fn reader_task(
                             }
                             continue;
                         }
-                        for ev in map_notification(m, params) {
-                            emit(&event_tx, &session_id, cur, scope_notice_to_turn(ev, cur));
-                        }
+                        let events = map_notification(m, params);
                         if raw_image_result_completed(m, params)
-                            && let Some((terminal, _)) = pending_turn_terminal.take()
+                            && has_materializable_image_result(&events)
+                            && let Some(item) = params.get("item")
                         {
-                            *active_turn_id.lock().await = None;
-                            *pending_goal_activation.lock().await = None;
-                            turn_in_flight.store(false, Ordering::SeqCst);
-                            emit(&event_tx, &session_id, cur, terminal);
+                            mark_image_result_seen(&rollout_images, item).await;
+                        }
+                        for ev in events {
+                            emit(&event_tx, &session_id, cur, scope_notice_to_turn(ev, cur));
                         }
                     }
                     _ => {
@@ -1817,6 +1873,13 @@ async fn reader_task(
                         // never a silent drop. Other responses (settings/rollback/etc)
                         // flow via notifications; diagnostic only.
                         if let Some(rid) = frame.get("id").and_then(Value::as_u64) {
+                            capture_rollout_path_from_response(
+                                &rollout_images,
+                                &frame,
+                                turn_in_flight.load(Ordering::SeqCst),
+                                &session_id,
+                            )
+                            .await;
                             let error_message = frame.get("error").map(|e| {
                                 e.get("message")
                                     .and_then(Value::as_str)
@@ -2106,9 +2169,16 @@ async fn reader_task(
 
     // EOF can cut the grace window short. The already decoded late tool result
     // must precede this terminal in the stream, preserving the image attachment.
-    if let Some((terminal, _)) = pending_turn_terminal.take() {
+    if pending_turn_terminal.is_some() {
+        emit_pending_terminal_with_rollout_images(
+            &mut pending_turn_terminal,
+            &rollout_images,
+            &event_tx,
+            &session_id,
+            turn_gen.load(Ordering::SeqCst),
+        )
+        .await;
         *active_turn_id.lock().await = None;
-        emit(&event_tx, &session_id, turn_gen.load(Ordering::SeqCst), terminal);
     }
 
     // Deferred-systemError flush: the stream ended (EOF) before the rich follow-up
@@ -3577,6 +3647,241 @@ fn raw_image_result_completed(method: &str, params: &Value) -> bool {
             .and_then(|item| item.get("type"))
             .and_then(Value::as_str)
             .is_some_and(is_codex_image_generation_item)
+}
+
+const MAX_ROLLOUT_SCAN_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_ROLLOUT_RECORD_BYTES: usize = 72 * 1024 * 1024;
+
+fn rollout_path_from_thread(thread: &Value) -> Option<(PathBuf, String)> {
+    let thread_id = thread.get("id").and_then(Value::as_str)?;
+    let path = PathBuf::from(thread.get("path").and_then(Value::as_str)?);
+    let file_name = path.file_name()?.to_str()?;
+    if !path.is_absolute() || path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+        return None;
+    }
+    let expected_suffix = format!("-{thread_id}.jsonl");
+    if !file_name.ends_with(&expected_suffix) {
+        return None;
+    }
+    Some((path, thread_id.to_string()))
+}
+
+async fn capture_rollout_path(
+    rollout_images: &Arc<Mutex<RolloutImageCursor>>,
+    thread: &Value,
+    turn_in_flight: bool,
+    conversation_id: &str,
+) {
+    let Some((path, thread_id)) = rollout_path_from_thread(thread) else {
+        return;
+    };
+    let initial_offset = if turn_in_flight {
+        0
+    } else {
+        tokio::fs::metadata(&path).await.map_or(0, |metadata| metadata.len())
+    };
+    let mut cursor = rollout_images.lock().await;
+    if cursor.path.as_ref() == Some(&path) {
+        return;
+    }
+    cursor.path = Some(path);
+    cursor.offset = initial_offset;
+    cursor.seen_image_ids.clear();
+    tracing::info!(
+        conversation_id,
+        thread_id,
+        initial_offset,
+        turn_in_flight,
+        "codex rollout image fallback bound"
+    );
+}
+
+async fn capture_rollout_path_from_response(
+    rollout_images: &Arc<Mutex<RolloutImageCursor>>,
+    frame: &Value,
+    turn_in_flight: bool,
+    conversation_id: &str,
+) {
+    if let Some(thread) = frame.get("result").and_then(|result| result.get("thread")) {
+        capture_rollout_path(rollout_images, thread, turn_in_flight, conversation_id).await;
+    }
+}
+
+async fn mark_image_result_seen(rollout_images: &Arc<Mutex<RolloutImageCursor>>, item: &Value) {
+    if let Some(image_id) = item
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|image_id| !image_id.is_empty())
+    {
+        rollout_images.lock().await.seen_image_ids.insert(image_id.to_string());
+    }
+}
+
+fn has_materializable_image_result(events: &[SessionEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(event,
+            SessionEvent::ToolResult { content, .. }
+                if content.iter().any(|part| match part {
+                    crate::event::ToolResultContent::Image { .. } => true,
+                    crate::event::ToolResultContent::FilePath { mime: Some(mime), .. } => {
+                        mime.starts_with("image/")
+                    }
+                    _ => false,
+                })
+        )
+    })
+}
+
+struct RolloutImageScan {
+    path: PathBuf,
+    start_offset: u64,
+    end_offset: u64,
+    items: Vec<Value>,
+}
+
+fn scan_rollout_images(path: &Path, start_offset: u64, turn_id: &str) -> Result<RolloutImageScan, String> {
+    use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
+
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let file_len = file.metadata().map_err(|error| error.to_string())?.len();
+    let start_offset = if start_offset <= file_len { start_offset } else { 0 };
+    let scan_len = file_len.saturating_sub(start_offset);
+    if scan_len > MAX_ROLLOUT_SCAN_BYTES {
+        return Err(format!(
+            "rollout append exceeds {MAX_ROLLOUT_SCAN_BYTES} byte scan limit"
+        ));
+    }
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|error| error.to_string())?;
+    let mut reader = std::io::BufReader::new(file.take(scan_len));
+    let mut line = Vec::new();
+    let mut consumed = 0_u64;
+    let mut in_target_turn = start_offset > 0;
+    let mut items = Vec::new();
+
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        if !line.ends_with(b"\n") {
+            break;
+        }
+        consumed = consumed.saturating_add(read as u64);
+        if line.len() > MAX_ROLLOUT_RECORD_BYTES {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let payload = record.get("payload").unwrap_or(&Value::Null);
+        if record.get("type").and_then(Value::as_str) == Some("event_msg") {
+            match payload.get("type").and_then(Value::as_str) {
+                Some("task_started") => {
+                    in_target_turn = payload.get("turn_id").and_then(Value::as_str) == Some(turn_id);
+                }
+                Some("task_complete") if payload.get("turn_id").and_then(Value::as_str) == Some(turn_id) => {
+                    break;
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if in_target_turn
+            && record.get("type").and_then(Value::as_str) == Some("response_item")
+            && payload.get("type").and_then(Value::as_str) == Some("image_generation_call")
+            && payload.get("status").and_then(Value::as_str) == Some("completed")
+        {
+            items.push(payload.clone());
+        }
+    }
+
+    Ok(RolloutImageScan {
+        path: path.to_path_buf(),
+        start_offset,
+        end_offset: start_offset.saturating_add(consumed),
+        items,
+    })
+}
+
+async fn collect_rollout_image_events(
+    rollout_images: &Arc<Mutex<RolloutImageCursor>>,
+    turn_id: &str,
+) -> Result<Vec<SessionEvent>, String> {
+    let (path, start_offset) = {
+        let cursor = rollout_images.lock().await;
+        let Some(path) = cursor.path.clone() else {
+            return Ok(Vec::new());
+        };
+        (path, cursor.offset)
+    };
+    let turn_id = turn_id.to_string();
+    let scan = tokio::task::spawn_blocking(move || scan_rollout_images(&path, start_offset, &turn_id))
+        .await
+        .map_err(|error| error.to_string())??;
+
+    let mut cursor = rollout_images.lock().await;
+    if cursor.path.as_ref() != Some(&scan.path) || cursor.offset != scan.start_offset {
+        return Ok(Vec::new());
+    }
+    cursor.offset = scan.end_offset;
+    let mut events = Vec::new();
+    for item in scan.items {
+        let Some(image_id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|image_id| !image_id.is_empty())
+        else {
+            continue;
+        };
+        let mapped = map_raw_response_item(&json!({ "item": item }));
+        if !has_materializable_image_result(&mapped) || !cursor.seen_image_ids.insert(image_id.to_string()) {
+            continue;
+        }
+        events.extend(mapped);
+    }
+    Ok(events)
+}
+
+async fn emit_pending_terminal_with_rollout_images(
+    pending_turn_terminal: &mut Option<PendingTurnTerminal>,
+    rollout_images: &Arc<Mutex<RolloutImageCursor>>,
+    event_tx: &broadcast::Sender<SessionEnvelope>,
+    session_id: &str,
+    turn_gen: u64,
+) {
+    let Some(pending) = pending_turn_terminal.take() else {
+        return;
+    };
+    if let Some(turn_id) = pending.turn_id.as_deref() {
+        match collect_rollout_image_events(rollout_images, turn_id).await {
+            Ok(events) => {
+                let recovered = events
+                    .iter()
+                    .filter(|event| matches!(event, SessionEvent::ToolResult { .. }))
+                    .count();
+                for event in events {
+                    emit(event_tx, session_id, turn_gen, event);
+                }
+                if recovered > 0 {
+                    tracing::info!(
+                        conversation_id = session_id,
+                        turn_id,
+                        recovered,
+                        "codex rollout image fallback recovered completed image results"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                conversation_id = session_id,
+                turn_id,
+                error = %error,
+                "codex rollout image fallback scan failed"
+            ),
+        }
+    }
+    emit(event_tx, session_id, turn_gen, pending.event);
 }
 
 fn image_media_type_from_path(path: &str) -> Option<&'static str> {
@@ -7916,6 +8221,215 @@ mod tests {
         assert!(
             image_index < terminal_index,
             "the image result must precede terminal so StreamRelay can persist it, got {events:?}"
+        );
+    }
+
+    /// Codex 0.144.6 can omit the normalized imageGeneration item entirely while
+    /// still archiving the completed Responses image in the rollout JSONL. This
+    /// reproduces that real shape: app-server only reports turn completion, and
+    /// the image must be recovered from the path returned by thread/start.
+    #[tokio::test]
+    async fn codex_rollout_only_image_result_precedes_terminal() {
+        use std::io::Write as _;
+
+        let temp = tempfile::tempdir().expect("temp rollout directory");
+        let rollout_path = temp.path().join("rollout-2026-09-02T20-19-25-th-rollout.jsonl");
+        std::fs::write(
+            &rollout_path,
+            concat!(
+                r#"{"timestamp":"2026-09-02T12:19:26.805Z","type":"session_meta","payload":{"id":"th-rollout"}}"#,
+                "\n",
+            ),
+        )
+        .expect("seed rollout");
+
+        let binding_segment = format!(
+            "{}\n{}\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 91,
+                "result": { "thread": { "id": "th-rollout", "path": rollout_path } }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "thread/started",
+                "params": { "thread": { "id": "th-rollout" } }
+            })
+        )
+        .into_bytes();
+        let turn_segment = concat!(
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"th-rollout","turn":{"id":"turn-rollout"}}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th-rollout","turn":{"id":"turn-rollout","status":"completed"}}}"#,
+            "\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![
+            binding_segment,
+            turn_segment,
+            // Never released: production app-server stdout remains open, so the
+            // rollout fallback must run from the terminal drain deadline.
+            b"{}\n".to_vec(),
+        ]);
+        let release = fake.segment_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-rollout", Box::new(fake)).await;
+        let mut events = backend.events();
+
+        release();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(envelope) = events.next().await {
+                if matches!(envelope.event, SessionEvent::BackendBound { .. }) {
+                    return;
+                }
+            }
+            panic!("reader ended before thread binding");
+        })
+        .await
+        .expect("thread binding timed out");
+
+        let mut rollout = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .expect("open rollout append");
+        writeln!(
+            rollout,
+            "{}",
+            json!({
+                "timestamp": "2026-09-02T12:19:26.805Z",
+                "type": "event_msg",
+                "payload": { "type": "task_started", "turn_id": "turn-rollout" }
+            })
+        )
+        .expect("append task start");
+        writeln!(
+            rollout,
+            "{}",
+            json!({
+                "timestamp": "2026-09-02T12:20:07.996Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "image_generation_call",
+                    "id": "ig-rollout-only",
+                    "status": "completed",
+                    "result": "iVBORw0KGgo="
+                }
+            })
+        )
+        .expect("append image result");
+        writeln!(
+            rollout,
+            "{}",
+            json!({
+                "timestamp": "2026-09-02T12:20:08.102Z",
+                "type": "event_msg",
+                "payload": { "type": "task_complete", "turn_id": "turn-rollout" }
+            })
+        )
+        .expect("append task completion");
+        rollout.flush().expect("flush rollout");
+
+        backend.mark_turn_in_flight_for_test();
+        release();
+        let mut observed = Vec::new();
+        tokio::time::timeout(CODEX_TERMINAL_DRAIN_GRACE + std::time::Duration::from_secs(2), async {
+            while let Some(envelope) = events.next().await {
+                let terminal = matches!(envelope.event, SessionEvent::TurnResult { .. });
+                observed.push(envelope.event);
+                if terminal {
+                    return;
+                }
+            }
+            panic!("reader ended before terminal");
+        })
+        .await
+        .expect("rollout fallback terminal timed out");
+
+        let image_index = observed
+            .iter()
+            .position(|event| {
+                matches!(event,
+                    SessionEvent::ToolResult { tool_use_id, content, .. }
+                        if tool_use_id == "ig-rollout-only"
+                            && content.iter().any(|part| matches!(part,
+                                crate::event::ToolResultContent::Image { media_type, .. }
+                                    if media_type == "image/png"
+                            ))
+                )
+            })
+            .expect("rollout-only image must be recovered");
+        let terminal_index = observed
+            .iter()
+            .position(|event| matches!(event, SessionEvent::TurnResult { .. }))
+            .expect("turn must terminate");
+        assert!(
+            image_index < terminal_index,
+            "rollout image must precede terminal: {observed:?}"
+        );
+    }
+
+    #[test]
+    fn rollout_scan_is_scoped_to_the_requested_turn() {
+        let temp = tempfile::tempdir().expect("temp rollout directory");
+        let rollout_path = temp.path().join("rollout-2026-09-02T20-19-25-th-scan.jsonl");
+        let lines = [
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"other-turn"}}),
+            json!({"type":"response_item","payload":{"type":"image_generation_call","id":"ig-other","status":"completed","result":"iVBORw0KGgo="}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"other-turn"}}),
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"target-turn"}}),
+            json!({"type":"response_item","payload":{"type":"image_generation_call","id":"ig-target","status":"completed","result":"iVBORw0KGgo="}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"target-turn"}}),
+        ];
+        std::fs::write(
+            &rollout_path,
+            lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .expect("write rollout fixture");
+
+        let scan = scan_rollout_images(&rollout_path, 0, "target-turn").expect("scan rollout");
+        let ids = scan
+            .items
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["ig-target"]);
+        assert!(scan.end_offset <= std::fs::metadata(rollout_path).expect("rollout metadata").len());
+    }
+
+    #[tokio::test]
+    async fn rollout_fallback_does_not_duplicate_an_app_server_image() {
+        let temp = tempfile::tempdir().expect("temp rollout directory");
+        let rollout_path = temp.path().join("rollout-2026-09-02T20-19-25-th-dedup.jsonl");
+        std::fs::write(
+            &rollout_path,
+            [
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-dedup"}}),
+                json!({"type":"response_item","payload":{"type":"image_generation_call","id":"ig-already-seen","status":"completed","result":"iVBORw0KGgo="}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-dedup"}}),
+            ]
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+                + "\n",
+        )
+        .expect("write rollout fixture");
+        let cursor = Arc::new(Mutex::new(RolloutImageCursor {
+            path: Some(rollout_path),
+            offset: 0,
+            seen_image_ids: HashSet::from(["ig-already-seen".to_string()]),
+        }));
+
+        let events = collect_rollout_image_events(&cursor, "turn-dedup")
+            .await
+            .expect("scan rollout fallback");
+        assert!(
+            events.is_empty(),
+            "an image already emitted by app-server must not be duplicated"
+        );
+        assert!(
+            cursor.lock().await.offset > 0,
+            "deduplicated scans still advance the cursor"
         );
     }
 
