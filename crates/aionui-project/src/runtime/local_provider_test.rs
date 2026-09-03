@@ -335,6 +335,22 @@ async fn search_matches_files_by_name_substring() {
 }
 
 #[tokio::test]
+async fn search_matches_directories_by_name() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("src-components")).unwrap();
+    std::fs::write(root.join("src-components").join("button.tsx"), b"x").unwrap();
+
+    let (hits, capped) = search_collect(root, "components", MatchMode::Substring, 100).await;
+    assert!(!capped);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].relative_path, "src-components");
+    assert_eq!(hits[0].name, "src-components");
+    assert!(hits[0].is_directory);
+    assert_eq!(hits[0].match_kind, SearchMatchKind::Name);
+}
+
+#[tokio::test]
 async fn search_empty_query_returns_all_files_not_dirs() {
     let dir = tempdir().unwrap();
     let root = dir.path();
@@ -345,7 +361,6 @@ async fn search_empty_query_returns_all_files_not_dirs() {
     let (hits, _) = search_collect(root, "", MatchMode::Substring, 100).await;
     let mut names: Vec<&str> = hits.iter().map(|hit| hit.name.as_str()).collect();
     names.sort_unstable();
-    // Files only — directories ("sub") are traversed but never emitted.
     assert_eq!(names, vec!["a.txt", "b.txt"]);
 }
 

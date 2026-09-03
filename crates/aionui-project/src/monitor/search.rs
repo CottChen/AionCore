@@ -160,6 +160,7 @@ impl SearchSink for RootSink {
             pe_id: self.pe_id.clone(),
             relative_path: hit.relative_path,
             name: hit.name,
+            is_directory: hit.is_directory,
             match_kind: hit.match_kind,
             content_match_count: hit.content_match_count,
             content_preview: hit.content_preview,

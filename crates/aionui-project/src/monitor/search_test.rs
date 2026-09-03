@@ -70,6 +70,7 @@ impl IFsSearchProvider for ScriptedProvider {
             sink.emit(ProviderSearchHit {
                 relative_path: rel.clone(),
                 name: name.clone(),
+                is_directory: false,
                 match_kind: SearchMatchKind::Name,
                 content_match_count: None,
                 content_preview: None,

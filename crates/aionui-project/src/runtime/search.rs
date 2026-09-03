@@ -4,8 +4,8 @@
 //! non-recursive data-op contract is not polluted by the recursive/streaming shape
 //! of search. A provider walks its own subtree the most efficient way it can
 //! (`LocalFsProvider` = in-process `ignore` walk; a future remote provider = one
-//! request + a frame stream), emitting each file hit through a [`SearchSink`].
-//! The provider produces pe-relative hits; batching and pe-id stamping,
+//! request + a frame stream), emitting each matching entry through a [`SearchSink`].
+//! The provider produces pe-relative hits (files and matching directories); batching and pe-id stamping,
 //! merging into one `fs/search` stream, and pushing to the wire are the
 //! orchestration layer's job (see `monitor::search`).
 //!
@@ -313,13 +313,14 @@ impl CancellationToken {
     }
 }
 
-/// Hit outlet. The provider calls [`SearchSink::emit`] per matching file with the
-/// root-relative path (forward-slash normalized, no leading slash) and file name;
+/// Hit outlet. The provider calls [`SearchSink::emit`] per matching entry with the
+/// root-relative path (forward-slash normalized, no leading slash) and entry name;
 /// the orchestration layer stamps `pe_id`, batches, and pushes `fs/searchMatch`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSearchHit {
     pub relative_path: String,
     pub name: String,
+    pub is_directory: bool,
     pub match_kind: SearchMatchKind,
     pub content_match_count: Option<usize>,
     pub content_preview: Option<String>,

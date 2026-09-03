@@ -271,6 +271,7 @@ fn search_hit_serializes_project_identity() {
         pe_id: "pe1".to_owned(),
         relative_path: "src/components/Button.tsx".to_owned(),
         name: "Button.tsx".to_owned(),
+        is_directory: false,
         match_kind: SearchMatchKind::Name,
         content_match_count: None,
         content_preview: None,
@@ -278,7 +279,7 @@ fn search_hit_serializes_project_identity() {
     let v = serde_json::to_value(&hit).unwrap();
     assert_eq!(
         v,
-        json!({"pe_id":"pe1","relative_path":"src/components/Button.tsx","name":"Button.tsx","match_kind":"name"})
+        json!({"pe_id":"pe1","relative_path":"src/components/Button.tsx","name":"Button.tsx","is_directory":false,"match_kind":"name"})
     );
 }
 
@@ -288,6 +289,7 @@ fn search_match_params_batches_hits_under_search_id() {
         pe_id: "pe2".to_owned(),
         relative_path: "widgets/iconButton.ts".to_owned(),
         name: "iconButton.ts".to_owned(),
+        is_directory: false,
         match_kind: SearchMatchKind::Content,
         content_match_count: Some(2),
         content_preview: Some("button content".to_owned()),

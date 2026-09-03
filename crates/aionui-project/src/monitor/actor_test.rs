@@ -1002,6 +1002,7 @@ impl IFsSearchProvider for BarrierSearchProvider {
             sink.emit(ProviderSearchHit {
                 relative_path: "hit.txt".to_owned(),
                 name: "hit.txt".to_owned(),
+                is_directory: false,
                 match_kind: SearchMatchKind::Name,
                 content_match_count: None,
                 content_preview: None,

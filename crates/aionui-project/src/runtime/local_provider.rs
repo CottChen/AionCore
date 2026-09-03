@@ -59,12 +59,18 @@ struct SearchSessionStore {
 #[derive(Debug)]
 struct SearchSession {
     root: PathBuf,
-    entries: Vec<String>,
+    entries: Vec<SearchEntry>,
     next_index: usize,
     query: String,
     mode: super::search::SearchMode,
     truncated: bool,
     updated_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct SearchEntry {
+    relative_path: String,
+    is_directory: bool,
 }
 
 impl LocalFsProvider {
@@ -373,7 +379,7 @@ fn search_page(
 /// Enumerate a stable, bounded catalog once. The list contains only relative
 /// paths, so continuation memory is proportional to file names rather than
 /// file size or result count.
-fn collect_search_entries(root: &Path, budget: &Budget, cancel: &CancellationToken) -> (Vec<String>, bool) {
+fn collect_search_entries(root: &Path, budget: &Budget, cancel: &CancellationToken) -> (Vec<SearchEntry>, bool) {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
@@ -391,7 +397,7 @@ fn collect_search_entries(root: &Path, budget: &Budget, cancel: &CancellationTok
     let walker = builder.build();
 
     let mut scanned_files = 0usize;
-    let mut entries = Vec::new();
+    let mut entries: Vec<SearchEntry> = Vec::new();
     let mut catalog_bytes = 0usize;
     for (seen, entry) in walker.enumerate() {
         if seen.is_multiple_of(CANCEL_CHECK_STRIDE) && cancel.is_cancelled() {
@@ -405,16 +411,21 @@ fn collect_search_entries(root: &Path, budget: &Budget, cancel: &CancellationTok
                 continue;
             }
         };
-        // Project search returns files only (SearchHit is files-only); the root
-        // dir itself and every subdirectory are traversed but never emitted.
-        if entry.file_type().is_none_or(|ft| ft.is_dir()) {
+        let file_type = entry.file_type();
+        let is_directory = file_type.is_some_and(|ft| ft.is_dir())
+            || file_type.is_some_and(|ft| ft.is_symlink() && entry.path().is_dir());
+        // The root itself has an empty relative path and is not a searchable
+        // result. Descendant directories are retained so their names can match.
+        if is_directory && entry.path() == root {
             continue;
         }
-        if scanned_files >= MAX_SEARCH_SCANNED_FILES {
+        if !is_directory && scanned_files >= MAX_SEARCH_SCANNED_FILES {
             return (entries, true);
         }
-        scanned_files += 1;
-        budget.record_scanned_file();
+        if !is_directory {
+            scanned_files += 1;
+            budget.record_scanned_file();
+        }
         // Keep only the forward-slash relative path. It is sufficient to build
         // the native path later and avoids retaining duplicate name strings.
         let relative_path = rel_path(root, entry.path());
@@ -422,7 +433,10 @@ fn collect_search_entries(root: &Path, budget: &Budget, cancel: &CancellationTok
             return (entries, true);
         }
         catalog_bytes += relative_path.len();
-        entries.push(relative_path);
+        entries.push(SearchEntry {
+            relative_path,
+            is_directory,
+        });
     }
     (entries, false)
 }
@@ -485,14 +499,21 @@ fn search_catalog(
         if cancel.is_cancelled() {
             return SearchWalkResult::default();
         }
-        let relative_path = &session.entries[session.next_index];
+        let entry = &session.entries[session.next_index];
+        let relative_path = &entry.relative_path;
         let path = session.root.join(relative_path);
+        // Empty query is browse mode and retains the historical files-only
+        // result set; directories participate when a directory name is queried.
+        if entry.is_directory && query.needle().is_empty() {
+            session.next_index += 1;
+            continue;
+        }
         let Some(name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else {
             session.next_index += 1;
             continue;
         };
         let name_matches = query.matches_name(&name);
-        let content_match = if query.searches_content() {
+        let content_match = if !entry.is_directory && query.searches_content() {
             match search_file_content(&path, query.needle(), budget) {
                 ContentSearch::Match(found) => Some(found),
                 ContentSearch::NoMatch => None,
@@ -521,6 +542,7 @@ fn search_catalog(
         sink.emit(ProviderSearchHit {
             relative_path: relative_path.clone(),
             name,
+            is_directory: entry.is_directory,
             match_kind,
             content_match_count,
             content_preview,

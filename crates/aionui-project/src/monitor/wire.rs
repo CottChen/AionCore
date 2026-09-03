@@ -145,13 +145,14 @@ pub struct SearchCancelParams {
     pub search_id: Value,
 }
 
-/// One project-search hit — the chat-ref `project` identity (files only). `pe_id` is
+/// One project-search hit — the chat-ref `project` identity. `pe_id` is
 /// stamped by the orchestration layer from the root the hit came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SearchHit {
     pub pe_id: String,
     pub relative_path: String,
     pub name: String,
+    pub is_directory: bool,
     pub match_kind: SearchMatchKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_match_count: Option<usize>,
