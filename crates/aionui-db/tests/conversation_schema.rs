@@ -1,5 +1,37 @@
+use std::borrow::Cow;
+use std::path::Path;
+
 use aionui_db::{init_database_memory, models::ConversationRow, models::MessageRow};
 use sqlx::Row;
+use sqlx::migrate::Migrator;
+use sqlx::sqlite::SqlitePoolOptions;
+
+async fn run_migrations_through(pool: &sqlx::SqlitePool, max_version: i64) {
+    sqlx::query("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON")
+        .execute(pool)
+        .await
+        .unwrap();
+    let full = Migrator::new(Path::new("migrations")).await.unwrap();
+    let migrations = full
+        .migrations
+        .iter()
+        .filter(|migration| migration.version <= max_version)
+        .cloned()
+        .collect::<Vec<_>>();
+    Migrator {
+        migrations: Cow::Owned(migrations),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+    .run(pool)
+    .await
+    .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON; PRAGMA legacy_alter_table = OFF")
+        .execute(pool)
+        .await
+        .unwrap();
+}
 
 // Helper: insert a test user and return their id.
 async fn insert_test_user(pool: &sqlx::SqlitePool) -> String {
@@ -653,5 +685,63 @@ async fn messages_table_does_not_require_sequence_column() {
         !indexes
             .iter()
             .any(|row| row.get::<String, _>("name") == "idx_messages_conv_sequence_unique")
+    );
+}
+
+#[tokio::test]
+async fn migration_900024_backfills_text_search_and_installs_sync_triggers() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations_through(&pool, 27).await;
+
+    let user_id = insert_test_user(&pool).await;
+    let conv_id = insert_test_conversation(&pool, &user_id).await;
+    for (id, message_type, content) in [
+        ("legacy-text", "text", r#"{"content":"legacy searchable text"}"#),
+        ("legacy-tool", "acp_tool_call", r#"{"content":"hidden tool text"}"#),
+        ("legacy-invalid", "text", "not-json"),
+    ] {
+        sqlx::query("INSERT INTO messages (id, conversation_id, type, content, created_at) VALUES (?, ?, ?, ?, 1000)")
+            .bind(id)
+            .bind(&conv_id)
+            .bind(message_type)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    run_migrations_through(&pool, 900024).await;
+
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT COUNT(*) = 1 FROM sqlite_master WHERE type = 'table' AND name = 'message_text_search'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(table_exists);
+
+    let trigger_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
+            'trg_message_text_search_insert',
+            'trg_message_text_search_update',
+            'trg_message_text_search_delete'
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(trigger_count, 3);
+
+    let indexed: Vec<(String,)> = sqlx::query_as("SELECT content FROM message_text_search ORDER BY rowid")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        indexed,
+        vec![("legacy searchable text".to_string(),), ("not-json".to_string(),)]
     );
 }

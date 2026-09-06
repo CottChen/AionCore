@@ -8,9 +8,18 @@ use crate::models::{
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
+    ConversationFilters, ConversationRowUpdate, ConversationTextMessageRow, IConversationRepository, MessagePageCursor,
+    MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
 };
+
+fn fts_phrase(keyword: &str) -> String {
+    format!("\"{}\"", keyword.replace('"', "\"\""))
+}
+
+fn escaped_like_pattern(keyword: &str) -> String {
+    let escaped = keyword.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    format!("%{escaped}%")
+}
 
 /// SQLite-backed implementation of [`IConversationRepository`].
 #[derive(Clone, Debug)]
@@ -737,6 +746,23 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(rows)
     }
 
+    async fn list_text_messages(&self, conv_id: &str) -> Result<Vec<ConversationTextMessageRow>, DbError> {
+        let rows = sqlx::query_as::<_, ConversationTextMessageRow>(
+            "SELECT id, msg_id, position, json_extract(content, '$.content') AS content \
+             FROM messages \
+             WHERE conversation_id = ? \
+               AND type = 'text' \
+               AND json_valid(content) \
+               AND typeof(json_extract(content, '$.content')) = 'text' \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(conv_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     async fn search_messages(
         &self,
         user_id: &str,
@@ -749,49 +775,76 @@ impl IConversationRepository for SqliteConversationRepository {
         let offset = (effective_page - 1) * effective_size;
         let fetch_limit = effective_size + 1;
 
-        let like_pattern = format!("%{keyword}%");
+        let keyword = keyword.trim();
+        let use_fts = keyword.chars().count() >= 3;
+        let search_value = if use_fts {
+            fts_phrase(keyword)
+        } else {
+            escaped_like_pattern(keyword)
+        };
 
-        let count_row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM messages m \
-             INNER JOIN conversations c ON m.conversation_id = c.id \
-             WHERE c.user_id = ? AND m.content LIKE ?",
-        )
-        .bind(user_id)
-        .bind(&like_pattern)
-        .fetch_one(&self.pool)
-        .await?;
-        let total = count_row.0 as u64;
+        let total: i64 = if use_fts {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) \
+                 FROM message_text_search mts \
+                 INNER JOIN messages m ON m.rowid = mts.rowid \
+                 INNER JOIN conversations c ON m.conversation_id = c.id \
+                 WHERE c.user_id = ? AND message_text_search MATCH ?",
+            )
+            .bind(user_id)
+            .bind(&search_value)
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) \
+                 FROM message_text_search mts \
+                 INNER JOIN messages m ON m.rowid = mts.rowid \
+                 INNER JOIN conversations c ON m.conversation_id = c.id \
+                 WHERE c.user_id = ? AND mts.content LIKE ? ESCAPE '\\'",
+            )
+            .bind(user_id)
+            .bind(&search_value)
+            .fetch_one(&self.pool)
+            .await?
+        };
 
-        let rows = sqlx::query_as::<_, MessageSearchRow>(
+        let select_sql = if use_fts {
             "SELECT \
-                m.id AS message_id, \
-                m.type, \
-                m.content, \
-                m.created_at, \
-                c.id AS conversation_id, \
-                c.name AS conversation_name, \
-                c.type AS conversation_type, \
-                c.extra AS conversation_extra, \
-                c.model AS conversation_model, \
-                c.status AS conversation_status, \
-                c.source AS conversation_source, \
-                c.channel_chat_id AS conversation_channel_chat_id, \
-                c.pinned AS conversation_pinned, \
-                c.pinned_at AS conversation_pinned_at, \
-                c.created_at AS conversation_created_at, \
-                c.updated_at AS conversation_updated_at \
-             FROM messages m \
+                m.id AS message_id, m.type, m.content, m.created_at, \
+                c.id AS conversation_id, c.name AS conversation_name, c.type AS conversation_type, \
+                c.extra AS conversation_extra, c.model AS conversation_model, c.status AS conversation_status, \
+                c.source AS conversation_source, c.channel_chat_id AS conversation_channel_chat_id, \
+                c.pinned AS conversation_pinned, c.pinned_at AS conversation_pinned_at, \
+                c.created_at AS conversation_created_at, c.updated_at AS conversation_updated_at \
+             FROM message_text_search mts \
+             INNER JOIN messages m ON m.rowid = mts.rowid \
              INNER JOIN conversations c ON m.conversation_id = c.id \
-             WHERE c.user_id = ? AND m.content LIKE ? \
-             ORDER BY m.created_at DESC \
-             LIMIT ? OFFSET ?",
-        )
-        .bind(user_id)
-        .bind(&like_pattern)
-        .bind(fetch_limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE c.user_id = ? AND message_text_search MATCH ? \
+             ORDER BY m.created_at DESC, m.id DESC \
+             LIMIT ? OFFSET ?"
+        } else {
+            "SELECT \
+                m.id AS message_id, m.type, m.content, m.created_at, \
+                c.id AS conversation_id, c.name AS conversation_name, c.type AS conversation_type, \
+                c.extra AS conversation_extra, c.model AS conversation_model, c.status AS conversation_status, \
+                c.source AS conversation_source, c.channel_chat_id AS conversation_channel_chat_id, \
+                c.pinned AS conversation_pinned, c.pinned_at AS conversation_pinned_at, \
+                c.created_at AS conversation_created_at, c.updated_at AS conversation_updated_at \
+             FROM message_text_search mts \
+             INNER JOIN messages m ON m.rowid = mts.rowid \
+             INNER JOIN conversations c ON m.conversation_id = c.id \
+             WHERE c.user_id = ? AND mts.content LIKE ? ESCAPE '\\' \
+             ORDER BY m.created_at DESC, m.id DESC \
+             LIMIT ? OFFSET ?"
+        };
+        let rows = sqlx::query_as::<_, MessageSearchRow>(select_sql)
+            .bind(user_id)
+            .bind(&search_value)
+            .bind(fetch_limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
         let has_more = rows.len() as u32 > effective_size;
         let items = if has_more {
@@ -800,7 +853,11 @@ impl IConversationRepository for SqliteConversationRepository {
             rows
         };
 
-        Ok(PaginatedResult { items, total, has_more })
+        Ok(PaginatedResult {
+            items,
+            total: total as u64,
+            has_more,
+        })
     }
 
     async fn list_artifacts(&self, conversation_id: &str) -> Result<Vec<ConversationArtifactRow>, DbError> {
@@ -1766,6 +1823,207 @@ mod tests {
         assert_eq!(result.items.len(), 2);
         assert_eq!(result.total, 5);
         assert!(result.has_more);
+    }
+
+    #[tokio::test]
+    async fn search_messages_indexes_only_text_content() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        let mut text = sample_message(&conv.id);
+        text.content = r#"{"content":"visible needle"}"#.to_string();
+        repo.insert_message(&text).await.unwrap();
+
+        let mut tool = sample_message(&conv.id);
+        tool.id = aionui_common::generate_prefixed_id("msg");
+        tool.r#type = "acp_tool_call".to_string();
+        tool.content = r#"{"content":"hidden needle"}"#.to_string();
+        repo.insert_message(&tool).await.unwrap();
+
+        let result = repo.search_messages(SYSTEM_USER_ID, "needle", 1, 20).await.unwrap();
+        assert_eq!(result.total, 1);
+        assert_eq!(result.items[0].message_id, text.id);
+    }
+
+    #[tokio::test]
+    async fn search_messages_indexes_nested_text_values() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        let mut message = sample_message(&conv.id);
+        message.content =
+            r#"[{"type":"text","content":"Design document for search"},{"nested":{"text":"feature implementation"}}]"#
+                .to_string();
+        repo.insert_message(&message).await.unwrap();
+
+        let first = repo
+            .search_messages(SYSTEM_USER_ID, "document for search", 1, 20)
+            .await
+            .unwrap();
+        let nested = repo
+            .search_messages(SYSTEM_USER_ID, "feature implementation", 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(first.total, 1);
+        assert_eq!(nested.total, 1);
+    }
+
+    #[tokio::test]
+    async fn search_messages_supports_short_chinese_and_literal_wildcards() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        for (id, content) in [
+            ("short-cn", "数据库优化"),
+            ("literal-percent", "progress is 100% complete"),
+            ("plain", "progress is complete"),
+        ] {
+            let mut message = sample_message(&conv.id);
+            message.id = id.to_string();
+            message.content = serde_json::json!({ "content": content }).to_string();
+            repo.insert_message(&message).await.unwrap();
+        }
+
+        let chinese = repo.search_messages(SYSTEM_USER_ID, "数据", 1, 20).await.unwrap();
+        assert_eq!(chinese.total, 1);
+        assert_eq!(chinese.items[0].message_id, "short-cn");
+
+        let percent = repo.search_messages(SYSTEM_USER_ID, "%", 1, 20).await.unwrap();
+        assert_eq!(percent.total, 1);
+        assert_eq!(percent.items[0].message_id, "literal-percent");
+    }
+
+    #[tokio::test]
+    async fn search_index_tracks_message_updates_and_deletes() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        let mut message = sample_message(&conv.id);
+        message.content = r#"{"content":"before value"}"#.to_string();
+        repo.insert_message(&message).await.unwrap();
+
+        repo.update_message(
+            &message.id,
+            &MessageRowUpdate {
+                content: Some(r#"{"content":"after value"}"#.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.search_messages(SYSTEM_USER_ID, "before", 1, 20)
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+        assert_eq!(
+            repo.search_messages(SYSTEM_USER_ID, "after", 1, 20)
+                .await
+                .unwrap()
+                .total,
+            1
+        );
+
+        repo.delete_messages_by_conversation(&conv.id).await.unwrap();
+        assert_eq!(
+            repo.search_messages(SYSTEM_USER_ID, "after", 1, 20)
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn search_index_skips_streaming_updates_until_text_is_finalized() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        let mut message = sample_message(&conv.id);
+        message.status = Some("work".to_string());
+        message.content = r#"{"content":"streaming draft"}"#.to_string();
+        repo.insert_message(&message).await.unwrap();
+
+        repo.update_message(
+            &message.id,
+            &MessageRowUpdate {
+                content: Some(r#"{"content":"streaming extended draft"}"#.to_string()),
+                status: Some(Some("work".to_string())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.search_messages(SYSTEM_USER_ID, "streaming", 1, 20)
+                .await
+                .unwrap()
+                .total,
+            0
+        );
+
+        repo.update_message(
+            &message.id,
+            &MessageRowUpdate {
+                content: Some(r#"{"content":"final searchable answer"}"#.to_string()),
+                status: Some(Some("finish".to_string())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.search_messages(SYSTEM_USER_ID, "searchable answer", 1, 20)
+                .await
+                .unwrap()
+                .total,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn list_text_messages_returns_minimal_ordered_projection() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        let mut later = sample_message(&conv.id);
+        later.id = "later".to_string();
+        later.created_at = 2000;
+        later.position = Some("left".to_string());
+        later.content = r#"{"content":"answer"}"#.to_string();
+        repo.insert_message(&later).await.unwrap();
+
+        let mut earlier = sample_message(&conv.id);
+        earlier.id = "earlier".to_string();
+        earlier.created_at = 1000;
+        earlier.position = Some("right".to_string());
+        earlier.content = r#"{"content":"question"}"#.to_string();
+        repo.insert_message(&earlier).await.unwrap();
+
+        let mut tool = sample_message(&conv.id);
+        tool.id = "tool".to_string();
+        tool.r#type = "acp_tool_call".to_string();
+        tool.content = r#"{"content":"large payload"}"#.to_string();
+        repo.insert_message(&tool).await.unwrap();
+
+        let rows = repo.list_text_messages(&conv.id).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["earlier", "later"]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.content.as_str()).collect::<Vec<_>>(),
+            ["question", "answer"]
+        );
     }
 
     // ── Filters tests ───────────────────────────────────────────────

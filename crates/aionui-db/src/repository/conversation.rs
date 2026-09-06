@@ -130,6 +130,11 @@ pub trait IConversationRepository: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Returns only the text fields needed to build a conversation turn preview.
+    async fn list_text_messages(&self, _conv_id: &str) -> Result<Vec<ConversationTextMessageRow>, DbError> {
+        Ok(Vec::new())
+    }
+
     /// Full-text search across messages, joining conversation name.
     async fn search_messages(
         &self,
@@ -227,6 +232,15 @@ pub struct MessagePageResult {
     pub items: Vec<MessageRow>,
     pub has_more_before: bool,
     pub has_more_after: bool,
+}
+
+/// Minimal text-message projection used by conversation search previews.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct ConversationTextMessageRow {
+    pub id: String,
+    pub msg_id: Option<String>,
+    pub position: Option<String>,
+    pub content: String,
 }
 
 /// Filters for paginated conversation listing.

@@ -216,3 +216,9 @@ cargo test -p aionui-<crate1> -p aionui-<crate2>                               #
 ```bash
 just push                                             # full pre-push gate, then push
 ```
+
+### Fork Migration And Packaging Notes
+
+- Fork-only migrations use the reserved `900xxx` range; the conversation FTS migration is `900024` after existing `900021`-`900023` records.
+- Keep compatibility for unknown historical `900xxx` records so upgrades do not fail SQLx startup validation.
+- AionUI GitHub builds cannot see uncommitted local Core changes; build and publish the matching AionCore artifact first, then pass its run ID to AionUI.

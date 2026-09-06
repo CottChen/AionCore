@@ -36,8 +36,8 @@ use aionui_db::models::{
     MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    ConversationFilters, ConversationRowUpdate, ConversationTextMessageRow, CreateAcpSessionParams, DbError,
+    IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
     SaveRuntimeStateParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
     SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams,
@@ -472,6 +472,34 @@ impl IConversationRepository for MockRepo {
             has_more_before,
             has_more_after,
         })
+    }
+
+    async fn list_text_messages(&self, conv_id: &str) -> Result<Vec<ConversationTextMessageRow>, aionui_db::DbError> {
+        let mut messages = self
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| message.conversation_id == conv_id && message.r#type == "text")
+            .cloned()
+            .collect::<Vec<_>>();
+        messages.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(messages
+            .into_iter()
+            .filter_map(|message| {
+                let content = serde_json::from_str::<serde_json::Value>(&message.content)
+                    .ok()?
+                    .get("content")?
+                    .as_str()?
+                    .to_string();
+                Some(ConversationTextMessageRow {
+                    id: message.id,
+                    msg_id: message.msg_id,
+                    position: message.position,
+                    content,
+                })
+            })
+            .collect())
     }
 
     async fn insert_message(&self, message: &MessageRow) -> Result<(), aionui_db::DbError> {
@@ -2439,6 +2467,51 @@ async fn search_messages_whitespace_keyword_returns_bad_request() {
     };
     let err = svc.search_messages("user_1", query).await.unwrap_err();
     assert!(matches!(err, ConversationError::BadRequest { .. }));
+}
+
+#[tokio::test]
+async fn turn_previews_pair_text_messages_without_tool_payloads() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    for (id, position, message_type, content, created_at) in [
+        ("q1", "right", "text", "  First\n question  ", 1000),
+        ("tool", "left", "acp_tool_call", "ignored payload", 1500),
+        ("a1", "left", "text", "First answer", 2000),
+        ("a1-extra", "left", "text", "ignored extra answer", 2500),
+        ("q2", "right", "text", "Second question", 3000),
+    ] {
+        repo.insert_message(&MessageRow {
+            id: id.to_string(),
+            conversation_id: conv.id.clone(),
+            msg_id: Some(format!("client-{id}")),
+            r#type: message_type.to_string(),
+            content: serde_json::json!({ "content": content }).to_string(),
+            position: Some(position.to_string()),
+            status: Some("finish".to_string()),
+            hidden: false,
+            created_at,
+        })
+        .await
+        .unwrap();
+    }
+
+    let turns = svc.list_turn_previews("user_1", &conv.id).await.unwrap();
+
+    assert_eq!(turns.len(), 2);
+    assert_eq!((turns[0].index, turns[0].question.as_str()), (1, "First question"));
+    assert_eq!(turns[0].answer, "First answer");
+    assert_eq!((turns[1].message_id.as_str(), turns[1].answer.as_str()), ("q2", ""));
+}
+
+#[tokio::test]
+async fn turn_previews_hide_conversations_owned_by_another_user() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let error = svc.list_turn_previews("user_2", &conv.id).await.unwrap_err();
+
+    assert!(matches!(error, ConversationError::NotFound { .. }));
 }
 
 // ── Mock Agent ───────────────────────────────────────────────────

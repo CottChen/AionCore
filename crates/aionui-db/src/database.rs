@@ -388,6 +388,19 @@ async fn run_migrations_staged(pool: &SqlitePool) -> Result<(), DatabaseInitErro
 async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<(), DbError> {
     match DB_MIGRATOR.run(&mut *conn).await {
         Ok(()) => Ok(()),
+        // Fork builds may leave 900xxx migrations in the database that are
+        // intentionally absent from this checkout. Keep those records and
+        // apply the migrations known by the current binary.
+        Err(sqlx::migrate::MigrateError::VersionMissing(_)) => {
+            let mut compatible_migrator = sqlx::migrate::Migrator {
+                migrations: DB_MIGRATOR.migrations.clone(),
+                ignore_missing: false,
+                locking: DB_MIGRATOR.locking,
+                no_tx: DB_MIGRATOR.no_tx,
+            };
+            compatible_migrator.set_ignore_missing(true);
+            compatible_migrator.run(&mut *conn).await.map_err(DbError::Migration)
+        }
         Err(e) if is_migrations_table_unique_conflict(&e) => {
             warn!("Concurrent migrator detected (UNIQUE conflict on _sqlx_migrations); retrying");
             DB_MIGRATOR.run(&mut *conn).await.map_err(DbError::Migration)
@@ -773,6 +786,29 @@ mod tests {
         .unwrap();
 
         assert_eq!(fk_table, "conversations");
+    }
+
+    #[tokio::test]
+    async fn migrations_ignore_unknown_fork_records() {
+        let db = init_database_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (900021, 'legacy fork migration', TRUE, x'00', 0)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let mut conn = db.pool().acquire().await.unwrap();
+        run_migrations_with_retry(&mut conn).await.unwrap();
+        drop(conn);
+
+        let preserved: bool =
+            sqlx::query_scalar("SELECT COUNT(*) = 1 FROM _sqlx_migrations WHERE version = 900021 AND success = 1")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(preserved);
     }
 
     #[test]
