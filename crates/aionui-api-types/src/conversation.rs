@@ -293,6 +293,18 @@ pub struct MessageListResponse {
     pub has_more_after: bool,
 }
 
+/// Lightweight question/answer pair used by the in-conversation search panel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationTurnPreview {
+    pub index: u32,
+    pub question: String,
+    pub answer: String,
+    pub message_id: String,
+    pub msg_id: Option<String>,
+}
+
+pub type ConversationTurnPreviewListResponse = Vec<ConversationTurnPreview>;
+
 /// Response for `GET /api/conversations/active-count`.
 #[derive(Debug, Serialize)]
 pub struct ActiveCountResponse {
@@ -911,6 +923,22 @@ mod tests {
         assert_eq!(raw["has_more_after"], false);
         assert!(raw.get("total").is_none());
         assert!(raw.get("has_more").is_none());
+    }
+
+    #[test]
+    fn conversation_turn_preview_serialization_uses_api_field_names() {
+        let preview = ConversationTurnPreview {
+            index: 2,
+            question: "Question".into(),
+            answer: "Answer".into(),
+            message_id: "msg_2".into(),
+            msg_id: Some("client_2".into()),
+        };
+
+        let raw = serde_json::to_value(preview).unwrap();
+        assert_eq!(raw["index"], 2);
+        assert_eq!(raw["message_id"], "msg_2");
+        assert_eq!(raw["msg_id"], "client_2");
     }
 
     #[test]

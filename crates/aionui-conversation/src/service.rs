@@ -18,11 +18,12 @@ use aionui_api_types::{
     ApprovalCheckResponse, AssistantConversationOverridesRequest, CancelConversationResponse, CloneConversationRequest,
     ConfirmRequest, ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse,
     ConversationArtifactResponse, ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus,
-    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
-    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, ConversationTurnPreview,
+    ConversationTurnPreviewListResponse, CreateConversationRequest, EnsureConversationRuntimeResponse,
+    ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
+    TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
+    assistant_avatar_response_value, assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -30,11 +31,11 @@ use aionui_common::{
 };
 use aionui_db::models::{AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow};
 use aionui_db::{
-    AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, MessagePageCursor,
-    MessagePageDirection, MessagePageParams, SaveRuntimeStateParams, UpsertConversationAssistantSnapshotParams,
-    resolve_agent_binding_from_rows,
+    AgentBindingResolution, ConversationFilters, ConversationRowUpdate, ConversationTextMessageRow,
+    CreateAcpSessionParams, IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository,
+    IAssistantOverlayRepository, IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository,
+    MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
+    UpsertConversationAssistantSnapshotParams, resolve_agent_binding_from_rows,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -42,7 +43,7 @@ use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
 use chrono::Datelike;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::convert::{
@@ -2221,7 +2222,90 @@ fn message_locator_count(query: &ListMessagesQuery) -> usize {
         + usize::from(query.anchor_message_id.is_some())
 }
 
+fn normalize_search_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn build_turn_previews(rows: Vec<ConversationTextMessageRow>) -> ConversationTurnPreviewListResponse {
+    let mut turns = Vec::new();
+    let mut current: Option<ConversationTurnPreview> = None;
+
+    for row in rows {
+        let content = normalize_search_text(&row.content);
+        if content.is_empty() {
+            continue;
+        }
+
+        match row.position.as_deref() {
+            Some("right") => {
+                if let Some(turn) = current.take() {
+                    turns.push(turn);
+                }
+                current = Some(ConversationTurnPreview {
+                    index: turns.len() as u32 + 1,
+                    question: content,
+                    answer: String::new(),
+                    message_id: row.id,
+                    msg_id: row.msg_id,
+                });
+            }
+            Some("left") => {
+                if let Some(turn) = current.as_mut()
+                    && turn.answer.is_empty()
+                {
+                    turn.answer = content;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(turn) = current {
+        turns.push(turn);
+    }
+    turns
+}
+
 impl ConversationService {
+    /// Return lightweight text-only turns for the in-conversation search panel.
+    pub async fn list_turn_previews(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationTurnPreviewListResponse, ConversationError> {
+        self.conversation_repo
+            .get(conversation_id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
+        let started = Instant::now();
+        let rows = self.conversation_repo.list_text_messages(conversation_id).await?;
+        let message_count = rows.len();
+        let turns = build_turn_previews(rows);
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            warn!(
+                conversation_id,
+                text_messages = message_count,
+                turns = turns.len(),
+                elapsed_ms = elapsed.as_millis(),
+                "Slow conversation turn preview query"
+            );
+        } else {
+            debug!(
+                conversation_id,
+                text_messages = message_count,
+                turns = turns.len(),
+                elapsed_ms = elapsed.as_millis(),
+                "Built conversation turn previews"
+            );
+        }
+        Ok(turns)
+    }
+
     /// List messages for a conversation with cursor-based pagination.
     pub async fn list_messages(
         &self,
@@ -2456,10 +2540,30 @@ impl ConversationService {
         let page = query.page.unwrap_or(1);
         let page_size = query.page_size.unwrap_or(20);
 
+        let started = Instant::now();
         let result = self
             .conversation_repo
             .search_messages(user_id, &query.keyword, page, page_size)
             .await?;
+
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            warn!(
+                page,
+                page_size,
+                matches = result.total,
+                elapsed_ms = elapsed.as_millis(),
+                "Slow conversation message search"
+            );
+        } else {
+            debug!(
+                page,
+                page_size,
+                matches = result.total,
+                elapsed_ms = elapsed.as_millis(),
+                "Searched conversation messages"
+            );
+        }
 
         let items = result
             .items

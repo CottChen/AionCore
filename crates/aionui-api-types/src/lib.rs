@@ -82,9 +82,10 @@ pub use conversation::{
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
     ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationRatingResponse, ConversationRatingVote, ConversationResponse, ConversationRuntimeStateKind,
-    ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationRatingRequest,
+    ConversationRuntimeSummary, ConversationTurnPreview, ConversationTurnPreviewListResponse, CreateConversationRequest,
+    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchItem, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SubmitConversationRatingRequest,
     UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
