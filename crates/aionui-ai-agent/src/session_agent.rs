@@ -2590,7 +2590,10 @@ fn spawn_event_pump(
             // mode categories together) so it never wipes a sibling category.
             if let SessionEvent::CatalogUpdated {
                 models,
+                current_model,
                 modes,
+                current_mode,
+                current_effort,
                 slash_commands,
             } = &env.event
             {
@@ -2603,7 +2606,7 @@ fn spawn_event_pump(
                         description: None,
                         category: Some("mode".into()),
                         option_type: "select".into(),
-                        current_value: runtime.mode_override(),
+                        current_value: runtime.mode_override().or_else(|| current_mode.clone()),
                         options: modes
                             .iter()
                             .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
@@ -2623,7 +2626,7 @@ fn spawn_event_pump(
                         description: None,
                         category: Some("model".into()),
                         option_type: "select".into(),
-                        current_value: runtime.model_override(),
+                        current_value: runtime.model_override().or_else(|| current_model.clone()),
                         options: models
                             .iter()
                             .map(|m| aionui_api_types::AcpConfigSelectOptionDto {
@@ -2643,7 +2646,8 @@ fn spawn_event_pump(
                 // and the highlight comes from the runtime's optimistic effort override
                 // (claude emits no effort echo). Emitted only when the current model
                 // advertises efforts (union fallback when the current model is unknown).
-                let efforts = resolve_current_model_efforts(models, runtime.model_override().as_deref());
+                let effective_model = runtime.model_override().or_else(|| current_model.clone());
+                let efforts = resolve_current_model_efforts(models, effective_model.as_deref());
                 if !efforts.is_empty() {
                     config_options.push(aionui_api_types::AcpConfigOptionDto {
                         id: "reasoning_effort".into(),
@@ -2652,7 +2656,7 @@ fn spawn_event_pump(
                         description: None,
                         category: Some("thought_level".into()),
                         option_type: "select".into(),
-                        current_value: runtime.effort_override(),
+                        current_value: runtime.effort_override().or_else(|| current_effort.clone()),
                         options: efforts
                             .iter()
                             .map(|e| aionui_api_types::AcpConfigSelectOptionDto {
@@ -6999,14 +7003,17 @@ mod pump_tests {
                     id: "opus".into(),
                     name: "Opus".into(),
                     description: None,
-                    reasoning_efforts: Vec::new(),
+                    reasoning_efforts: vec!["low".into(), "high".into()],
                 },
             ],
+            current_model: Some("opus".into()),
             modes: vec![ModeInfo {
                 id: "plan".into(),
                 name: "Plan".into(),
                 description: None,
             }],
+            current_mode: Some("plan".into()),
+            current_effort: Some("high".into()),
             slash_commands: Vec::new(),
         })];
         let frames = drain_script(script).await;
@@ -7046,6 +7053,22 @@ mod pump_tests {
             vec!["default", "opus"],
             "the parsed model ids ride the frame"
         );
+        assert_eq!(
+            model_opt.get("current_value").or_else(|| model_opt.get("currentValue")),
+            Some(&serde_json::Value::String("opus".into())),
+            "catalog push must preserve the current model highlight"
+        );
+        let effort_opt = options
+            .iter()
+            .find(|o| o.get("category").and_then(|c| c.as_str()) == Some("thought_level"))
+            .expect("thought-level category");
+        assert_eq!(
+            effort_opt
+                .get("current_value")
+                .or_else(|| effort_opt.get("currentValue")),
+            Some(&serde_json::Value::String("high".into())),
+            "catalog push must preserve Codex's current reasoning effort"
+        );
     }
 
     // The FIX (async slash-command arrival push): claude advertises its command
@@ -7060,7 +7083,10 @@ mod pump_tests {
         use aionui_session::SlashCommandInfo;
         let script = vec![env(SessionEvent::CatalogUpdated {
             models: Vec::new(),
+            current_model: None,
             modes: Vec::new(),
+            current_mode: None,
+            current_effort: None,
             slash_commands: vec![
                 SlashCommandInfo {
                     name: "compact".into(),
@@ -7101,7 +7127,10 @@ mod pump_tests {
                 description: None,
                 reasoning_efforts: Vec::new(),
             }],
+            current_model: Some("opus".into()),
             modes: Vec::new(),
+            current_mode: None,
+            current_effort: None,
             slash_commands: Vec::new(),
         })];
         let frames = drain_script(script).await;

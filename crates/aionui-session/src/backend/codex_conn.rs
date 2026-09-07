@@ -272,50 +272,31 @@ async fn await_codex_catalog(
     Vec::new()
 }
 
-/// Apply `requested` model the ACP way: wait for `model/list` to fill the catalog, then
-///   - if `requested` IS in the catalog → dispatch a `SetModel` (validated apply;
-///     success converges via `thread/settings/updated`);
-///   - if `requested` is NOT in the catalog → DROP it (WARN) and clear the optimistic
-///     open-time `current_model` seed, so a stale frontend default (e.g. `gpt-5.5` the
-///     local codex lacks) never binds and poisons every turn with an opaque
-///     UNKNOWN_UPSTREAM_ERROR. Exact ACP contract (`session/new` carried no model; the
-///     model was applied only after `clear_invalid_desired_model` validated it against
-///     the session/new catalog), adapted to codex's `model/list`-after-`thread/start`
-///     ordering.
+/// Apply `requested` model only after `model/list` has filled the catalog.
+/// This keeps stale assistant defaults from binding an invalid model into the thread.
 async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String) {
     let catalog = await_codex_catalog(backend, |d| d.models.iter().map(|m| m.id.clone()).collect()).await;
 
     if catalog.is_empty() {
-        // Never learned the catalog → cannot validate. Leave codex on its launch
-        // default (the safe choice) rather than bind a possibly-invalid model.
         tracing::warn!(
             requested_model = %requested,
-            "codex model reconcile: model/list never populated; leaving thread on codex default \
-             (requested model NOT applied — cannot validate)"
+            "codex model reconcile: model/list never populated; requested model not applied"
         );
         return;
     }
-
     if !catalog.contains(&requested) {
-        // DROP the invalid desire (ACP `clear_invalid_desired_model`). Clear the
-        // optimistic open-time seed so SetMode can't later build a collaborationMode
-        // around a model codex rejected, and the UI intent doesn't outlive reality.
         tracing::warn!(
             requested_model = %requested,
             catalog = ?catalog,
-            "codex model reconcile: requested model not in catalog; dropping it \
-             (thread stays on codex default)"
+            "codex model reconcile: requested model not in catalog; dropping stale model"
         );
         *backend.current_model.lock().await = None;
         return;
     }
 
-    // Valid → apply via the normal SetModel wire (validated apply). Success converges to
-    // the UI via the `thread/settings/updated` → ConfigChanged notif; a rejection
-    // surfaces as a Notice{Warning} (pending_set path).
     tracing::info!(
         model = %requested,
-        "codex model reconcile: applying requested model (validated against catalog)"
+        "codex model reconcile: applying catalog-valid requested model"
     );
     if let Err(e) = backend.dispatch(Command::SetModel { model: requested }).await {
         tracing::error!(error = %e, "codex model reconcile: SetModel dispatch failed");
@@ -433,7 +414,7 @@ fn initialize_params() -> HandshakeParams {
 /// catalog (`model/list`) is UNKNOWN at this instant — it is fired AFTER thread/start
 /// in `run_handshake` — so we CANNOT validate the model here. Instead we launch on
 /// codex's OWN default model (always valid locally) and apply `config.model` later
-/// via a VALIDATED `SetModel`, dropping it if it is not in the discovered catalog.
+/// via `SetModel` after catalog validation.
 /// This is the faithful port of the ACP path, which likewise launched model-less
 /// (`session/new` carried no model) and applied the model only after
 /// `clear_invalid_desired_model` validated it against the session/new catalog.
@@ -461,7 +442,7 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
         params["cwd"] = json!(cwd);
     }
     // NB: `config.model` is intentionally NOT written here — see the doc comment
-    // above. It is applied post-discovery by `reconcile_codex_model` (validated).
+    // above. It is applied post-discovery by `reconcile_codex_model`.
     if !config.init.mcp_servers.is_empty() {
         params["config"] = json!({ "mcp_servers": build_codex_mcp_servers(&config.init.mcp_servers) });
     }
@@ -748,6 +729,10 @@ pub struct CodexSessionBackend {
     /// updated by `dispatch(SetModel)` + the `thread/settings/updated` notif. None
     /// until known → SetMode rejects (can't build a valid collaborationMode).
     current_model: Arc<Mutex<Option<String>>>,
+    /// Current reasoning effort from Codex `thread/start` / `thread/settings/updated`.
+    /// Unlike explicit AionUi switches, Codex can resolve this from `~/.codex/config.toml`
+    /// before any AionUi `SetConfigOption`, so the value must be tracked by the backend.
+    current_effort: Arc<Mutex<Option<String>>>,
     /// REST-recovery (`GET /confirmations`) source: the currently-open (unanswered)
     /// tool/file/elicitation approval requests, keyed by the SAME request_id the
     /// backend surfaced on `SessionEvent::Permission` (so the recovered card's
@@ -916,6 +901,8 @@ struct CodexReaderState {
     pending_local_commands: Arc<Mutex<HashMap<u64, PendingLocalCommand>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    current_model: Arc<Mutex<Option<String>>>,
+    current_effort: Arc<Mutex<Option<String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
@@ -954,6 +941,8 @@ fn start_codex_reader(
             state.pending_local_commands,
             state.pending_discovery,
             state.pending_set,
+            state.current_model,
+            state.current_effort,
             state.pending_resume,
             state.resume_poison,
             state.pending_fork,
@@ -1121,6 +1110,7 @@ impl CodexSessionBackend {
         let pending_auth_id = Arc::new(Mutex::new(None));
         let pending_tool_approvals = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let current_model = Arc::new(Mutex::new(None));
+        let current_effort = Arc::new(Mutex::new(None));
         let pending_sends = Arc::new(Mutex::new(HashMap::new()));
         let pending_goal_activation = Arc::new(Mutex::new(None));
         let pending_local_commands = Arc::new(Mutex::new(HashMap::new()));
@@ -1154,6 +1144,8 @@ impl CodexSessionBackend {
             pending_local_commands: pending_local_commands.clone(),
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
+            current_model: current_model.clone(),
+            current_effort: current_effort.clone(),
             pending_resume: pending_resume.clone(),
             resume_poison: resume_poison.clone(),
             pending_fork: pending_fork.clone(),
@@ -1211,6 +1203,7 @@ impl CodexSessionBackend {
             pending_auth_id,
             pending_tool_approvals,
             current_model,
+            current_effort,
             pending_sends,
             pending_goal_activation,
             pending_local_commands,
@@ -1466,6 +1459,8 @@ async fn reader_task(
     pending_local_commands: Arc<Mutex<HashMap<u64, PendingLocalCommand>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    current_model: Arc<Mutex<Option<String>>>,
+    current_effort: Arc<Mutex<Option<String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
@@ -1646,6 +1641,9 @@ async fn reader_task(
                         // server notification → SessionEvent(s)
                         let cur = turn_gen.load(Ordering::SeqCst);
                         let params = frame.get("params").unwrap_or(&Value::Null);
+                        if m == "thread/settings/updated" {
+                            capture_runtime_config_from_value(params, &current_model, &current_effort).await;
+                        }
                         if m == "skills/changed" {
                             // The generated protocol documents this notification as
                             // an invalidation signal: refresh with the current cwds.
@@ -1880,6 +1878,9 @@ async fn reader_task(
                                 &session_id,
                             )
                             .await;
+                            if let Some(result) = frame.get("result") {
+                                capture_runtime_config_from_value(result, &current_model, &current_effort).await;
+                            }
                             let error_message = frame.get("error").map(|e| {
                                 e.get("message")
                                     .and_then(Value::as_str)
@@ -1954,7 +1955,14 @@ async fn reader_task(
                                 if let Some(result) = frame.get("result") {
                                     if matches!(command.kind, LocalCommandKind::Skills) {
                                         fill_discovery(DiscoveryKind::Skills, result, &discovered);
-                                        emit_catalog_updated(&event_tx, &session_id, cur, &discovered);
+                                        emit_catalog_updated(
+                                            &event_tx,
+                                            &session_id,
+                                            cur,
+                                            &discovered,
+                                            &current_model,
+                                            &current_effort,
+                                        );
                                     }
                                     emit_local_command_text(
                                         &event_tx,
@@ -2081,6 +2089,8 @@ async fn reader_task(
                                             &session_id,
                                             turn_gen.load(Ordering::SeqCst),
                                             &discovered,
+                                            &current_model,
+                                            &current_effort,
                                         );
                                     }
                                     DiscoveryKind::Checkpoints => {
@@ -2129,6 +2139,9 @@ async fn reader_task(
                             if let Some(label) = pending_set.lock().await.remove(&rid)
                                 && let Some(err) = frame.get("error")
                             {
+                                if label.starts_with("model\u{2192}") {
+                                    *current_model.lock().await = None;
+                                }
                                 let message = err
                                     .get("message")
                                     .and_then(Value::as_str)
@@ -2400,9 +2413,8 @@ mod codex_perm {
 ///   `data` first then fall back to `models`/`modes` so a cross-version rename in
 ///   either direction degrades gracefully rather than silently emptying.
 /// - model item: `{id, displayName, description, supportedReasoningEfforts}` where
-///   `supportedReasoningEfforts` is an array of OBJECTS `{reasoningEffort, description}`
-///   (the old code read bare strings → every object dropped → empty efforts). We
-///   accept both: an object → its `reasoningEffort`, a bare string → itself.
+///   `supportedReasoningEfforts` is an array of OBJECTS `{reasoningEffort, description}`.
+///   Bare-string efforts are retained for compatibility with older Codex wire versions.
 /// - mode item: `{name:"Plan", mode:"plan", model?, reasoning_effort?}`. The id MUST
 ///   be the lowercase `mode` token, because `dispatch(SetMode)` sends
 ///   `collaborationMode.mode` = that token (codex rejects the display `name`); `name`
@@ -2430,18 +2442,27 @@ fn fill_discovery(kind: DiscoveryKind, result: &Value, discovered: &Arc<std::syn
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|m| {
-                            let id = m.get("id").and_then(Value::as_str)?.to_string();
+                            let id = m
+                                .get("id")
+                                .or_else(|| m.get("model"))
+                                .and_then(Value::as_str)?
+                                .to_string();
                             Some(ModelInfo {
-                                id,
-                                name: m.get("displayName").and_then(Value::as_str).unwrap_or("").to_string(),
+                                id: id.clone(),
+                                name: m
+                                    .get("displayName")
+                                    .or_else(|| m.get("name"))
+                                    .or_else(|| m.get("label"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(&id)
+                                    .to_string(),
                                 description: m.get("description").and_then(Value::as_str).map(str::to_string),
                                 reasoning_efforts: m
                                     .get("supportedReasoningEfforts")
                                     .and_then(Value::as_array)
                                     .map(|e| {
                                         e.iter()
-                                            // real wire: object {reasoningEffort, description};
-                                            // legacy/guess: bare string. Accept either.
+                                            // Real wire: object {reasoningEffort}; older wire: bare string.
                                             .filter_map(|v| {
                                                 v.get("reasoningEffort")
                                                     .and_then(Value::as_str)
@@ -2579,6 +2600,8 @@ fn emit_catalog_updated(
     session_id: &str,
     turn_gen: u64,
     discovered: &Arc<std::sync::Mutex<Discovered>>,
+    current_model: &Arc<Mutex<Option<String>>>,
+    current_effort: &Arc<Mutex<Option<String>>>,
 ) {
     let (models, modes, slash_commands) = {
         let disc = discovered.lock().unwrap_or_else(|e| e.into_inner());
@@ -2588,16 +2611,60 @@ fn emit_catalog_updated(
             slash_commands_with_skills(&disc.skills),
         )
     };
+    let current_model = current_model.try_lock().ok().and_then(|g| g.clone());
+    let current_effort = current_effort.try_lock().ok().and_then(|g| g.clone());
     emit(
         event_tx,
         session_id,
         turn_gen,
         SessionEvent::CatalogUpdated {
             models,
+            current_model,
             modes,
+            current_mode: None,
+            current_effort,
             slash_commands,
         },
     );
+}
+
+fn string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter().find_map(|key| value.get(*key).and_then(Value::as_str))
+}
+
+fn settings_object(value: &Value) -> Option<&Value> {
+    value
+        .get("threadSettings")
+        .or_else(|| value.get("thread_settings"))
+        .or_else(|| value.get("settings"))
+}
+
+fn current_model_from_runtime_value(value: &Value) -> Option<String> {
+    string_field(value, &["model"])
+        .or_else(|| settings_object(value).and_then(|settings| string_field(settings, &["model"])))
+        .map(str::to_string)
+}
+
+fn current_effort_from_runtime_value(value: &Value) -> Option<String> {
+    string_field(value, &["reasoningEffort", "reasoning_effort", "effort"])
+        .or_else(|| {
+            settings_object(value)
+                .and_then(|settings| string_field(settings, &["reasoningEffort", "reasoning_effort", "effort"]))
+        })
+        .map(str::to_string)
+}
+
+async fn capture_runtime_config_from_value(
+    value: &Value,
+    current_model: &Arc<Mutex<Option<String>>>,
+    current_effort: &Arc<Mutex<Option<String>>>,
+) {
+    if let Some(model) = current_model_from_runtime_value(value) {
+        *current_model.lock().await = Some(model);
+    }
+    if let Some(effort) = current_effort_from_runtime_value(value) {
+        *current_effort.lock().await = Some(effort);
+    }
 }
 
 /// O2 up-leg: map a `thread/turns/list` response `result` into the
@@ -5130,6 +5197,16 @@ impl SessionBackend for CodexSessionBackend {
         // from model/list + permissionProfile/list responses — the latter mapped to the
         // fixed permission-tier mode enum, feature 012). Read-only sync lock.
         let mut caps = self.capabilities.clone();
+        if let Ok(current_model) = self.current_model.try_lock()
+            && current_model.is_some()
+        {
+            caps.current_model = current_model.clone();
+        }
+        if let Ok(current_effort) = self.current_effort.try_lock()
+            && current_effort.is_some()
+        {
+            caps.current_effort = current_effort.clone();
+        }
         let disc = self.discovered.lock().unwrap_or_else(|e| e.into_inner());
         if !disc.models.is_empty() {
             caps.available_models = disc.models.clone();
@@ -7732,6 +7809,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_start_response_updates_current_effort() {
+        // Codex 0.144.6 returns the config-resolved effort on thread/start:
+        // { ..., model:"gpt-5.5", reasoningEffort:"medium" }. AionUi must retain
+        // it so get_config_options can render "model · effort" without guessing.
+        let bytes = br#"{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"th1"},"model":"gpt-5.5","reasoningEffort":"medium"}}"#
+            .iter()
+            .copied()
+            .chain(std::iter::once(b'\n'))
+            .collect::<Vec<_>>();
+        let fake = FakeAgentIo::never_exits(bytes);
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+
+        for _ in 0..20 {
+            let caps = backend.capabilities();
+            if caps.current_model.as_deref() == Some("gpt-5.5") && caps.current_effort.as_deref() == Some("medium") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let caps = backend.capabilities();
+        assert_eq!(caps.current_model.as_deref(), Some("gpt-5.5"), "{caps:?}");
+        assert_eq!(caps.current_effort.as_deref(), Some("medium"), "{caps:?}");
+    }
+
+    #[tokio::test]
     async fn dispatch_steer_writes_turn_steer_with_expected_turn_id() {
         // R6 Steer → `turn/steer{threadId, expectedTurnId, input}` (soft injection;
         // NoTurn admission — no new turn_gen). The expectedTurnId is the active turn.
@@ -7952,6 +8054,7 @@ mod tests {
         let backend = CodexSessionBackend::build_with_io("codex-set", Box::new(fake)).await;
         // Register the pending id the reader will claim (dispatch does this; here we mimic
         // it so the response — keyed 42 — is recognized as a SetModel reconcile target).
+        *backend.current_model.lock().await = Some("gpt-bogus".into());
         backend.set_pending_set_for_test(42, "model\u{2192}gpt-bogus").await;
         // Subscribe BEFORE the reader consumes the response (broadcast drops pre-subscribe).
         let mut events = backend.events();
@@ -7982,6 +8085,10 @@ mod tests {
         assert!(
             !saw_config_changed,
             "an ERROR response must NOT emit a ConfigChanged (no false convergence)"
+        );
+        assert!(
+            backend.current_model.lock().await.is_none(),
+            "a rejected model update must clear the optimistic current_model seed"
         );
     }
 
@@ -8853,6 +8960,10 @@ mod tests {
             "handshake discovers model/list, got: {written}"
         );
         assert!(
+            written.contains(r#""includeHidden":false"#),
+            "handshake must request the visible model catalog, got: {written}"
+        );
+        assert!(
             written.contains(r#""method":"permissionProfile/list""#),
             "feature 012: handshake discovers permissionProfile/list, got: {written}"
         );
@@ -9622,33 +9733,25 @@ mod tests {
         );
     }
 
-    /// A requested model that is NOT in the catalog (a stale frontend picker default the
-    /// local codex lacks — the exact "新会话首个回复报上游错误" repro) is DROPPED: no
-    /// `thread/settings/update` is written (the thread stays on codex's launch default),
-    /// and the optimistic open-time `current_model` seed is cleared so a later SetMode
-    /// can't build a collaborationMode around a model codex rejected. This is the port of
-    /// ACP's `clear_invalid_desired_model`.
+    /// A requested model that is NOT in the catalog is dropped and the optimistic
+    /// current-model seed is cleared, leaving Codex on its validated default.
     #[tokio::test]
     async fn codex_model_reconcile_drops_invalid_model_and_clears_seed() {
         let (backend, captured) = backend_with_catalog_and_binding().await;
         // Optimistic open-time seed (open_session sets this from config.model).
-        *backend.current_model.lock().await = Some("gpt-5.5-that-local-codex-lacks".into());
+        *backend.current_model.lock().await = Some("gpt-6-rollout".into());
         // Run the reconcile inline (awaited directly — no detached task).
-        reconcile_codex_model(&backend, "gpt-5.5-that-local-codex-lacks".into()).await;
-        assert!(
-            backend.current_model.lock().await.is_none(),
-            "an invalid requested model must clear the optimistic current_model seed"
-        );
+        reconcile_codex_model(&backend, "gpt-6-rollout".into()).await;
         let written = captured_str_allow_empty(&captured).await;
         assert!(
             !written.contains(r#""method":"thread/settings/update""#),
-            "an invalid model must NOT be applied to codex (no thread/settings/update), got: {written}"
+            "an invalid model must not be applied to codex, got: {written}"
         );
+        assert!(backend.current_model.lock().await.is_none());
     }
 
-    /// Drain captured stdin WITHOUT requiring non-empty output (the invalid-model
-    /// reconcile writes NOTHING, so `captured_str`'s "poll until non-empty" would hang
-    /// the full 40 iterations then still assert). Bounded settle, returns whatever is there.
+    /// Drain captured stdin WITHOUT requiring non-empty output. Used by reconcile
+    /// paths that intentionally write nothing.
     async fn captured_str_allow_empty(captured: &Arc<tokio::sync::Mutex<Vec<u8>>>) -> String {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         String::from_utf8_lossy(&captured.lock().await.clone()).to_string()

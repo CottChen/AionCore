@@ -2156,7 +2156,10 @@ fn sniff_control_initialize(
         turn_gen,
         event: SessionEvent::CatalogUpdated {
             models: parsed_models,
+            current_model: None,
             modes: crate::adapter::claude_permission_modes(),
+            current_mode: None,
+            current_effort: None,
             slash_commands: parsed_commands,
         },
     });
@@ -5298,6 +5301,7 @@ mod tests {
                     models,
                     modes,
                     slash_commands,
+                    ..
                 } = env.event
             {
                 catalog = Some((models, modes, slash_commands));
