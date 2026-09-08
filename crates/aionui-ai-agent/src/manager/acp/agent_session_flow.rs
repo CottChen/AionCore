@@ -350,11 +350,34 @@ impl AcpAgentManager {
         // earlier turn cannot override a later benign empty turn.
         self.process.clear_stderr().await;
 
-        let prompt_response = self
+        let pi_session_marker = if self.params.metadata.backend.as_deref() == Some("pi") {
+            AgentSessionInspectionService::new()
+                .pi_latest_assistant_marker(sid)
+                .await
+        } else {
+            None
+        };
+
+        let prompt_response = match self
             .protocol
             .prompt(PromptRequest::new(SessionId::new(sid), prompt_blocks))
             .await
-            .map_err(AcpSendFailure::from)?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if self.params.metadata.backend.as_deref() == Some("pi")
+                    && let Some(detail) = AgentSessionInspectionService::new()
+                        .pi_last_error_since(sid, pi_session_marker.as_deref())
+                        .await
+                {
+                    return Ok(PromptOutcome::TerminalError {
+                        session_id: sid.to_owned(),
+                        error: classify_pi_session_error(&detail),
+                    });
+                }
+                return Err(AcpSendFailure::from(error));
+            }
+        };
 
         // End-of-turn usage: agents that never emit UsageUpdate notifications
         // report token usage on the prompt response instead — either via the
@@ -392,6 +415,17 @@ impl AcpAgentManager {
         // seen earlier in the session lifetime are never attributed here.
         let observations = drain_turn_observations(&mut probe_rx);
         let empty_turn = observations.empty;
+        if empty_turn
+            && self.params.metadata.backend.as_deref() == Some("pi")
+            && let Some(detail) = AgentSessionInspectionService::new()
+                .pi_last_error_since(sid, pi_session_marker.as_deref())
+                .await
+        {
+            return Ok(PromptOutcome::TerminalError {
+                session_id: sid.to_owned(),
+                error: classify_pi_session_error(&detail),
+            });
+        }
         if empty_turn && let Some(error) = self.empty_turn_terminal_error().await {
             return Ok(PromptOutcome::TerminalError {
                 session_id: sid.to_owned(),
@@ -782,6 +816,11 @@ fn empty_finish_diagnostic_tip(stop_reason: StopReason) -> TipsEventData {
 
 fn classify_empty_turn_stderr_error(detail: &str) -> ErrorEventData {
     AgentSendError::from_agent_error(AgentError::bad_gateway(detail.to_owned())).into_stream_error()
+}
+
+fn classify_pi_session_error(detail: &str) -> ErrorEventData {
+    AgentSendError::from_agent_error(AgentError::bad_gateway(format!("Pi provider error: {detail}")))
+        .into_stream_error()
 }
 
 fn empty_finish_tip_code(stop_reason: StopReason) -> &'static str {
@@ -1539,6 +1578,16 @@ mod tests {
         assert_eq!(error.code, Some(AgentErrorCode::UserLlmProviderBillingRequired));
         assert_eq!(error.retryable, Some(false));
         assert_eq!(error.feedback_recommended, Some(false));
+    }
+
+    #[test]
+    fn pi_session_error_is_exposed_as_a_visible_provider_error() {
+        let error = super::classify_pi_session_error("403: model access denied");
+
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("Pi provider error: 403: model access denied")
+        );
     }
 
     #[tokio::test]

@@ -121,6 +121,54 @@ impl AgentSessionInspectionService {
         None
     }
 
+    /// Read the latest Pi assistant provider error for a session.
+    ///
+    /// Pi persists provider failures as assistant messages with
+    /// `stopReason=error` and `errorMessage`, while the ACP adapter may still
+    /// report a successful `end_turn`. Retry briefly because the JSONL write
+    /// can race the ACP response.
+    pub async fn pi_last_error(&self, id: &str) -> Option<String> {
+        self.pi_last_error_since(id, None).await
+    }
+
+    /// Return a marker for the latest assistant message so a caller can
+    /// distinguish a new provider failure from an older one in the same file.
+    pub async fn pi_latest_assistant_marker(&self, id: &str) -> Option<String> {
+        validate_session_id(id).ok()?;
+        let service = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || service.read_pi_last_error(&id))
+            .await
+            .ok()
+            .flatten()
+            .map(|(marker, _)| marker)
+    }
+
+    /// Read the latest Pi provider error only when the latest assistant
+    /// message changed since `previous_marker`.
+    pub async fn pi_last_error_since(&self, id: &str, previous_marker: Option<&str>) -> Option<String> {
+        validate_session_id(id).ok()?;
+        for attempt in 0..PI_USAGE_READ_ATTEMPTS {
+            let service = self.clone();
+            let id = id.to_owned();
+            let previous_marker = previous_marker.map(str::to_owned);
+            let error = tokio::task::spawn_blocking(move || service.read_pi_last_error(&id))
+                .await
+                .ok()
+                .flatten();
+            if let Some((marker, error)) = error
+                && previous_marker.as_deref() != Some(marker.as_str())
+                && error.is_some()
+            {
+                return error;
+            }
+            if attempt + 1 < PI_USAGE_READ_ATTEMPTS {
+                tokio::time::sleep(PI_USAGE_RETRY_DELAY).await;
+            }
+        }
+        None
+    }
+
     fn list_codex(&self, scope: AgentSessionScope, limit: usize) -> Result<Vec<AgentSessionSummary>, AgentError> {
         let Some(db_path) = find_codex_state_db(&self.codex_home)? else {
             return Ok(Vec::new());
@@ -377,6 +425,22 @@ impl AgentSessionInspectionService {
             if let Ok(Some(usage)) = parse_pi_context_usage(&path, &self.pi_agent_dir) {
                 return Some(usage);
             }
+        }
+        None
+    }
+
+    fn read_pi_last_error(&self, id: &str) -> Option<(String, Option<String>)> {
+        let session_dir = self.pi_agent_dir.join("sessions");
+        if !session_dir.is_dir() {
+            return None;
+        }
+        for path in pi_session_files(&session_dir) {
+            let filename_matches = pi_id_from_filename(&path).as_deref() == Some(id);
+            let header_matches = filename_matches || pi_session_file_matches_id(&path, id).unwrap_or(false);
+            if !header_matches {
+                continue;
+            }
+            return parse_pi_last_error(&path).ok().flatten();
         }
         None
     }
@@ -951,6 +1015,39 @@ fn parse_pi_context_usage(path: &Path, pi_agent_dir: &Path) -> Result<Option<Val
             },
         })
     }))
+}
+
+fn parse_pi_last_error(path: &Path) -> Result<Option<(String, Option<String>)>, AgentError> {
+    let file = File::open(path).map_err(|error| io_error("open Pi session", error))?;
+    let mut latest_assistant = None;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| io_error("read Pi session", error))?;
+        let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let message = &entry["message"];
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+
+        // Every assistant message supersedes the previous terminal state. A
+        // later successful response must clear an older provider error.
+        let error = if message.get("stopReason").and_then(Value::as_str) == Some("error") {
+            message
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        latest_assistant = Some((line, error));
+    }
+    Ok(latest_assistant)
 }
 
 fn pi_model_context_window(pi_agent_dir: &Path, provider: Option<&str>, model: Option<&str>) -> u64 {
@@ -1644,5 +1741,74 @@ mod tests {
             }))
         );
         assert_eq!(service.read_pi_context_usage("pi-missing"), None);
+    }
+
+    #[tokio::test]
+    async fn reads_latest_pi_provider_error_and_clears_it_after_success() {
+        let codex = TempDir::new().unwrap();
+        let opencode = TempDir::new().unwrap();
+        let pi = TempDir::new().unwrap();
+        let sessions = pi.path().join("sessions").join("workspace");
+        fs::create_dir_all(&sessions).unwrap();
+        let target = sessions.join("history.jsonl");
+        let mut file = File::create(target).unwrap();
+        writeln!(file, "{}", json!({"type":"session","id":"pi-error"})).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type":"message",
+                "message":{
+                    "role":"assistant",
+                    "content":[],
+                    "stopReason":"error",
+                    "errorMessage":"403: model access denied"
+                }
+            })
+        )
+        .unwrap();
+
+        let service = AgentSessionInspectionService::with_roots(
+            codex.path().to_owned(),
+            opencode.path().to_owned(),
+            pi.path().to_owned(),
+        );
+        assert_eq!(
+            service.pi_last_error("pi-error").await.as_deref(),
+            Some("403: model access denied")
+        );
+        let marker = service.pi_latest_assistant_marker("pi-error").await.unwrap();
+        assert_eq!(service.pi_last_error_since("pi-error", Some(&marker)).await, None);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(sessions.join("history.jsonl"))
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type":"message",
+                "message":{
+                    "role":"assistant",
+                    "content":[{"type":"text","text":"ok"}],
+                    "stopReason":"stop"
+                }
+            })
+        )
+        .unwrap();
+        assert_eq!(service.pi_last_error("pi-error").await, None);
+    }
+
+    #[test]
+    fn ignores_pi_messages_without_a_provider_error() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            &mut file.as_file(),
+            "{}",
+            json!({"type":"message","message":{"role":"assistant","stopReason":"error"}})
+        )
+        .unwrap();
+        assert!(matches!(parse_pi_last_error(file.path()).unwrap(), Some((_, None))));
     }
 }
