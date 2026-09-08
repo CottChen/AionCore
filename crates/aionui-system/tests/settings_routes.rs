@@ -512,6 +512,44 @@ async fn regular_users_can_override_assistant_order_without_changing_other_users
 }
 
 #[tokio::test]
+async fn regular_users_keep_their_last_assistant_selection_isolated() {
+    let (app, db) = setup().await;
+
+    let resp = app
+        .oneshot(json_request_as_regular_user(
+            TEST_USER_ID,
+            "PUT",
+            "/api/settings/client",
+            serde_json::json!({ "guid.lastAssistantId": "assistant-user-choice" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let owner_app = settings_routes(build_state(&db));
+    let owner_resp = owner_app
+        .oneshot(get_request_as_regular_user(
+            TEST_USER_ID,
+            "/api/settings/client?keys=guid.lastAssistantId",
+        ))
+        .await
+        .unwrap();
+    let owner_json = body_json(owner_resp).await;
+    assert_eq!(owner_json["data"]["guid.lastAssistantId"], "assistant-user-choice");
+
+    let other_app = settings_routes(build_state(&db));
+    let other_resp = other_app
+        .oneshot(get_request_as_regular_user(
+            OTHER_USER_ID,
+            "/api/settings/client?keys=guid.lastAssistantId",
+        ))
+        .await
+        .unwrap();
+    let other_json = body_json(other_resp).await;
+    assert_eq!(other_json["data"], serde_json::json!({}));
+}
+
+#[tokio::test]
 async fn get_client_prefs_with_keys_filter() {
     let (app, db) = setup().await;
 
