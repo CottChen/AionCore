@@ -30,9 +30,11 @@ use crate::types::ProjectError;
 async fn setup() -> (Router, String, String, TempDir, Database) {
     let db = init_database_memory().await.unwrap();
     let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
-    let service = Arc::new(ProjectService::new(Arc::clone(&store), std::env::temp_dir()));
-
     let dir = tempfile::tempdir().unwrap();
+    let service = Arc::new(ProjectService::new(
+        Arc::clone(&store),
+        dir.path().join("conversations"),
+    ));
     let created = service
         .create_standard("system_default_user", to_file_uri(dir.path()).unwrap())
         .await
@@ -76,6 +78,31 @@ async fn send(router: &Router, method: &str, uri: &str, body: Option<Value>) -> 
 
 fn folders_url(project_id: &str) -> String {
     format!("/api/projects/{project_id}/folders")
+}
+
+#[tokio::test]
+async fn create_project_returns_a_managed_sibling_directory() {
+    let (router, _project_id, _workspace_pe_id, work_dir, _db) = setup().await;
+
+    let (status, body) = send(&router, "POST", "/api/projects", Some(json!({ "name": "new-project" }))).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"]["path"],
+        work_dir.path().join("projects/new-project").to_string_lossy().as_ref()
+    );
+    assert!(work_dir.path().join("projects/new-project").is_dir());
+}
+
+#[tokio::test]
+async fn create_project_rejects_a_path_instead_of_a_name() {
+    let (router, _project_id, _workspace_pe_id, work_dir, _db) = setup().await;
+
+    let (status, body) = send(&router, "POST", "/api/projects", Some(json!({ "name": "../escape" }))).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_request");
+    assert!(!work_dir.path().parent().unwrap().join("escape").exists());
 }
 
 /// Render the `From<ProjectError> for ApiError` wire mapping to `(status,

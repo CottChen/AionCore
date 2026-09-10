@@ -5,8 +5,9 @@
 
 //! Project Explorer control-plane HTTP routes.
 //!
-//! Read a project's roots (`GET /api/projects/{id}`) and mutate its attached
-//! folders (`POST`/`DELETE .../folders`). Filesystem content is served
+//! Create managed project directories (`POST /api/projects`), read a project's
+//! roots (`GET /api/projects/{id}`), and mutate its attached folders
+//! (`POST`/`DELETE .../folders`). Filesystem content is served
 //! separately over the `fs/*` WebSocket protocol; these routes only expose the
 //! project shell + root list the explorer needs to open subscriptions.
 //!
@@ -19,8 +20,8 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ApiResponse, AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest,
-    ResolveRefResponse,
+    ApiResponse, AttachFolderRequest, CreateProjectRequest, CreateProjectResponse, ProjectDetailResponse, ProjectEntry,
+    ProjectExplorer, ResolveRefRequest, ResolveRefResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -46,11 +47,27 @@ pub struct ProjectRouterState {
 /// All routes require authentication (applied by the caller).
 pub fn project_routes(state: ProjectRouterState) -> Router {
     Router::new()
+        .route("/api/projects", post(create_project))
         .route("/api/projects/{project_id}", get(get_project))
         .route("/api/projects/{project_id}/folders", post(attach_folder))
         .route("/api/projects/{project_id}/folders/{pe_id}", delete(remove_folder))
         .route("/api/projects/{project_id}/resolve-ref", post(resolve_ref))
         .with_state(state)
+}
+
+/// `POST /api/projects` — create a managed project directory alongside the
+/// temporary conversation directory. The path is returned so WebUI can select
+/// it without exposing any filesystem-write primitive to the browser.
+async fn create_project(
+    State(state): State<ProjectRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    body: Result<Json<CreateProjectRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<CreateProjectResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let path = state.project.create_named_project(&req.name)?;
+    Ok(Json(ApiResponse::ok(CreateProjectResponse {
+        path: path.to_string_lossy().into_owned(),
+    })))
 }
 
 /// `GET /api/projects/{project_id}` — full project detail + all roots in one
@@ -220,9 +237,19 @@ impl From<ProjectError> for ApiError {
             | ProjectError::UnsupportedResourceScheme { .. }
             | ProjectError::InvalidRelativePath { .. }
             | ProjectError::ResourceOutsideFolder { .. } => (StatusCode::BAD_REQUEST, "invalid_resource", None),
-            ProjectError::TempDirExists { .. } | ProjectError::WorkspaceMissing => {
+            ProjectError::TempDirExists { .. } | ProjectError::WorkspaceMissing | ProjectError::InvalidProjectName => {
                 (StatusCode::BAD_REQUEST, "invalid_request", None)
             }
+            ProjectError::ProjectDirExists { path } => (
+                StatusCode::CONFLICT,
+                "project_directory_exists",
+                Some(json!({ "path": path })),
+            ),
+            ProjectError::ProjectDirCreateFailed { path } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "project_directory_create_failed",
+                Some(json!({ "path": path })),
+            ),
             ProjectError::UploadPathOutsideRoot { path } => (
                 StatusCode::BAD_REQUEST,
                 "upload_path_outside_root",
