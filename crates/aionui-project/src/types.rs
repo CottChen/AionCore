@@ -140,6 +140,15 @@ pub enum ProjectError {
     #[error("temp directory already exists: {path}")]
     TempDirExists { path: String },
 
+    #[error("invalid project name")]
+    InvalidProjectName,
+
+    #[error("project directory already exists: {path}")]
+    ProjectDirExists { path: String },
+
+    #[error("failed to create project directory: {path}")]
+    ProjectDirCreateFailed { path: String },
+
     #[error("workspace path missing, cannot backfill")]
     WorkspaceMissing,
 
@@ -195,6 +204,9 @@ impl ProjectError {
             ProjectError::FolderPermissionDenied { .. } => "folder_permission_denied",
             ProjectError::FolderCanonicalizeFailed { .. } => "folder_canonicalize_failed",
             ProjectError::TempDirExists { .. } => "temp_dir_exists",
+            ProjectError::InvalidProjectName => "invalid_project_name",
+            ProjectError::ProjectDirExists { .. } => "project_directory_exists",
+            ProjectError::ProjectDirCreateFailed { .. } => "project_directory_create_failed",
             ProjectError::WorkspaceMissing => "workspace_missing",
             ProjectError::WorkspaceFolderMismatch { .. } => "workspace_folder_mismatch",
             ProjectError::StandardProjectConflict { .. } => "standard_project_conflict",

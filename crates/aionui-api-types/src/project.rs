@@ -6,9 +6,10 @@
 //! carried separately over the `fs/*` WebSocket protocol, keyed by `pe_id` —
 //! these DTOs only describe the project shell and its root list.
 //!
-//! Deliberately excludes absolute paths / canonical URIs: the frontend
-//! identifies resources purely by `{pe_id, relative_path}`. `display_path`
-//! is a human-facing, read-only rendering of the folder location.
+//! Explorer resource identity deliberately excludes canonical URIs: the
+//! frontend identifies resources by `{pe_id, relative_path}`. `display_path`
+//! and the managed-project creation response expose human-facing paths for
+//! explicit selection and clipboard actions.
 
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,20 @@ pub struct ProjectDetailResponse {
     /// Project display name (explorer header).
     pub name: String,
     pub explorer: ProjectExplorer,
+}
+
+/// `POST /api/projects` response for a newly created managed project folder.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateProjectResponse {
+    /// Absolute path selected by the caller as its current workspace.
+    pub path: String,
+}
+
+/// `POST /api/projects` body. The server creates the folder beneath its
+/// managed projects directory; callers never submit an absolute path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateProjectRequest {
+    pub name: String,
 }
 
 /// The explorer view of a project: its pinned workspace root plus every

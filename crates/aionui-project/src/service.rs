@@ -92,6 +92,36 @@ impl ProjectService {
             .await
     }
 
+    /// Create a user-named managed project directory alongside the temporary
+    /// conversation directory. The returned path is intended for immediate
+    /// selection by the WebUI; project binding is created lazily when the
+    /// conversation is started, just like a user-picked existing directory.
+    pub fn create_named_project(&self, name: &str) -> Result<PathBuf, ProjectError> {
+        let name = name.trim();
+        if !is_valid_project_name(name) {
+            return Err(ProjectError::InvalidProjectName);
+        }
+
+        let root = self
+            .temp_root
+            .parent()
+            .unwrap_or(self.temp_root.as_path())
+            .join("projects");
+        std::fs::create_dir_all(&root).map_err(|_| ProjectError::ProjectDirCreateFailed {
+            path: root.to_string_lossy().into_owned(),
+        })?;
+        let dir = root.join(name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(ProjectError::ProjectDirExists {
+                path: dir.to_string_lossy().into_owned(),
+            }),
+            Err(_) => Err(ProjectError::ProjectDirCreateFailed {
+                path: dir.to_string_lossy().into_owned(),
+            }),
+        }
+    }
+
     /// Lazy backfill of an existing path. Does not create directories; `kind`
     /// is decided here (under `temp_root` ⇒ temp, otherwise standard).
     pub async fn resolve_existing(&self, user_id: &str, uri: String) -> Result<ResolveOutput, ProjectError> {
@@ -480,6 +510,47 @@ fn leaf_of(dir: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Project names are a single portable path segment. In particular, reject
+/// separators, traversal segments, control characters, and Windows-reserved
+/// filename characters even when running on Unix so a project can be moved.
+fn is_valid_project_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default();
+    let reserved = matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    );
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.ends_with('.')
+        && name.len() <= 120
+        && !reserved
+        && !name
+            .chars()
+            .any(|ch| ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+}
+
 /// Compute a folder's runtime availability by stat (never persisted).
 fn runtime_status_of(folder: &FolderRow) -> (RuntimeStatus, Option<String>) {
     let Ok(canonical) = canonical::canonicalize(&folder.resource_canonical) else {
@@ -496,5 +567,33 @@ fn runtime_status_of(folder: &FolderRow) -> (RuntimeStatus, Option<String>) {
             std::io::ErrorKind::PermissionDenied => (RuntimeStatus::PermissionDenied, None),
             _ => (RuntimeStatus::Missing, Some(err.to_string())),
         },
+    }
+}
+
+#[cfg(test)]
+mod project_name_tests {
+    use super::is_valid_project_name;
+
+    #[test]
+    fn accepts_normal_unicode_name() {
+        assert!(is_valid_project_name("知识库 MVP"));
+    }
+
+    #[test]
+    fn rejects_path_like_or_non_portable_names() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a\0b",
+            "a:name",
+            "con",
+            "NUL.txt",
+            "trailing.",
+        ] {
+            assert!(!is_valid_project_name(name), "accepted {name:?}");
+        }
     }
 }
