@@ -78,6 +78,24 @@ async fn create_temp_auto_uuid_yields_distinct_projects() {
 }
 
 #[tokio::test]
+async fn create_named_project_uses_projects_directory_beside_conversations() {
+    let work_root = tempfile::tempdir().unwrap();
+    let temp_root = work_root.path().join("conversations");
+    let (svc, _store, _db) = harness(temp_root).await;
+
+    let created = svc.create_named_project("知识库 MVP").unwrap();
+    assert_eq!(created, work_root.path().join("projects/知识库 MVP"));
+    assert!(created.is_dir());
+
+    let duplicate = svc.create_named_project("知识库 MVP").unwrap_err();
+    assert_eq!(duplicate.code(), "project_directory_exists");
+    assert_eq!(
+        svc.create_named_project("../escape").unwrap_err().code(),
+        "invalid_project_name"
+    );
+}
+
+#[tokio::test]
 async fn resolve_existing_classifies_temp_vs_standard_by_temp_root() {
     let temp_root = tempfile::tempdir().unwrap();
     let (svc, _store, _db) = harness(temp_root.path().to_path_buf()).await;
