@@ -59,6 +59,16 @@ pub struct FileMetadata {
     pub is_directory: bool,
 }
 
+/// A bounded UTF-8 chunk used by the renderer for file previews.
+#[derive(Debug, Clone)]
+pub struct FilePreview {
+    pub content: String,
+    pub offset: u64,
+    pub next_offset: Option<u64>,
+    pub total_bytes: u64,
+    pub truncated: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------

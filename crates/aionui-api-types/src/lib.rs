@@ -109,10 +109,11 @@ pub use file::{
     ContentMetadataRequest, CopyFilesRequest, CopyFilesResponse, CreateDirectoryRequest, CreateDirectoryResponse,
     CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse,
     FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest,
-    ReadContentRequest, ReadFileBufferRequest, ReadFileRequest, RemoveEntryRequest, RenameRequest, RenameResponse,
-    SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotMode,
-    SnapshotStageRequest, SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest,
-    WriteContentRequest, WriteFileRequest, ZipFileEntry, ZipRequest,
+    ReadContentRequest, ReadFileBufferRequest, ReadFilePreviewRequest, ReadFilePreviewResponse, ReadFileRequest,
+    RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest, SnapshotCompareResponse,
+    SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest,
+    WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteContentRequest, WriteFileRequest, ZipFileEntry,
+    ZipRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

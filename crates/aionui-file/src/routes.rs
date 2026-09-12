@@ -15,10 +15,10 @@ use aionui_api_types::{
     ContentMetadataRequest, CopyFilesRequest, CopyFilesResponse, CreateDirectoryRequest, CreateDirectoryResponse,
     CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse,
     FileWatchRequest, GetFileMetadataRequest, GetFilesByDirRequest, GetImageBase64Request, ListWorkspaceFilesRequest,
-    ReadContentRequest, ReadFileBufferRequest, ReadFileRequest, RemoveEntryRequest, RenameRequest, RenameResponse,
-    SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse,
-    SnapshotStageRequest, SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest,
-    WriteContentRequest, WriteFileRequest, ZipRequest,
+    ReadContentRequest, ReadFileBufferRequest, ReadFilePreviewRequest, ReadFilePreviewResponse, ReadFileRequest,
+    RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest, SnapshotCompareResponse,
+    SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest, SnapshotWorkspaceRequest,
+    WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteContentRequest, WriteFileRequest, ZipRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -162,6 +162,7 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/list", post(list_workspace_files))
         .route("/api/fs/metadata", post(get_file_metadata))
         .route("/api/fs/read", post(read_file))
+        .route("/api/fs/read-preview", post(read_file_preview))
         .route("/api/fs/content", post(read_content).put(write_content))
         .route("/api/fs/content/metadata", post(content_metadata))
         .route("/api/fs/read-buffer", post(read_file_buffer))
@@ -295,6 +296,33 @@ async fn read_file(
         .read_file(&req.path, req.workspace.as_deref().map(Path::new))
         .await?;
     Ok(Json(ApiResponse::ok(content)))
+}
+
+async fn read_file_preview(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<ReadFilePreviewRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<Option<ReadFilePreviewResponse>>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let workspace = req.workspace.as_deref().unwrap_or_default();
+    require_workspace_access(&state, &user, workspace).await?;
+    let preview = state
+        .file_service
+        .read_file_preview(
+            &req.path,
+            req.workspace.as_deref().map(Path::new),
+            req.offset,
+            req.max_bytes.unwrap_or(4 * 1024 * 1024),
+        )
+        .await?;
+    let response = preview.map(|value| ReadFilePreviewResponse {
+        content: value.content,
+        offset: value.offset,
+        next_offset: value.next_offset,
+        total_bytes: value.total_bytes,
+        truncated: value.truncated,
+    });
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 async fn read_content(

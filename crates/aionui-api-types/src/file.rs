@@ -63,6 +63,28 @@ pub struct ReadFileRequest {
     pub workspace: Option<String>,
 }
 
+/// Request body for `POST /api/fs/read-preview`.
+#[derive(Debug, Deserialize)]
+pub struct ReadFilePreviewRequest {
+    pub path: String,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+/// A bounded UTF-8 preview chunk.
+#[derive(Debug, Serialize)]
+pub struct ReadFilePreviewResponse {
+    pub content: String,
+    pub offset: u64,
+    pub next_offset: Option<u64>,
+    pub total_bytes: u64,
+    pub truncated: bool,
+}
+
 /// Request body for `POST /api/fs/read-buffer` — read file as binary.
 #[derive(Debug, Deserialize)]
 pub struct ReadFileBufferRequest {

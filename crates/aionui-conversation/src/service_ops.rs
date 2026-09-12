@@ -7,7 +7,9 @@
 //! Kept in a separate file from service.rs to avoid pushing that file
 //! over 2000 lines.
 
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
@@ -16,7 +18,10 @@ use aionui_api_types::{
     WorkspaceSearchMatchKind, WorkspaceSearchMode, WorkspaceSearchResponse,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tracing::warn;
 
 use crate::ConversationError;
@@ -26,21 +31,121 @@ const MAX_DIR_DEPTH: usize = 10;
 const MAX_WORKSPACE_SEARCH_RESULTS: usize = 200;
 const MAX_WORKSPACE_SEARCH_SCANNED: usize = 5000;
 const MAX_WORKSPACE_SEARCH_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_WORKSPACE_SEARCH_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const WORKSPACE_SEARCH_CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_CONCURRENT_WORKSPACE_SEARCHES: usize = 2;
 
-fn workspace_content_match_count(path: &Path, needle: &str) -> usize {
+static WORKSPACE_SEARCH_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkspaceSearchCursor {
+    index: usize,
+    query: String,
+    path: String,
+    mode: WorkspaceSearchMode,
+    respect_gitignore: bool,
+}
+
+fn encode_workspace_search_cursor(cursor: WorkspaceSearchCursor) -> String {
+    let json = serde_json::to_vec(&cursor).expect("workspace search cursor is serializable");
+    URL_SAFE_NO_PAD.encode(json)
+}
+
+fn decode_workspace_search_cursor(value: &str) -> Result<WorkspaceSearchCursor, ConversationError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| ConversationError::BadRequest {
+            reason: "cursor is invalid".into(),
+        })?;
+    serde_json::from_slice(&bytes).map_err(|_| ConversationError::BadRequest {
+        reason: "cursor is invalid".into(),
+    })
+}
+
+fn workspace_content_match_count(path: &Path, needle: &str) -> Option<usize> {
     if needle.is_empty() {
-        return 0;
+        return Some(0);
     }
     let Ok(metadata) = std::fs::metadata(path) else {
-        return 0;
+        return Some(0);
     };
     if metadata.len() > MAX_WORKSPACE_SEARCH_FILE_BYTES {
-        return 0;
+        return Some(0);
     }
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return 0;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Some(0);
     };
-    content.to_lowercase().match_indices(needle).count()
+    let needle_chars = needle.chars().count();
+    let mut raw = Vec::with_capacity(WORKSPACE_SEARCH_CHUNK_BYTES + 4);
+    let mut buffer = vec![0u8; WORKSPACE_SEARCH_CHUNK_BYTES];
+    let mut overlap = String::new();
+    let mut matches = 0usize;
+
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(read) => read,
+            Err(_) => return Some(0),
+        };
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buffer[..read]);
+
+        let valid_len = match std::str::from_utf8(&raw) {
+            Ok(text) => {
+                let count = count_workspace_chunk_matches(text, needle, &overlap);
+                matches = matches.saturating_add(count);
+                overlap = take_workspace_overlap(&text.to_lowercase(), needle_chars);
+                raw.len()
+            }
+            Err(error) if error.error_len().is_none() => {
+                let valid_len = error.valid_up_to();
+                if valid_len > 0 {
+                    let text = std::str::from_utf8(&raw[..valid_len]).expect("valid UTF-8 prefix");
+                    let count = count_workspace_chunk_matches(text, needle, &overlap);
+                    matches = matches.saturating_add(count);
+                    overlap = take_workspace_overlap(&text.to_lowercase(), needle_chars);
+                }
+                valid_len
+            }
+            Err(_) => return None,
+        };
+        if valid_len > 0 {
+            raw.drain(..valid_len);
+        }
+    }
+
+    if !raw.is_empty() {
+        let text = std::str::from_utf8(&raw).ok()?;
+        matches = matches.saturating_add(count_workspace_chunk_matches(text, needle, &overlap));
+    }
+    Some(matches)
+}
+
+fn take_workspace_overlap(lowercase: &str, needle_chars: usize) -> String {
+    lowercase
+        .chars()
+        .rev()
+        .take(needle_chars.saturating_sub(1))
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
+
+fn count_workspace_chunk_matches(text: &str, needle: &str, overlap: &str) -> usize {
+    let lowercase = text.to_lowercase();
+    let overlap_bytes = overlap.len();
+    let combined = if overlap.is_empty() {
+        lowercase
+    } else {
+        format!("{overlap}{lowercase}")
+    };
+    combined
+        .match_indices(needle)
+        .filter(|(start, matched)| start.saturating_add(matched.len()) > overlap_bytes)
+        .count()
 }
 
 fn workspace_search_entry(
@@ -74,7 +179,9 @@ fn search_workspace_entries_sync(
     let needle = search.to_lowercase();
     let mut entries = Vec::new();
     let mut scanned = 0usize;
+    let mut scanned_bytes = 0u64;
     let mut absolute_index = 0usize;
+    let mut budget_exhausted = false;
     let mut walker_builder = WalkBuilder::new(&search_root);
     walker_builder
         .hidden(false)
@@ -96,9 +203,6 @@ fn search_workspace_entries_sync(
         if scanned >= MAX_WORKSPACE_SEARCH_SCANNED || entries.len() >= MAX_WORKSPACE_SEARCH_RESULTS {
             break;
         }
-        absolute_index += 1;
-        scanned += 1;
-
         let Some(file_type) = entry.file_type() else { continue };
         let is_dir = file_type.is_dir();
         let is_file = file_type.is_file();
@@ -107,11 +211,22 @@ fn search_workspace_entries_sync(
             && relative
                 .map(|value| value.to_string_lossy().to_lowercase().contains(&needle))
                 .unwrap_or(false);
-        let content_match_count = if !matches!(search_mode, WorkspaceSearchMode::Name) && is_file {
-            workspace_content_match_count(path, &needle)
+        let content_match_count = if !matches!(search_mode, WorkspaceSearchMode::Name) && is_file && !name_matches {
+            let file_size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            if file_size > MAX_WORKSPACE_SEARCH_FILE_BYTES {
+                0
+            } else if scanned_bytes.saturating_add(file_size) > MAX_WORKSPACE_SEARCH_TOTAL_BYTES {
+                budget_exhausted = true;
+                break;
+            } else {
+                scanned_bytes = scanned_bytes.saturating_add(file_size);
+                workspace_content_match_count(path, &needle).unwrap_or(0)
+            }
         } else {
             0
         };
+        absolute_index += 1;
+        scanned += 1;
         let content_matches = content_match_count > 0;
         let Some(match_kind) = (if name_matches {
             Some(WorkspaceSearchMatchKind::Name)
@@ -127,10 +242,19 @@ fn search_workspace_entries_sync(
         }
     }
 
-    let truncated = scanned >= MAX_WORKSPACE_SEARCH_SCANNED || entries.len() >= MAX_WORKSPACE_SEARCH_RESULTS;
+    let truncated =
+        budget_exhausted || scanned >= MAX_WORKSPACE_SEARCH_SCANNED || entries.len() >= MAX_WORKSPACE_SEARCH_RESULTS;
     WorkspaceSearchResponse {
         entries,
-        next_cursor: truncated.then(|| (cursor + scanned).to_string()),
+        next_cursor: truncated.then(|| {
+            encode_workspace_search_cursor(WorkspaceSearchCursor {
+                index: cursor + scanned,
+                query: search,
+                path: search_root.to_string_lossy().into_owned(),
+                mode: search_mode,
+                respect_gitignore,
+            })
+        }),
         scanned,
         truncated,
     }
@@ -468,21 +592,34 @@ impl ConversationService {
             });
         }
 
-        let cursor =
-            query
-                .cursor
-                .as_deref()
-                .unwrap_or("0")
-                .parse::<usize>()
-                .map_err(|_| ConversationError::BadRequest {
-                    reason: "cursor is invalid".into(),
-                })?;
         let search_mode = query.search_mode.unwrap_or(WorkspaceSearchMode::All);
         let respect_gitignore = query.respect_gitignore.unwrap_or(is_project_root);
+        let cursor = if let Some(value) = query.cursor.as_deref() {
+            let cursor = decode_workspace_search_cursor(value)?;
+            if cursor.query != search
+                || cursor.path != canonical_root.to_string_lossy()
+                || cursor.mode != search_mode
+                || cursor.respect_gitignore != respect_gitignore
+            {
+                return Err(ConversationError::BadRequest {
+                    reason: "cursor does not match this search".into(),
+                });
+            }
+            cursor.index
+        } else {
+            0
+        };
         let base_owned = canonical_base.clone();
         let root_owned = canonical_root;
         let search_owned = search.to_owned();
+        let permit = WORKSPACE_SEARCH_LIMITER
+            .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_WORKSPACE_SEARCHES)))
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ConversationError::internal("Workspace search limiter closed"))?;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             search_workspace_entries_sync(
                 base_owned,
                 root_owned,
@@ -526,7 +663,9 @@ mod tests {
             "needle".to_owned(),
             WorkspaceSearchMode::Content,
             false,
-            next_cursor.parse().expect("numeric cursor"),
+            decode_workspace_search_cursor(&next_cursor)
+                .expect("opaque cursor")
+                .index,
         );
         assert_eq!(second.entries.len(), 10);
         assert!(!second.truncated);

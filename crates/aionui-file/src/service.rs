@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +15,8 @@ use aionui_realtime::EventBroadcaster;
 
 use crate::path_safety::{has_traversal, validate_path_for_write, validate_path_with_extra_root};
 use crate::types::{
-    ContentUpdateEvent, ContentUpdateOperation, CopyResult, DirOrFile, FileMetadata, WorkspaceFlatFile, ZipEntry,
+    ContentUpdateEvent, ContentUpdateOperation, CopyResult, DirOrFile, FileMetadata, FilePreview, WorkspaceFlatFile,
+    ZipEntry,
 };
 
 /// Maximum number of files returned by `list_workspace_files`.
@@ -23,6 +24,9 @@ const MAX_WORKSPACE_FILES: usize = 20_000;
 
 /// Maximum file size for read operations (256 MB).
 const MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Maximum bytes returned by a single preview request.
+const MAX_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Maximum remote image size (5 MB).
 const MAX_REMOTE_IMAGE_SIZE: usize = 5 * 1024 * 1024;
@@ -310,6 +314,52 @@ fn read_file_sync(path: &Path) -> Result<Option<String>, FileError> {
         .map_err(|e| FileError::Internal(format!("cannot read file '{}': {e}", path.display())))?;
 
     Ok(Some(content))
+}
+
+/// Read a bounded UTF-8 preview chunk without loading the complete file.
+fn read_file_preview_sync(path: &Path, offset: u64, requested_bytes: u64) -> Result<Option<FilePreview>, FileError> {
+    if validate_file_for_read(path)?.is_none() {
+        return Ok(None);
+    }
+
+    let total_bytes = std::fs::metadata(path)
+        .map_err(|e| FileError::Internal(format!("cannot read metadata for '{}': {e}", path.display())))?
+        .len();
+    if offset > total_bytes {
+        return Err(FileError::BadRequest(format!(
+            "preview offset {} exceeds file size {}",
+            offset, total_bytes
+        )));
+    }
+
+    let max_bytes = requested_bytes.clamp(1, MAX_PREVIEW_BYTES);
+    let available = total_bytes.saturating_sub(offset);
+    let read_bytes = available.min(max_bytes.saturating_add(4));
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| FileError::Internal(format!("cannot open file '{}': {e}", path.display())))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| FileError::Internal(format!("cannot seek file '{}': {e}", path.display())))?;
+    let mut bytes = Vec::with_capacity(read_bytes as usize);
+    file.take(read_bytes)
+        .read_to_end(&mut bytes)
+        .map_err(|e| FileError::Internal(format!("cannot read preview '{}': {e}", path.display())))?;
+
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|e| FileError::BadRequest(format!("file '{}' is not valid UTF-8 text: {e}", path.display())))?;
+    let mut content_bytes = max_bytes.min(bytes.len() as u64) as usize;
+    while content_bytes > 0 && !text.is_char_boundary(content_bytes) {
+        content_bytes -= 1;
+    }
+    let next_offset = offset + content_bytes as u64;
+    let truncated = next_offset < total_bytes;
+
+    Ok(Some(FilePreview {
+        content: text[..content_bytes].to_owned(),
+        offset,
+        next_offset: truncated.then_some(next_offset),
+        total_bytes,
+        truncated,
+    }))
 }
 
 /// Read a file as raw bytes. Returns `None` if the file does not exist.
@@ -785,6 +835,41 @@ impl crate::traits::IFileService for FileService {
         tokio::task::spawn_blocking(move || read_file_sync(&canonical))
             .await
             .map_err(|e| FileError::Internal(format!("read file task failed: {e}")))?
+    }
+
+    async fn read_file_preview(
+        &self,
+        path: &str,
+        extra_root: Option<&Path>,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<Option<FilePreview>, FileError> {
+        if has_traversal(path) {
+            return Err(FileError::BadRequest(format!(
+                "path '{}' contains invalid traversal patterns",
+                path
+            )));
+        }
+
+        let roots = self.allowed_roots_refs();
+        let canonical = match validate_path_with_extra_root(path, &roots, extra_root) {
+            Ok(c) => c,
+            Err(err) => {
+                if matches!(err, FileError::BadRequest(_))
+                    && validate_path_for_write(path, &self.allowed_roots_with_extra(extra_root)).is_ok()
+                {
+                    return Ok(None);
+                }
+                if matches!(err, FileError::BadRequest(_)) && self.path_uses_allowed_root(Path::new(path), extra_root) {
+                    return Ok(None);
+                }
+                return Err(err);
+            }
+        };
+
+        tokio::task::spawn_blocking(move || read_file_preview_sync(&canonical, offset, max_bytes))
+            .await
+            .map_err(|e| FileError::Internal(format!("read preview task failed: {e}")))?
     }
 
     async fn read_file_buffer(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<Vec<u8>>, FileError> {
@@ -1468,6 +1553,26 @@ mod tests {
 
         let result = read_file_sync(&file).unwrap();
         assert_eq!(result.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn read_file_preview_sync_is_bounded_and_supports_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("large.txt");
+        fs::write(&file, "a".repeat((MAX_PREVIEW_BYTES + 32) as usize)).unwrap();
+
+        let first = read_file_preview_sync(&file, 0, MAX_PREVIEW_BYTES).unwrap().unwrap();
+        assert_eq!(first.content.len(), MAX_PREVIEW_BYTES as usize);
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.next_offset, Some(MAX_PREVIEW_BYTES));
+        assert!(first.truncated);
+
+        let second = read_file_preview_sync(&file, first.next_offset.unwrap(), MAX_PREVIEW_BYTES)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.content.len(), 32);
+        assert_eq!(second.next_offset, None);
+        assert!(!second.truncated);
     }
 
     #[test]

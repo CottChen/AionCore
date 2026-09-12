@@ -5,7 +5,9 @@ use aionui_common::FileChangeOperation;
 
 use crate::error::FileError;
 
-use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotInfo, WorkspaceFlatFile, ZipEntry};
+use crate::types::{
+    CompareResult, CopyResult, DirOrFile, FileMetadata, FilePreview, SnapshotInfo, WorkspaceFlatFile, ZipEntry,
+};
 use aionui_api_types::ChatFileRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +93,15 @@ pub trait IFileService: Send + Sync {
     /// Read a file as UTF-8 text. Returns `None` if the file does not exist.
     /// Files larger than 256 MB are rejected.
     async fn read_file(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<String>, FileError>;
+
+    /// Read a bounded UTF-8 preview chunk without loading the whole file.
+    async fn read_file_preview(
+        &self,
+        path: &str,
+        extra_root: Option<&Path>,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<Option<FilePreview>, FileError>;
 
     /// Read a file as raw bytes. Returns `None` if the file does not exist.
     /// Files larger than 256 MB are rejected.
