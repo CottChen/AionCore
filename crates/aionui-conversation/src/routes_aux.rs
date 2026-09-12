@@ -3,7 +3,7 @@
 use crate::state::ConversationRouterState;
 use aionui_api_types::{
     ApiResponse, SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse,
-    SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry, WorkspaceSearchResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -24,6 +24,7 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
             put(set_config_option),
         )
         .route("/api/conversations/{id}/workspace", get(browse_workspace))
+        .route("/api/conversations/{id}/workspace/search", get(search_workspace))
         .with_state(state)
 }
 
@@ -90,6 +91,21 @@ async fn browse_workspace(
         state
             .service
             .browse_workspace(&id, query)
+            .await
+            .map_err(ApiError::from)?,
+    )))
+}
+
+async fn search_workspace(
+    State(state): State<ConversationRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<WorkspaceBrowseQuery>,
+) -> Result<Json<ApiResponse<WorkspaceSearchResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .search_workspace(&id, query)
             .await
             .map_err(ApiError::from)?,
     )))

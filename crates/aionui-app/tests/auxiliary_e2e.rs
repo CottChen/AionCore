@@ -183,6 +183,43 @@ async fn workspace_browse_treats_symlinked_skill_dir_as_directory() {
     );
 }
 
+#[tokio::test]
+async fn workspace_search_respects_gitignore_only_for_project_scope() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("ignored")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("visible")).unwrap();
+    std::fs::write(tmp.path().join(".gitignore"), "ignored/\n").unwrap();
+    std::fs::write(tmp.path().join("ignored/needle.txt"), "needle").unwrap();
+    std::fs::write(tmp.path().join("visible/needle.txt"), "needle").unwrap();
+
+    let workspace = tmp.path().to_string_lossy().into_owned();
+    let conv_id = create_conversation_with_workspace(&mut app, &token, &csrf, "Search Conv", "acp", &workspace).await;
+
+    let root_req = get_with_token(
+        &format!("/api/conversations/{conv_id}/workspace/search?path=&search=needle&search_mode=content"),
+        &token,
+    );
+    let root_resp = app.clone().oneshot(root_req).await.unwrap();
+    assert_eq!(root_resp.status(), StatusCode::OK);
+    let root_json = body_json(root_resp).await;
+    let root_entries = root_json["data"]["entries"].as_array().unwrap();
+    assert!(root_entries.iter().any(|entry| entry["name"] == "visible/needle.txt"));
+    assert!(!root_entries.iter().any(|entry| entry["name"] == "ignored/needle.txt"));
+
+    let folder_req = get_with_token(
+        &format!("/api/conversations/{conv_id}/workspace/search?path=/ignored&search=needle&search_mode=content"),
+        &token,
+    );
+    let folder_resp = app.oneshot(folder_req).await.unwrap();
+    assert_eq!(folder_resp.status(), StatusCode::OK);
+    let folder_json = body_json(folder_resp).await;
+    let folder_entries = folder_json["data"]["entries"].as_array().unwrap();
+    assert!(folder_entries.iter().any(|entry| entry["name"] == "ignored/needle.txt"));
+}
+
 // ── 9.2 Side question ───────────────────────────────────────────
 
 #[tokio::test]

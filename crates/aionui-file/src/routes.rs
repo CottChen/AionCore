@@ -18,6 +18,7 @@ use aionui_api_types::{
     ReadFileRequest, RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest,
     SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest,
     SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteContentRequest,
+    CreateDirectoryRequest, CreateDirectoryResponse, CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest,
     WriteFileRequest, ZipRequest,
 };
 use aionui_auth::CurrentUser;
@@ -169,6 +170,7 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/copy", post(copy_files))
         .route("/api/fs/remove", post(remove_entry))
         .route("/api/fs/rename", post(rename_entry))
+        .route("/api/fs/create-directory", post(create_directory))
         .route("/api/fs/image-base64", post(get_image_base64))
         .route("/api/fs/fetch-remote-image", post(fetch_remote_image))
         .with_state(state)
@@ -501,6 +503,42 @@ async fn create_temp_file(
     let Json(req) = body.map_err(ApiError::from)?;
     let path = state.file_service.create_temp_file(&req.file_name).await?;
     Ok(Json(ApiResponse::ok(path)))
+}
+
+async fn create_directory(
+    State(state): State<FileRouterState>,
+    body: Result<Json<CreateDirectoryRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<CreateDirectoryResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    if req.parent_path.trim().is_empty() {
+        return Err(ApiError::BadRequest("parent_path must not be empty".to_owned()));
+    }
+    let name = req.name.trim();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(ApiError::BadRequest("invalid directory name".to_owned()));
+    }
+    let roots = state.browse_roots.get();
+    let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+    let target = Path::new(req.parent_path.trim()).join(name);
+    let validated = crate::path_safety::validate_path_for_write(&target.to_string_lossy(), &root_refs)?;
+    let created = tokio::task::spawn_blocking(move || {
+        std::fs::create_dir(&validated)
+            .map_err(|error| FileError::BadRequest(format!("cannot create directory: {error}")))?;
+        validated
+            .canonicalize()
+            .map_err(|error| FileError::Internal(format!("cannot resolve created directory: {error}")))
+    })
+    .await
+    .map_err(|error| ApiError::Internal(format!("create directory task failed: {error}")))??;
+    Ok(Json(ApiResponse::ok(CreateDirectoryResponse {
+        path: created.to_string_lossy().into_owned(),
+    })))
 }
 
 /// Fields extracted from a `/api/fs/upload` multipart request.

@@ -37,7 +37,8 @@ pub use acp::{
     DetectCliRequest, DetectCliResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry,
     ModelInfoPayload, ProbeModelRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
     SetModelRequest, SideQuestionRequest, SideQuestionResponse, TryConnectCustomAgentRequest,
-    TryConnectCustomAgentResponse, WorkspaceBrowseQuery, WorkspaceEntry,
+    TryConnectCustomAgentResponse, WorkspaceBrowseQuery, WorkspaceEntry, WorkspaceSearchMatchKind, WorkspaceSearchMode,
+    WorkspaceSearchResponse,
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
@@ -111,7 +112,8 @@ pub use file::{
     ReadFileRequest, RemoveEntryRequest, RenameRequest, RenameResponse, SnapshotBaselineRequest,
     SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest,
     SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteContentRequest,
-    WriteFileRequest, ZipFileEntry, ZipRequest,
+    CreateDirectoryRequest, CreateDirectoryResponse, CreateTempFileRequest, DirOrFileResponse, FetchRemoteImageRequest,
+    SnapshotMode, WriteFileRequest, ZipFileEntry, ZipRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

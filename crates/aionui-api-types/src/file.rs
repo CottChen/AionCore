@@ -118,6 +118,19 @@ pub struct CreateTempFileRequest {
     pub file_name: String,
 }
 
+/// Request body for `POST /api/fs/create-directory`.
+#[derive(Debug, Deserialize)]
+pub struct CreateDirectoryRequest {
+    pub parent_path: String,
+    pub name: String,
+}
+
+/// Response for a newly-created directory.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateDirectoryResponse {
+    pub path: String,
+}
+
 /// Request body for `POST /api/fs/image-base64` — get image as base64.
 #[derive(Debug, Deserialize)]
 pub struct GetImageBase64Request {

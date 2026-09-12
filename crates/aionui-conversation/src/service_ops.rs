@@ -7,20 +7,134 @@
 //! Kept in a separate file from service.rs to avoid pushing that file
 //! over 2000 lines.
 
-use std::path::Component;
+use std::path::{Component, Path, PathBuf};
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
     ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse,
     SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    WorkspaceSearchMatchKind, WorkspaceSearchMode, WorkspaceSearchResponse,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
+use ignore::WalkBuilder;
 use tracing::warn;
 
 use crate::ConversationError;
 use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 
 const MAX_DIR_DEPTH: usize = 10;
+const MAX_WORKSPACE_SEARCH_RESULTS: usize = 200;
+const MAX_WORKSPACE_SEARCH_SCANNED: usize = 5000;
+const MAX_WORKSPACE_SEARCH_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+fn workspace_content_match_count(path: &Path, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if metadata.len() > MAX_WORKSPACE_SEARCH_FILE_BYTES {
+        return 0;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    content.to_lowercase().match_indices(needle).count()
+}
+
+fn workspace_search_entry(
+    base: &Path,
+    path: &Path,
+    is_dir: bool,
+    match_kind: WorkspaceSearchMatchKind,
+    content_match_count: usize,
+) -> Option<WorkspaceEntry> {
+    let relative = path.strip_prefix(base).ok()?;
+    let name = relative.to_string_lossy().replace('\\', "/");
+    if name.is_empty() {
+        return None;
+    }
+    Some(WorkspaceEntry {
+        name,
+        entry_type: if is_dir { "directory" } else { "file" }.into(),
+        match_kind: Some(match_kind),
+        content_match_count: (content_match_count > 0).then_some(content_match_count),
+    })
+}
+
+fn search_workspace_entries_sync(
+    base: PathBuf,
+    search_root: PathBuf,
+    search: String,
+    search_mode: WorkspaceSearchMode,
+    respect_gitignore: bool,
+    cursor: usize,
+) -> WorkspaceSearchResponse {
+    let needle = search.to_lowercase();
+    let mut entries = Vec::new();
+    let mut scanned = 0usize;
+    let mut absolute_index = 0usize;
+    let mut walker_builder = WalkBuilder::new(&search_root);
+    walker_builder
+        .hidden(false)
+        .git_ignore(respect_gitignore)
+        .git_global(respect_gitignore)
+        .git_exclude(respect_gitignore)
+        .require_git(false);
+
+    for result in walker_builder.build() {
+        let Ok(entry) = result else { continue };
+        let path = entry.path();
+        if path == search_root {
+            continue;
+        }
+        if absolute_index < cursor {
+            absolute_index += 1;
+            continue;
+        }
+        if scanned >= MAX_WORKSPACE_SEARCH_SCANNED || entries.len() >= MAX_WORKSPACE_SEARCH_RESULTS {
+            break;
+        }
+        absolute_index += 1;
+        scanned += 1;
+
+        let Some(file_type) = entry.file_type() else { continue };
+        let is_dir = file_type.is_dir();
+        let is_file = file_type.is_file();
+        let relative = path.strip_prefix(&base).ok();
+        let name_matches = !matches!(search_mode, WorkspaceSearchMode::Content)
+            && relative
+                .map(|value| value.to_string_lossy().to_lowercase().contains(&needle))
+                .unwrap_or(false);
+        let content_match_count = if !matches!(search_mode, WorkspaceSearchMode::Name) && is_file {
+            workspace_content_match_count(path, &needle)
+        } else {
+            0
+        };
+        let content_matches = content_match_count > 0;
+        let Some(match_kind) = (if name_matches {
+            Some(WorkspaceSearchMatchKind::Name)
+        } else if content_matches {
+            Some(WorkspaceSearchMatchKind::Content)
+        } else {
+            None
+        }) else {
+            continue;
+        };
+        if let Some(search_entry) = workspace_search_entry(&base, path, is_dir, match_kind, content_match_count) {
+            entries.push(search_entry);
+        }
+    }
+
+    let truncated = scanned >= MAX_WORKSPACE_SEARCH_SCANNED || entries.len() >= MAX_WORKSPACE_SEARCH_RESULTS;
+    WorkspaceSearchResponse {
+        entries,
+        next_cursor: truncated.then(|| (cursor + scanned).to_string()),
+        scanned,
+        truncated,
+    }
+}
 
 impl ConversationService {
     // ── Config Options ──────────────────────────────────────────────
@@ -267,6 +381,8 @@ impl ConversationService {
             entries.push(WorkspaceEntry {
                 name,
                 entry_type: entry_type.into(),
+                match_kind: None,
+                content_match_count: None,
             });
         }
 
@@ -281,5 +397,161 @@ impl ConversationService {
         });
 
         Ok(entries)
+    }
+
+    /// Search a workspace recursively with bounded scanning and opaque cursor
+    /// continuation. A root search follows gitignore; an explicitly selected
+    /// subdirectory does not, so users can inspect ignored files on demand.
+    pub async fn search_workspace(
+        &self,
+        conversation_id: &str,
+        query: WorkspaceBrowseQuery,
+    ) -> Result<WorkspaceSearchResponse, ConversationError> {
+        let search = query
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ConversationError::BadRequest {
+                reason: "search must not be empty".into(),
+            })?;
+
+        let row = self
+            .conversation_repo()
+            .get(conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let extra: serde_json::Value = serde_json::from_str(&row.extra)
+            .map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))?;
+        let workspace = extra
+            .get("workspace")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if workspace.is_empty() {
+            return Err(ConversationError::BadRequest {
+                reason: "Conversation has no workspace assigned".into(),
+            });
+        }
+
+        let relative_path = query.path.trim_start_matches('/');
+        let is_project_root = relative_path.is_empty() || relative_path == ".";
+        let relative_path_obj = Path::new(relative_path);
+        if relative_path_obj
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(ConversationError::BadRequest {
+                reason: "Path traversal outside workspace is not allowed".into(),
+            });
+        }
+
+        let base = Path::new(&workspace);
+        let search_root = if is_project_root {
+            base.to_path_buf()
+        } else {
+            base.join(relative_path_obj)
+        };
+        let canonical_base = base
+            .canonicalize()
+            .map_err(|e| ConversationError::internal(format!("Failed to resolve workspace path: {e}")))?;
+        let canonical_root = search_root
+            .canonicalize()
+            .map_err(|_| ConversationError::not_found_reason("Directory not found"))?;
+        if !search_root.starts_with(base) && !canonical_root.starts_with(&canonical_base) {
+            return Err(ConversationError::BadRequest {
+                reason: "Path traversal outside workspace is not allowed".into(),
+            });
+        }
+
+        let cursor =
+            query
+                .cursor
+                .as_deref()
+                .unwrap_or("0")
+                .parse::<usize>()
+                .map_err(|_| ConversationError::BadRequest {
+                    reason: "cursor is invalid".into(),
+                })?;
+        let search_mode = query.search_mode.unwrap_or(WorkspaceSearchMode::All);
+        let respect_gitignore = query.respect_gitignore.unwrap_or(is_project_root);
+        let base_owned = canonical_base.clone();
+        let root_owned = canonical_root;
+        let search_owned = search.to_owned();
+        tokio::task::spawn_blocking(move || {
+            search_workspace_entries_sync(
+                base_owned,
+                root_owned,
+                search_owned,
+                search_mode,
+                respect_gitignore,
+                cursor,
+            )
+        })
+        .await
+        .map_err(|error| ConversationError::internal(format!("Workspace search task failed: {error}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_search_cursor_continues_after_result_limit() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        for index in 0..210 {
+            std::fs::write(temp.path().join(format!("match-{index:03}.txt")), "needle").expect("write fixture");
+        }
+
+        let first = search_workspace_entries_sync(
+            temp.path().to_path_buf(),
+            temp.path().to_path_buf(),
+            "needle".to_owned(),
+            WorkspaceSearchMode::Content,
+            false,
+            0,
+        );
+        assert_eq!(first.entries.len(), MAX_WORKSPACE_SEARCH_RESULTS);
+        assert!(first.truncated);
+        let next_cursor = first.next_cursor.expect("continuation cursor");
+
+        let second = search_workspace_entries_sync(
+            temp.path().to_path_buf(),
+            temp.path().to_path_buf(),
+            "needle".to_owned(),
+            WorkspaceSearchMode::Content,
+            false,
+            next_cursor.parse().expect("numeric cursor"),
+        );
+        assert_eq!(second.entries.len(), 10);
+        assert!(!second.truncated);
+
+        let first_names: std::collections::HashSet<_> = first.entries.iter().map(|entry| &entry.name).collect();
+        assert!(second.entries.iter().all(|entry| !first_names.contains(&entry.name)));
+    }
+
+    #[test]
+    fn workspace_search_reads_large_text_files() {
+        let temp = tempfile::tempdir().expect("temporary workspace");
+        let file = temp.path().join("large.txt");
+        let mut content = "x".repeat(600 * 1024);
+        content.push_str(" needle");
+        std::fs::write(&file, content).expect("write fixture");
+
+        let response = search_workspace_entries_sync(
+            temp.path().to_path_buf(),
+            temp.path().to_path_buf(),
+            "needle".to_owned(),
+            WorkspaceSearchMode::Content,
+            false,
+            0,
+        );
+        assert_eq!(response.entries[0].name, "large.txt");
+        assert_eq!(response.entries[0].content_match_count, Some(1));
     }
 }
