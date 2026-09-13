@@ -546,6 +546,7 @@ async fn t9_1_keyword_match() {
 
     let query = SearchMessagesQuery {
         keyword: "review".into(),
+        cursor: None,
         page: None,
         page_size: None,
     };
@@ -573,6 +574,7 @@ async fn t9_2_no_match() {
 
     let query = SearchMessagesQuery {
         keyword: "xxxxnotexist".into(),
+        cursor: None,
         page: None,
         page_size: None,
     };
@@ -594,6 +596,7 @@ async fn t9_3_search_pagination() {
 
     let query = SearchMessagesQuery {
         keyword: "keyword".into(),
+        cursor: None,
         page: Some(1),
         page_size: Some(2),
     };
@@ -609,6 +612,7 @@ async fn t9_4_empty_keyword() {
 
     let query = SearchMessagesQuery {
         keyword: "".into(),
+        cursor: None,
         page: None,
         page_size: None,
     };
@@ -636,6 +640,7 @@ async fn t9_5_preview_text_extracts_from_json_content() {
 
     let query = SearchMessagesQuery {
         keyword: "search".into(),
+        cursor: None,
         page: None,
         page_size: None,
     };
@@ -670,6 +675,7 @@ async fn t9_6_search_result_includes_conversation_model() {
 
     let query = SearchMessagesQuery {
         keyword: "model test".into(),
+        cursor: None,
         page: None,
         page_size: None,
     };
@@ -693,6 +699,7 @@ async fn t9_7_search_does_not_leak_other_users_messages() {
 
     let query = SearchMessagesQuery {
         keyword: "secret".into(),
+        cursor: None,
         page: None,
         page_size: None,
     };
@@ -774,6 +781,7 @@ async fn t12_4_search_sql_injection() {
 
     let query = SearchMessagesQuery {
         keyword: "'; DROP TABLE messages; --".into(),
+        cursor: None,
         page: None,
         page_size: None,
     };

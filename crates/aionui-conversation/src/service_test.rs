@@ -2449,6 +2449,7 @@ async fn search_messages_empty_keyword_returns_bad_request() {
 
     let query = SearchMessagesQuery {
         keyword: "".into(),
+        cursor: None,
         page: None,
         page_size: None,
     };
@@ -2462,6 +2463,7 @@ async fn search_messages_whitespace_keyword_returns_bad_request() {
 
     let query = SearchMessagesQuery {
         keyword: "   ".into(),
+        cursor: None,
         page: None,
         page_size: None,
     };

@@ -144,6 +144,18 @@ pub trait IConversationRepository: Send + Sync {
         page_size: u32,
     ) -> Result<PaginatedResult<MessageSearchRow>, DbError>;
 
+    /// Searches messages newest-first using a stable cursor, avoiding COUNT/OFFSET for deep pages.
+    async fn search_messages_cursor(
+        &self,
+        user_id: &str,
+        keyword: &str,
+        cursor: Option<&MessagePageCursor>,
+        page_size: u32,
+    ) -> Result<PaginatedResult<MessageSearchRow>, DbError> {
+        let _ = cursor;
+        self.search_messages(user_id, keyword, 1, page_size).await
+    }
+
     /// Returns persisted conversation artifacts ordered by `created_at`.
     async fn list_artifacts(&self, _conversation_id: &str) -> Result<Vec<ConversationArtifactRow>, DbError> {
         Ok(Vec::new())

@@ -224,6 +224,8 @@ pub struct UpdateConversationArtifactRequest {
 #[derive(Debug, Deserialize)]
 pub struct SearchMessagesQuery {
     pub keyword: String,
+    /// Opaque cursor returned by the previous page. Results are ordered newest first.
+    pub cursor: Option<String>,
     pub page: Option<u32>,
     pub page_size: Option<u32>,
 }
@@ -355,8 +357,15 @@ pub struct MessageSearchItem {
     pub conversation: ConversationResponse,
 }
 
-/// Paginated search results for messages.
-pub type MessageSearchResponse = PaginatedResult<MessageSearchItem>;
+/// Cursor-paginated search results for messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSearchResponse {
+    pub items: Vec<MessageSearchItem>,
+    pub total: u64,
+    pub has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
 
 #[cfg(test)]
 mod tests {
@@ -899,6 +908,7 @@ mod tests {
             }],
             total: 1,
             has_more: false,
+            next_cursor: None,
         };
         let json = serde_json::to_value(&list).unwrap();
         assert_eq!(json["items"].as_array().unwrap().len(), 1);
@@ -943,7 +953,7 @@ mod tests {
 
     #[test]
     fn message_search_response_serialization() {
-        let resp: MessageSearchResponse = PaginatedResult {
+        let resp: MessageSearchResponse = MessageSearchResponse {
             items: vec![MessageSearchItem {
                 message_id: "m1".into(),
                 message_type: "text".into(),
@@ -968,6 +978,7 @@ mod tests {
             }],
             total: 1,
             has_more: false,
+            next_cursor: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["items"][0]["message_id"], "m1");

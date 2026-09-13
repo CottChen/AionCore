@@ -860,6 +860,83 @@ impl IConversationRepository for SqliteConversationRepository {
         })
     }
 
+    async fn search_messages_cursor(
+        &self,
+        user_id: &str,
+        keyword: &str,
+        cursor: Option<&MessagePageCursor>,
+        page_size: u32,
+    ) -> Result<PaginatedResult<MessageSearchRow>, DbError> {
+        let effective_size = if page_size == 0 { 20 } else { page_size };
+        let fetch_limit = effective_size + 1;
+        let keyword = keyword.trim();
+        let use_fts = keyword.chars().count() >= 3;
+        let search_value = if use_fts {
+            fts_phrase(keyword)
+        } else {
+            escaped_like_pattern(keyword)
+        };
+        let cursor_clause = if cursor.is_some() {
+            " AND (m.created_at < ? OR (m.created_at = ? AND m.id < ?))"
+        } else {
+            ""
+        };
+        let select_sql = if use_fts {
+            format!(
+                "SELECT \
+                    m.id AS message_id, m.type, m.content, m.created_at, \
+                    c.id AS conversation_id, c.name AS conversation_name, c.type AS conversation_type, \
+                    c.extra AS conversation_extra, c.model AS conversation_model, c.status AS conversation_status, \
+                    c.source AS conversation_source, c.channel_chat_id AS conversation_channel_chat_id, \
+                    c.pinned AS conversation_pinned, c.pinned_at AS conversation_pinned_at, \
+                    c.created_at AS conversation_created_at, c.updated_at AS conversation_updated_at \
+                 FROM message_text_search mts \
+                 INNER JOIN messages m ON m.rowid = mts.rowid \
+                 INNER JOIN conversations c ON m.conversation_id = c.id \
+                 WHERE c.user_id = ? AND message_text_search MATCH ?{} \
+                 ORDER BY m.created_at DESC, m.id DESC \
+                 LIMIT ?",
+                cursor_clause
+            )
+        } else {
+            format!(
+                "SELECT \
+                    m.id AS message_id, m.type, m.content, m.created_at, \
+                    c.id AS conversation_id, c.name AS conversation_name, c.type AS conversation_type, \
+                    c.extra AS conversation_extra, c.model AS conversation_model, c.status AS conversation_status, \
+                    c.source AS conversation_source, c.channel_chat_id AS conversation_channel_chat_id, \
+                    c.pinned AS conversation_pinned, c.pinned_at AS conversation_pinned_at, \
+                    c.created_at AS conversation_created_at, c.updated_at AS conversation_updated_at \
+                 FROM message_text_search mts \
+                 INNER JOIN messages m ON m.rowid = mts.rowid \
+                 INNER JOIN conversations c ON m.conversation_id = c.id \
+                 WHERE c.user_id = ? AND mts.content LIKE ? ESCAPE '\\\\'{} \
+                 ORDER BY m.created_at DESC, m.id DESC \
+                 LIMIT ?",
+                cursor_clause
+            )
+        };
+
+        let mut query = sqlx::query_as::<_, MessageSearchRow>(&select_sql)
+            .bind(user_id)
+            .bind(&search_value);
+        if let Some(cursor) = cursor {
+            query = query.bind(cursor.created_at).bind(cursor.created_at).bind(&cursor.id);
+        }
+        let mut rows = query.bind(fetch_limit).fetch_all(&self.pool).await?;
+        let has_more = rows.len() as u32 > effective_size;
+        if has_more {
+            rows.truncate(effective_size as usize);
+        }
+
+        Ok(PaginatedResult {
+            items: rows,
+            // Cursor pagination intentionally avoids the expensive full COUNT query.
+            total: 0,
+            has_more,
+        })
+    }
+
     async fn list_artifacts(&self, conversation_id: &str) -> Result<Vec<ConversationArtifactRow>, DbError> {
         let rows = sqlx::query_as::<_, ConversationArtifactRow>(
             "SELECT * FROM conversation_artifacts \
@@ -1854,6 +1931,40 @@ mod tests {
         assert_eq!(result.items.len(), 2);
         assert_eq!(result.total, 5);
         assert!(result.has_more);
+    }
+
+    #[tokio::test]
+    async fn search_messages_cursor_returns_older_results_without_offset() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        for i in 0..5 {
+            let mut msg = sample_message(&conv.id);
+            msg.id = aionui_common::generate_prefixed_id("msg");
+            msg.content = format!(r#"{{"content":"cursor keyword item {i}"}}"#);
+            msg.created_at = (i + 1) * 1000;
+            repo.insert_message(&msg).await.unwrap();
+        }
+
+        let first = repo
+            .search_messages_cursor(SYSTEM_USER_ID, "keyword", None, 2)
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 2);
+        assert!(first.has_more);
+
+        let cursor = MessagePageCursor {
+            created_at: first.items[1].created_at,
+            id: first.items[1].message_id.clone(),
+        };
+        let second = repo
+            .search_messages_cursor(SYSTEM_USER_ID, "keyword", Some(&cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(second.items.len(), 2);
+        assert!(second.items.iter().all(|item| item.created_at < cursor.created_at));
+        assert!(second.has_more);
     }
 
     #[tokio::test]

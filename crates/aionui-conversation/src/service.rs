@@ -10,7 +10,9 @@ use aionui_ai_agent::{
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 
-use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
+use crate::message_cursor::{
+    decode_message_cursor, decode_search_message_cursor, encode_message_cursor, encode_search_message_cursor,
+};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::runtime_state::ConversationRuntimeStateService;
@@ -2752,16 +2754,36 @@ impl ConversationService {
         let page_size = query.page_size.unwrap_or(20);
 
         let started = Instant::now();
-        let result = self
-            .conversation_repo
-            .search_messages(user_id, &query.keyword, page, page_size)
-            .await?;
+        let (result, cursor_mode) = if let Some(raw_cursor) = query.cursor.as_deref() {
+            let cursor = decode_search_message_cursor(raw_cursor, &query.keyword, user_id)?;
+            (
+                self.conversation_repo
+                    .search_messages_cursor(user_id, &query.keyword, Some(&cursor), page_size)
+                    .await?,
+                true,
+            )
+        } else if query.page.is_some() {
+            (
+                self.conversation_repo
+                    .search_messages(user_id, &query.keyword, page, page_size)
+                    .await?,
+                false,
+            )
+        } else {
+            (
+                self.conversation_repo
+                    .search_messages_cursor(user_id, &query.keyword, None, page_size)
+                    .await?,
+                true,
+            )
+        };
 
         let elapsed = started.elapsed();
         if elapsed >= Duration::from_millis(500) {
             warn!(
                 page,
                 page_size,
+                cursor_mode,
                 matches = result.total,
                 elapsed_ms = elapsed.as_millis(),
                 "Slow conversation message search"
@@ -2770,11 +2792,31 @@ impl ConversationService {
             debug!(
                 page,
                 page_size,
+                cursor_mode,
                 matches = result.total,
                 elapsed_ms = elapsed.as_millis(),
                 "Searched conversation messages"
             );
         }
+
+        let next_cursor = if cursor_mode && result.has_more {
+            result
+                .items
+                .last()
+                .map(|row| {
+                    encode_search_message_cursor(
+                        &aionui_db::MessagePageCursor {
+                            created_at: row.created_at,
+                            id: row.message_id.clone(),
+                        },
+                        &query.keyword,
+                        user_id,
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
 
         let items = result
             .items
@@ -2782,10 +2824,11 @@ impl ConversationService {
             .map(|row| search_row_to_item(row, &self.workspace_root))
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(PaginatedResult {
+        Ok(MessageSearchResponse {
             items,
             total: result.total,
             has_more: result.has_more,
+            next_cursor,
         })
     }
 }
