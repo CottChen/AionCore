@@ -1781,6 +1781,7 @@ impl ConversationService {
         // must not take down the whole listing. Skip-and-log is the
         // explicit resilience contract from the Gemini→ACP migration spec.
         let mut items = Vec::with_capacity(result.items.len());
+        let auto_inject = self.skill_resolver.auto_inject_names().await;
         for row in result.items {
             let row_id = row.id.clone();
             let mut extra: serde_json::Value = match serde_json::from_str(&row.extra) {
@@ -1794,7 +1795,8 @@ impl ConversationService {
                     continue;
                 }
             };
-            self.backfill_extra_inplace(&row_id, &mut extra).await;
+            self.backfill_extra_inplace_with_skills(&row_id, &mut extra, &auto_inject)
+                .await;
             match row_to_response_with_extra(row, extra, &self.workspace_root) {
                 Ok(mut resp) => {
                     if let Err(err) = self.attach_assistant_identity(&mut resp).await {
@@ -1843,18 +1845,17 @@ impl ConversationService {
 
         let existing_type: AgentType = string_to_enum(&existing.r#type)?;
 
-        // Snapshot invariant: once written at create time, `extra.skills`
-        // must not be re-shaped by PATCH. The frontend must clone the
-        // conversation to produce a new snapshot.
+        // MCP definitions, status results, and session-only servers remain
+        // immutable after creation. The selected persistent server IDs are
+        // allowed to change in the in-chat picker and are canonicalized from
+        // the MCP repository below before the runtime is rebuilt.
         if let Some(incoming) = &req.extra
-            && (incoming.get("skills").is_some()
-                || incoming.get("mcp_server_ids").is_some()
-                || incoming.get("mcp_servers").is_some()
+            && (incoming.get("mcp_servers").is_some()
                 || incoming.get("mcp_statuses").is_some()
                 || incoming.get("session_mcp_servers").is_some())
         {
             return Err(ConversationError::BadRequest {
-                reason: "extra.skills and MCP snapshots are immutable post-creation".into(),
+                reason: "Only mcp_server_ids may be changed after creation; MCP status snapshots are read-only".into(),
             });
         }
 
@@ -1886,9 +1887,26 @@ impl ConversationService {
 
         let now = now_ms();
 
+        if let Some(skills) = req.extra.as_ref().and_then(|extra| extra.get("skills")) {
+            let Some(items) = skills.as_array() else {
+                return Err(ConversationError::BadRequest {
+                    reason: "extra.skills must be an array of skill names".into(),
+                });
+            };
+            if items.iter().any(|item| {
+                let Some(name) = item.as_str() else { return true };
+                let name = name.trim();
+                name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..")
+            }) {
+                return Err(ConversationError::BadRequest {
+                    reason: "extra.skills contains an invalid skill name".into(),
+                });
+            }
+        }
+
         // Merge extra if provided. For aionrs, strip `extra.model` post-merge
         // so the row keeps a single canonical model source (top-level column).
-        let merged_extra = if let Some(new_extra) = &req.extra {
+        let mut merged_extra = if let Some(new_extra) = &req.extra {
             let mut existing_extra: serde_json::Value =
                 serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
             merge_json(&mut existing_extra, new_extra);
@@ -1908,6 +1926,185 @@ impl ConversationService {
         } else {
             None
         };
+
+        let mcp_ids_changed = req
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("mcp_server_ids"))
+            .is_some();
+        if mcp_ids_changed {
+            let existing_ids: HashSet<String> = serde_json::from_str::<serde_json::Value>(&existing.extra)
+                .ok()
+                .and_then(|extra| extra.get("mcp_server_ids").cloned())
+                .and_then(|value| value.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect();
+            let requested_ids: HashSet<String> = req
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("mcp_server_ids"))
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if existing_ids.iter().any(|server_id| !requested_ids.contains(server_id)) {
+                return Err(ConversationError::BadRequest {
+                    reason: "Removing existing conversation MCP servers is not supported".into(),
+                });
+            }
+        }
+        if mcp_ids_changed {
+            let Some(extra_json) = merged_extra.as_mut() else {
+                return Err(ConversationError::BadRequest {
+                    reason: "mcp_server_ids requires an extra object".into(),
+                });
+            };
+            let mut extra_value = serde_json::from_str::<serde_json::Value>(extra_json)
+                .map_err(|e| ConversationError::internal(format!("Failed to parse merged extra: {e}")))?;
+            let ids = extra_value
+                .get("mcp_server_ids")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| ConversationError::BadRequest {
+                    reason: "extra.mcp_server_ids must be an array of server IDs".into(),
+                })?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(ToOwned::to_owned)
+                        .ok_or_else(|| ConversationError::BadRequest {
+                            reason: "extra.mcp_server_ids must contain only non-empty strings".into(),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let support = self.resolve_mcp_support_policy(&existing_type, &extra_value).await?;
+            let repo = self
+                .mcp_server_repo
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned())
+                .ok_or_else(|| ConversationError::internal("MCP server repository is unavailable"))?;
+            let rows = repo
+                .list_by_ids_any(&ids)
+                .await
+                .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?;
+            let selected_rows = rows
+                .into_iter()
+                .filter(|row| !row.builtin && ids.iter().any(|id| id == &row.id))
+                .collect::<Vec<_>>();
+            let mut names = Vec::with_capacity(selected_rows.len());
+            let mut statuses = Vec::with_capacity(selected_rows.len());
+            for row in &selected_rows {
+                names.push(row.name.clone());
+                statuses.push(classify_repo_mcp_status(row, support));
+            }
+            let session_servers = extra_value
+                .get("session_mcp_servers")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Vec<SessionMcpServer>>(value).ok())
+                .unwrap_or_default();
+            for server in &session_servers {
+                if !names.iter().any(|name| name == &server.name) {
+                    names.push(server.name.clone());
+                    statuses.push(classify_session_mcp_status(server, support));
+                }
+            }
+            let Some(obj) = extra_value.as_object_mut() else {
+                return Err(ConversationError::BadRequest {
+                    reason: "conversation extra must be an object".into(),
+                });
+            };
+            obj.insert(
+                "mcp_server_ids".to_owned(),
+                serde_json::Value::Array(
+                    selected_rows
+                        .iter()
+                        .map(|row| serde_json::Value::String(row.id.clone()))
+                        .collect(),
+                ),
+            );
+            obj.insert(
+                "mcp_servers".to_owned(),
+                serde_json::Value::Array(names.into_iter().map(serde_json::Value::String).collect()),
+            );
+            obj.insert(
+                "mcp_statuses".to_owned(),
+                serde_json::to_value(statuses).map_err(|e| {
+                    ConversationError::internal(format!("Failed to serialize MCP status snapshot: {e}"))
+                })?,
+            );
+            *extra_json = serde_json::to_string(&extra_value)
+                .map_err(|e| ConversationError::internal(format!("Failed to serialize merged extra: {e}")))?;
+        }
+
+        let existing_extra_value = serde_json::from_str::<serde_json::Value>(&existing.extra).unwrap_or_default();
+        let merged_extra_value = merged_extra
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .unwrap_or_default();
+        if let (Some(existing_skills), Some(next_skills)) = (
+            existing_extra_value.get("skills").and_then(serde_json::Value::as_array),
+            merged_extra_value.get("skills").and_then(serde_json::Value::as_array),
+        ) {
+            let next_names: HashSet<&str> = next_skills.iter().filter_map(serde_json::Value::as_str).collect();
+            if existing_skills
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|name| !next_names.contains(name))
+            {
+                return Err(ConversationError::BadRequest {
+                    reason: "Removing existing conversation skills is not supported".into(),
+                });
+            }
+        }
+        if let (Some(existing_ids), Some(next_ids)) = (
+            existing_extra_value
+                .get("mcp_server_ids")
+                .and_then(serde_json::Value::as_array),
+            merged_extra_value
+                .get("mcp_server_ids")
+                .and_then(serde_json::Value::as_array),
+        ) {
+            let next_ids: HashSet<&str> = next_ids.iter().filter_map(serde_json::Value::as_str).collect();
+            if existing_ids
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|server_id| !next_ids.contains(server_id))
+            {
+                return Err(ConversationError::BadRequest {
+                    reason: "Removing existing conversation MCP servers is not supported".into(),
+                });
+            }
+        }
+
+        let skills_changed = merged_extra.as_ref().is_some_and(|merged| {
+            let existing_skills = serde_json::from_str::<serde_json::Value>(&existing.extra)
+                .ok()
+                .and_then(|extra| extra.get("skills").cloned());
+            let merged_skills = serde_json::from_str::<serde_json::Value>(merged)
+                .ok()
+                .and_then(|extra| extra.get("skills").cloned());
+            merged_skills.is_some() && merged_skills != existing_skills
+        });
+        let mcp_changed = mcp_ids_changed
+            && merged_extra.as_ref().is_some_and(|merged| {
+                serde_json::from_str::<serde_json::Value>(&existing.extra)
+                    .ok()
+                    .and_then(|extra| extra.get("mcp_server_ids").cloned())
+                    != serde_json::from_str::<serde_json::Value>(merged)
+                        .ok()
+                        .and_then(|extra| extra.get("mcp_server_ids").cloned())
+            });
 
         // Handle pinned_at: set timestamp on pin, clear on unpin
         let pinned_at = req.pinned.map(|p| if p { Some(now) } else { None });
@@ -1966,6 +2163,20 @@ impl ConversationService {
             );
             if let Err(e) = task_manager.kill(id, None) {
                 warn!(error = %ErrorChain(&e), "Failed to kill agent after model change");
+            }
+        }
+
+        if skills_changed {
+            info!("Conversation skills updated, killing agent task so the next turn reloads the skill snapshot");
+            if let Err(e) = task_manager.kill(id, None) {
+                warn!(error = %ErrorChain(&e), "Failed to kill agent after skill update");
+            }
+        }
+
+        if mcp_changed {
+            info!("Conversation MCP servers updated, killing agent task so the next turn reloads the MCP snapshot");
+            if let Err(e) = task_manager.kill(id, None) {
+                warn!(error = %ErrorChain(&e), "Failed to kill agent after MCP update");
             }
         }
 
@@ -3556,7 +3767,17 @@ impl ConversationService {
     /// failure.
     async fn backfill_extra_inplace(&self, conversation_id: &str, extra: &mut serde_json::Value) {
         let auto_inject = self.skill_resolver.auto_inject_names().await;
-        let mut mutated = backfill_skills_if_missing(extra, &auto_inject);
+        self.backfill_extra_inplace_with_skills(conversation_id, extra, &auto_inject)
+            .await;
+    }
+
+    async fn backfill_extra_inplace_with_skills(
+        &self,
+        conversation_id: &str,
+        extra: &mut serde_json::Value,
+        auto_inject: &[String],
+    ) {
+        let mut mutated = backfill_skills_if_missing(extra, auto_inject);
         mutated |= backfill_cron_job_id_alias(extra);
         if !mutated {
             return;

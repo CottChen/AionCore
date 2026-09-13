@@ -7193,7 +7193,7 @@ async fn warmup_restores_skill_links_for_custom_workspace() {
 }
 
 #[tokio::test]
-async fn update_rejects_extra_skills() {
+async fn update_allows_extra_skills() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let workspace = ensure_test_workspace_path();
 
@@ -7208,11 +7208,70 @@ async fn update_rejects_extra_skills() {
         "extra": { "skills": ["cron"] },
     }))
     .unwrap();
-    let err = svc.update("u", &resp.id, update_req, &task_mgr).await.unwrap_err();
+    let updated = svc.update("u", &resp.id, update_req, &task_mgr).await.unwrap();
 
-    match err {
-        ConversationError::BadRequest { reason: msg } => assert!(msg.contains("skills"), "msg = {msg:?}"),
-        other => panic!("expected BadRequest, got {other:?}"),
+    assert_eq!(updated.extra["skills"], json!(["cron"]));
+
+    let remove_req: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "skills": [] },
+    }))
+    .unwrap();
+    let err = svc.update("u", &resp.id, remove_req, &task_mgr).await.unwrap_err();
+    assert!(matches!(err, ConversationError::BadRequest { reason } if reason.contains("Removing")));
+}
+
+#[tokio::test]
+async fn update_rejects_invalid_extra_skills() {
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("u", req).await.unwrap();
+
+    for skills in [
+        json!("cron"),
+        json!(["../secret"]),
+        json!(["nested/skill"]),
+        json!([""]),
+    ] {
+        let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+            "extra": { "skills": skills },
+        }))
+        .unwrap();
+        let err = svc.update("u", &resp.id, update_req, &task_mgr).await.unwrap_err();
+
+        match err {
+            ConversationError::BadRequest { reason: msg } => assert!(msg.contains("skills"), "msg = {msg:?}"),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn update_rejects_invalid_mcp_server_ids() {
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "backend": "claude" },
+    }))
+    .unwrap();
+    let resp = svc.create("u", req).await.unwrap();
+
+    for ids in [json!("mcp-id"), json!([""]), json!([1])] {
+        let update_req: UpdateConversationRequest = serde_json::from_value(json!({
+            "extra": { "mcp_server_ids": ids },
+        }))
+        .unwrap();
+        let err = svc.update("u", &resp.id, update_req, &task_mgr).await.unwrap_err();
+        assert!(
+            matches!(err, ConversationError::BadRequest { .. }),
+            "unexpected error: {err:?}"
+        );
     }
 }
 
