@@ -26,7 +26,7 @@ use aionui_api_types::{
 };
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
-    SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
+    SendMessageRequest, UpdateConversationCapabilitiesRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
@@ -8376,6 +8376,91 @@ async fn update_rejects_extra_skills() {
         ConversationError::BadRequest { reason: msg } => assert!(msg.contains("skills"), "msg = {msg:?}"),
         other => panic!("expected BadRequest, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn update_capabilities_persists_skills_and_rebuilds_idle_agent() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let resp = svc.create("u", make_create_req()).await.unwrap();
+
+    let updated = svc
+        .update_capabilities(
+            "u",
+            &resp.id,
+            UpdateConversationCapabilitiesRequest {
+                skills_to_add: vec![" review ".into(), "review".into(), "slides".into(), "".into()],
+                mcp_server_ids_to_add: Vec::new(),
+            },
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.extra["skills"], json!(["review", "slides"]));
+    let records = task_mgr.kill_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0, resp.id);
+    assert_eq!(records[0].1, Some(AgentKillReason::RuntimeCapabilityChanged));
+
+    let updated_again = svc
+        .update_capabilities(
+            "u",
+            &resp.id,
+            UpdateConversationCapabilitiesRequest {
+                skills_to_add: vec!["review".into()],
+                mcp_server_ids_to_add: Vec::new(),
+            },
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_again.extra["skills"], json!(["review", "slides"]));
+    assert_eq!(task_mgr.kill_records().len(), 1, "duplicate add must be a no-op");
+}
+
+#[tokio::test]
+async fn update_capabilities_rejects_missing_and_running_conversations() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+
+    let missing = svc
+        .update_capabilities(
+            "u",
+            "missing",
+            UpdateConversationCapabilitiesRequest::default(),
+            &task_mgr_dyn,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(missing, ConversationError::NotFound { .. }));
+
+    let resp = svc.create("u", make_create_req()).await.unwrap();
+    repo.update(
+        "u",
+        &resp.id,
+        &ConversationRowUpdate {
+            status: Some("running".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let busy = svc
+        .update_capabilities(
+            "u",
+            &resp.id,
+            UpdateConversationCapabilitiesRequest {
+                skills_to_add: vec!["review".into()],
+                mcp_server_ids_to_add: Vec::new(),
+            },
+            &task_mgr_dyn,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(busy, ConversationError::Busy { .. }));
 }
 
 #[tokio::test]

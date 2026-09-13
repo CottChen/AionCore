@@ -129,6 +129,21 @@ pub struct UpdateConversationRequest {
     pub extra: Option<serde_json::Value>,
 }
 
+/// Body for `PATCH /api/conversations/:id/capabilities`.
+///
+/// This endpoint is intentionally add-only. Capability snapshots remain
+/// immutable through the generic conversation PATCH, and this dedicated
+/// request only appends new skills/MCP servers while the conversation is idle.
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateConversationCapabilitiesRequest {
+    #[serde(default)]
+    #[serde(alias = "skills")]
+    pub skills_to_add: Vec<String>,
+    #[serde(default)]
+    #[serde(alias = "mcp_server_ids")]
+    pub mcp_server_ids_to_add: Vec<String>,
+}
+
 /// Body for `POST /api/conversations/clone`.
 ///
 /// Despite the name, this endpoint no longer supports cloning from an

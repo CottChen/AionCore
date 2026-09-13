@@ -25,8 +25,8 @@ use aionui_api_types::{
     ListConversationTurnPreviewsQuery, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
     MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
     SessionMcpServer, SessionMcpTransport, SubmitConversationRatingRequest, TeamSessionBinding,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
-    assistant_avatar_response_value_with_version,
+    UpdateConversationArtifactRequest, UpdateConversationCapabilitiesRequest, UpdateConversationRequest,
+    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -2494,6 +2494,239 @@ impl ConversationService {
         info!("Conversation updated");
         self.broadcast_list_changed(user_id, id, "updated", response.source.as_ref());
 
+        Ok(response)
+    }
+
+    /// Add skills/MCP servers to an existing conversation.
+    ///
+    /// These fields are intentionally excluded from the generic conversation
+    /// PATCH. This method only performs a set union; it never removes an
+    /// existing capability. The running agent must be torn down so the next
+    /// turn is built with the new capability set. The operation is rejected
+    /// while a turn is running to avoid interrupting user work.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
+    pub async fn update_capabilities(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: UpdateConversationCapabilitiesRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<ConversationResponse, ConversationError> {
+        let existing = self
+            .conversation_repo
+            .get(user_id, id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+        if existing.status.as_deref() == Some("running") || self.runtime_state.is_claimed(id) {
+            return Err(ConversationError::Busy {
+                reason: "Cannot change MCP or skills while the conversation is running".to_owned(),
+            });
+        }
+
+        let mut extra: serde_json::Value =
+            serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+        if !extra.is_object() {
+            return Err(ConversationError::BadRequest {
+                reason: "Conversation extra must be a JSON object".to_owned(),
+            });
+        }
+
+        let skill_additions = req
+            .skills_to_add
+            .into_iter()
+            .map(|skill| skill.trim().to_owned())
+            .filter(|skill| !skill.is_empty())
+            .collect::<Vec<_>>();
+        let mcp_additions = req
+            .mcp_server_ids_to_add
+            .into_iter()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .collect::<Vec<_>>();
+        if skill_additions.is_empty() && mcp_additions.is_empty() {
+            return Ok(row_to_response(existing, &self.workspace_root)?);
+        }
+
+        let mut changed = false;
+        if !skill_additions.is_empty() {
+            let mut skills = extra
+                .get("skills")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for skill in skill_additions {
+                if !skills.iter().any(|existing| existing == &skill) {
+                    skills.push(skill);
+                    changed = true;
+                }
+            }
+            if changed {
+                if let Some(extra_obj) = extra.as_object_mut() {
+                    extra_obj.insert(
+                        "skills".to_owned(),
+                        serde_json::Value::Array(skills.into_iter().map(serde_json::Value::String).collect()),
+                    );
+                }
+            }
+        }
+
+        if !mcp_additions.is_empty() {
+            let existing_type: AgentType = string_to_enum(&existing.r#type)?;
+            let repo = self
+                .mcp_server_repo
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().cloned());
+            if repo.is_none() {
+                return Err(ConversationError::internal(
+                    "MCP repository is unavailable; the conversation was not changed",
+                ));
+            }
+            let mut current_ids = extra
+                .get("mcp_server_ids")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let support = self.resolve_mcp_support_policy(user_id, &existing_type, &extra).await?;
+            let mut rows = Vec::new();
+            if let Some(repo) = repo.as_ref() {
+                let rows = repo
+                    .list_by_ids_any(user_id, &mcp_additions)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?;
+                if let Some(invalid_id) = mcp_additions
+                    .iter()
+                    .find(|id| !rows.iter().any(|row| !row.builtin && row.id == **id))
+                {
+                    return Err(ConversationError::BadRequest {
+                        reason: format!("MCP server '{invalid_id}' is unavailable or cannot be added"),
+                    });
+                }
+                for row in rows.into_iter().filter(|row| !row.builtin) {
+                    if !current_ids.iter().any(|id| id == &row.id) {
+                        current_ids.push(row.id.clone());
+                        changed = true;
+                    }
+                }
+            }
+
+            if changed {
+                if let Some(repo) = repo {
+                    rows = repo
+                        .list_by_ids_any(user_id, &current_ids)
+                        .await
+                        .map_err(|e| ConversationError::internal(format!("Failed to refresh MCP servers: {e}")))?;
+                }
+
+                let mut names = extra
+                    .get("mcp_servers")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let mut statuses = extra
+                    .get("mcp_statuses")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Vec<ConversationMcpStatus>>(value).ok())
+                    .unwrap_or_default();
+                let mut seen_names = names.iter().cloned().collect::<HashSet<_>>();
+                let mut status_index_by_name = statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, status)| (status.name.clone(), index))
+                    .collect::<HashMap<_, _>>();
+
+                for row in &rows {
+                    if row.builtin {
+                        continue;
+                    }
+                    if seen_names.insert(row.name.clone()) {
+                        names.push(row.name.clone());
+                    }
+                    upsert_conversation_mcp_status(
+                        &mut statuses,
+                        &mut status_index_by_name,
+                        classify_repo_mcp_status(row, support),
+                    );
+                }
+
+                let session_servers = extra
+                    .get("session_mcp_servers")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Vec<SessionMcpServer>>(value).ok())
+                    .unwrap_or_default();
+                for server in &session_servers {
+                    if seen_names.insert(server.name.clone()) {
+                        names.push(server.name.clone());
+                    }
+                    upsert_conversation_mcp_status(
+                        &mut statuses,
+                        &mut status_index_by_name,
+                        classify_session_mcp_status(server, support),
+                    );
+                }
+
+                if let Some(extra_obj) = extra.as_object_mut() {
+                    extra_obj.insert(
+                        "mcp_server_ids".to_owned(),
+                        serde_json::Value::Array(current_ids.into_iter().map(serde_json::Value::String).collect()),
+                    );
+                    extra_obj.insert(
+                        "mcp_servers".to_owned(),
+                        serde_json::Value::Array(names.into_iter().map(serde_json::Value::String).collect()),
+                    );
+                    extra_obj.insert(
+                        "mcp_statuses".to_owned(),
+                        serde_json::to_value(statuses).map_err(|e| {
+                            ConversationError::internal(format!("Failed to serialize MCP status snapshot: {e}"))
+                        })?,
+                    );
+                }
+            }
+        }
+
+        if !changed {
+            return Ok(row_to_response(existing, &self.workspace_root)?);
+        }
+
+        self.conversation_repo
+            .update(
+                user_id,
+                id,
+                &ConversationRowUpdate {
+                    extra: Some(
+                        serde_json::to_string(&extra)
+                            .map_err(|e| ConversationError::internal(format!("Failed to serialize extra: {e}")))?,
+                    ),
+                    updated_at: Some(now_ms()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        if let Err(error) = task_manager.kill(id, Some(AgentKillReason::RuntimeCapabilityChanged)) {
+            warn!(conversation_id = %id, error = %ErrorChain(&error), "Failed to rebuild agent after capability update");
+        }
+
+        let response = self.get(user_id, id).await?;
+        self.broadcast_list_changed(user_id, id, "updated", response.source.as_ref());
         Ok(response)
     }
 

@@ -14,7 +14,8 @@ use aionui_api_types::{
     EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationTurnPreviewsQuery,
     ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
     SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationRatingRequest,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, WebuiTransferOwnerRequest,
+    UpdateConversationArtifactRequest, UpdateConversationCapabilitiesRequest, UpdateConversationRequest,
+    WebuiTransferOwnerRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -116,6 +117,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/conversations", post(create).get(list))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
+        .route("/api/conversations/{id}/capabilities", patch(update_capabilities))
         .route("/api/conversations/{id}/owner", post(transfer_owner))
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/fork", post(fork))
@@ -222,6 +224,21 @@ async fn update(
     let conversation = state
         .service
         .update(&user.id, &id, req, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(conversation)))
+}
+
+async fn update_capabilities(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateConversationCapabilitiesRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ConversationResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let conversation = state
+        .service
+        .update_capabilities(&user.id, &id, req, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(conversation)))

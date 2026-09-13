@@ -101,7 +101,8 @@ pub use conversation::{
     ForkCapabilityView, ForkConversationRequest, ListConversationTurnPreviewsQuery, ListConversationsQuery,
     ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse,
     PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    SubmitConversationRatingRequest, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    SubmitConversationRatingRequest, UpdateConversationArtifactRequest, UpdateConversationCapabilitiesRequest,
+    UpdateConversationRequest,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
