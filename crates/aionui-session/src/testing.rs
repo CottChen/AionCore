@@ -158,7 +158,7 @@ impl FakeAgentIo {
 
     /// A release handle usable AFTER the fake is moved into a backend (which
     /// consumes the `Box<dyn AgentIo>`). Calling it opens the gated-tail gate.
-    pub fn stdout_releaser(&self) -> impl Fn() + Send + Sync + 'static {
+    pub fn stdout_releaser(&self) -> impl Fn() + Send + Sync + 'static + use<> {
         let gate = Arc::clone(&self.stdout_gate);
         let ready = Arc::clone(&self.stdout_ready);
         move || {

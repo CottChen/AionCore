@@ -146,6 +146,16 @@ impl SessionRuntime {
     fn model_override(&self) -> Option<String> {
         self.model_override.lock().ok().and_then(|g| g.clone())
     }
+    fn clear_mode_override(&self) {
+        if let Ok(mut g) = self.mode_override.lock() {
+            *g = None;
+        }
+    }
+    fn clear_model_override(&self) {
+        if let Ok(mut g) = self.model_override.lock() {
+            *g = None;
+        }
+    }
     fn set_effort_override(&self, effort: String) {
         if let Ok(mut g) = self.effort_override.lock() {
             *g = Some(effort);
@@ -153,6 +163,11 @@ impl SessionRuntime {
     }
     fn effort_override(&self) -> Option<String> {
         self.effort_override.lock().ok().and_then(|g| g.clone())
+    }
+    fn clear_effort_override(&self) {
+        if let Ok(mut g) = self.effort_override.lock() {
+            *g = None;
+        }
     }
 
     /// Atomic clean-converge frame: if not already `Finished`, set status ←
@@ -927,30 +942,28 @@ impl SessionAgentTask {
                 value: value.to_string(),
             },
         };
-        self.backend
-            .dispatch(cmd)
-            .await
-            .map_err(|e| AgentError::bad_request(e.to_string()))?;
-        // Cache the requested value as an optimistic override for mode/model, then
-        // re-read the config-options snapshot so the response satisfies the frontend's
-        // `hasObservedValue` contract (confirmation == Observed AND the option's
-        // current_value == requested). This is required because claude's own
-        // `capabilities()` does NOT reflect an in-band switch synchronously (set_model
-        // has no confirmation wire; set_permission_mode confirms only via a later
-        // async system/status), so without the override the option would never read
-        // back as observed and the frontend would reject the switch as `command_ack`.
-        // Mirrors the clean-slate runtime's optimistic override + observed re-read.
-        // effort/thought_level is now a surfaced picker option too (id `reasoning_effort`,
-        // category `thought_level`), so it also caches an override + falls through to the
-        // observed re-read — the frontend's `hasObservedValue` requires Observed AND the
-        // option's current_value == requested, same as mode/model.
+        // Seed the requested value before dispatch so backends without a synchronous
+        // capability echo (notably Claude) can still satisfy the frontend's observed
+        // read-back. Direct Codex now blocks dispatch until its own
+        // `thread/settings/updated` confirmation, so a failed/timeout write never
+        // reaches this point as a successful switch.
         match option_id {
             "mode" => self.runtime.set_mode_override(value.to_string()),
             "model" => self.runtime.set_model_override(value.to_string()),
+            "effort" | "reasoning_effort" | "thought_level" => self.runtime.set_effort_override(value.to_string()),
+            _ => {}
+        }
+        if let Err(error) = self.backend.dispatch(cmd).await {
+            match option_id {
+                "mode" => self.runtime.clear_mode_override(),
+                "model" => self.runtime.clear_model_override(),
+                "effort" | "reasoning_effort" | "thought_level" => self.runtime.clear_effort_override(),
+                _ => {}
+            }
+            return Err(AgentError::bad_request(error.to_string()));
+        }
+        match option_id {
             "effort" | "reasoning_effort" | "thought_level" => {
-                // Optimistic highlight: claude emits no effort echo, so the streaming
-                // catalog push reads the current level from this override.
-                self.runtime.set_effort_override(value.to_string());
                 // Persist the chosen effort into `config_selections` so it survives a
                 // respawn/resume. Unlike mode/model (persisted by the pump on
                 // ConfigChanged), claude emits no ConfigChanged for effort, so this is
@@ -959,6 +972,7 @@ impl SessionAgentTask {
                 // not fail the switch the CLI already applied).
                 self.persist_effort(value).await;
             }
+            "mode" | "model" => {}
             _ => {
                 return Ok(aionui_api_types::SetConfigOptionResponse {
                     confirmation: aionui_api_types::ConfigOptionConfirmation::CommandAck,
@@ -2895,6 +2909,18 @@ fn spawn_event_pump(
                 }
                 SessionEvent::ToolResult { tool_use_id, .. } => {
                     open_tools.remove(tool_use_id);
+                }
+                SessionEvent::ConfigChanged { mode, model } => {
+                    // A backend-observed value supersedes the optimistic value
+                    // immediately. This is especially important for Codex, where
+                    // a late settings notification can report the previous model
+                    // after a rejected switch.
+                    if mode.is_some() {
+                        runtime.clear_mode_override();
+                    }
+                    if model.is_some() {
+                        runtime.clear_model_override();
+                    }
                 }
                 SessionEvent::TurnResult { .. } | SessionEvent::Detached { .. } if !suppress_intermediate_finish => {
                     // A real (unsuppressed) terminal settles any owed launch Finish —

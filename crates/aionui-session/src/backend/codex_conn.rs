@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aionui_process::Spawner;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, oneshot};
 
 use super::suspend::{ProcHandle, SuspendController, spawn_idle_timer};
 use super::types::{
@@ -233,6 +233,9 @@ impl BackendConnection for CodexConnection {
 /// arrives we do NOT apply the requested value (we cannot validate it), leaving the
 /// thread on codex's launch default rather than risk binding a bad model/mode.
 const CODEX_RECONCILE_POLLS: u32 = 100;
+/// A config write is complete only after Codex emits `thread/settings/updated`.
+/// Keep this bounded so a broken/old CLI cannot leave the model picker blocked.
+const CODEX_CONFIG_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// codex-model/mode-gating self-heal (the ACP `clear_invalid_desired_*` +
 /// `reconcile_session` port). `thread/start` launched the thread on codex's OWN default
@@ -786,6 +789,10 @@ pub struct CodexSessionBackend {
     /// `map_notification` → ConfigChanged, live-verified), so emitting here too would
     /// duplicate the ConfigChanged. The codex analogue of acp_conn's `pending_set`.
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    /// Waiters for the real `thread/settings/updated` confirmation. A JSON-RPC
+    /// write receipt is not enough: Codex can accept the request and then reject
+    /// or normalize it asynchronously.
+    pending_set_waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>,
 }
 
 /// One in-flight prompt-carrying client request (GAP-A correlation entry).
@@ -901,6 +908,7 @@ struct CodexReaderState {
     pending_local_commands: Arc<Mutex<HashMap<u64, PendingLocalCommand>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    pending_set_waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>,
     current_model: Arc<Mutex<Option<String>>>,
     current_effort: Arc<Mutex<Option<String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
@@ -941,6 +949,7 @@ fn start_codex_reader(
             state.pending_local_commands,
             state.pending_discovery,
             state.pending_set,
+            state.pending_set_waiters,
             state.current_model,
             state.current_effort,
             state.pending_resume,
@@ -1116,6 +1125,7 @@ impl CodexSessionBackend {
         let pending_local_commands = Arc::new(Mutex::new(HashMap::new()));
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
+        let pending_set_waiters = Arc::new(Mutex::new(HashMap::new()));
         let pending_resume = Arc::new(Mutex::new(None));
         let resume_poison = Arc::new(Mutex::new(None));
         let pending_fork = Arc::new(Mutex::new(None));
@@ -1144,6 +1154,7 @@ impl CodexSessionBackend {
             pending_local_commands: pending_local_commands.clone(),
             pending_discovery: pending_discovery.clone(),
             pending_set: pending_set.clone(),
+            pending_set_waiters: pending_set_waiters.clone(),
             current_model: current_model.clone(),
             current_effort: current_effort.clone(),
             pending_resume: pending_resume.clone(),
@@ -1209,10 +1220,39 @@ impl CodexSessionBackend {
             pending_local_commands,
             pending_discovery,
             pending_set,
+            pending_set_waiters,
             pending_resume,
             resume_poison,
             pending_fork,
             discovered,
+        }
+    }
+
+    async fn dispatch_config_update(&self, id: u64, label: String, frame: Value) -> Result<(), BackendError> {
+        let (waiter, receiver) = oneshot::channel();
+        self.pending_set.lock().await.insert(id, label.clone());
+        self.pending_set_waiters.lock().await.insert(id, waiter);
+        if let Err(error) = self.write_frame(frame).await {
+            self.pending_set.lock().await.remove(&id);
+            self.pending_set_waiters.lock().await.remove(&id);
+            return Err(error);
+        }
+        match tokio::time::timeout(CODEX_CONFIG_CONFIRM_TIMEOUT, receiver).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(message))) => Err(BackendError::Transport(format!(
+                "codex config update {label} rejected: {message}"
+            ))),
+            Ok(Err(_)) => Err(BackendError::Transport(format!(
+                "codex config update {label} confirmation channel closed"
+            ))),
+            Err(_) => {
+                self.pending_set.lock().await.remove(&id);
+                self.pending_set_waiters.lock().await.remove(&id);
+                Err(BackendError::Transport(format!(
+                    "codex config update {label} confirmation timed out after {}s",
+                    CODEX_CONFIG_CONFIRM_TIMEOUT.as_secs()
+                )))
+            }
         }
     }
 
@@ -1459,6 +1499,7 @@ async fn reader_task(
     pending_local_commands: Arc<Mutex<HashMap<u64, PendingLocalCommand>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
+    pending_set_waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>,
     current_model: Arc<Mutex<Option<String>>>,
     current_effort: Arc<Mutex<Option<String>>>,
     pending_resume: Arc<Mutex<Option<u64>>>,
@@ -1643,6 +1684,28 @@ async fn reader_task(
                         let params = frame.get("params").unwrap_or(&Value::Null);
                         if m == "thread/settings/updated" {
                             capture_runtime_config_from_value(params, &current_model, &current_effort).await;
+                            let settings = params
+                                .get("threadSettings")
+                                .or_else(|| params.get("thread_settings"))
+                                .unwrap_or(&Value::Null);
+                            let observed_model = settings.get("model").and_then(Value::as_str);
+                            let observed_mode = settings
+                                .get("activePermissionProfile")
+                                .and_then(|profile| profile.get("id"))
+                                .and_then(Value::as_str);
+                            let observed_effort = settings
+                                .get("effort")
+                                .or_else(|| settings.get("reasoningEffort"))
+                                .or_else(|| settings.get("reasoning_effort"))
+                                .and_then(Value::as_str);
+                            resolve_pending_set_waiters(
+                                &pending_set,
+                                &pending_set_waiters,
+                                observed_model,
+                                observed_mode,
+                                observed_effort,
+                            )
+                            .await;
                         }
                         if m == "skills/changed" {
                             // The generated protocol documents this notification as
@@ -1880,6 +1943,14 @@ async fn reader_task(
                             .await;
                             if let Some(result) = frame.get("result") {
                                 capture_runtime_config_from_value(result, &current_model, &current_effort).await;
+                                resolve_pending_set_waiters(
+                                    &pending_set,
+                                    &pending_set_waiters,
+                                    current_model_from_runtime_value(result).as_deref(),
+                                    None,
+                                    current_effort_from_runtime_value(result).as_deref(),
+                                )
+                                .await;
                             }
                             let error_message = frame.get("error").map(|e| {
                                 e.get("message")
@@ -2136,17 +2207,17 @@ async fn reader_task(
                             // On SUCCESS this does nothing: codex converges via the
                             // separate thread/settings/updated notification (→ ConfigChanged),
                             // so the claim only matters when the response carries an error.
-                            if let Some(label) = pending_set.lock().await.remove(&rid)
-                                && let Some(err) = frame.get("error")
+                            if let Some(err) = frame.get("error")
+                                && let Some(label) = pending_set.lock().await.remove(&rid)
                             {
-                                if label.starts_with("model\u{2192}") {
-                                    *current_model.lock().await = None;
-                                }
                                 let message = err
                                     .get("message")
                                     .and_then(Value::as_str)
                                     .unwrap_or("set rejected")
                                     .to_string();
+                                if let Some(waiter) = pending_set_waiters.lock().await.remove(&rid) {
+                                    let _ = waiter.send(Err(message.clone()));
+                                }
                                 tracing::error!(
                                     conversation_id = %session_id,
                                     set = %label,
@@ -2664,6 +2735,47 @@ async fn capture_runtime_config_from_value(
     }
     if let Some(effort) = current_effort_from_runtime_value(value) {
         *current_effort.lock().await = Some(effort);
+    }
+}
+
+fn pending_set_matches(label: &str, model: Option<&str>, mode: Option<&str>, effort: Option<&str>) -> bool {
+    let (axis, requested) = label.split_once('→').unwrap_or(("", ""));
+    match axis {
+        "model" => model == Some(requested),
+        "mode" => mode == Some(requested),
+        "effort" => effort == Some(requested),
+        _ => false,
+    }
+}
+
+/// Resolve config writes only from the agent's observed settings notification.
+/// The JSON-RPC response acknowledges receipt of the request, not application of
+/// the setting, so the reader must correlate the later notification to the
+/// requested value.
+async fn resolve_pending_set_waiters(
+    pending_set: &Arc<Mutex<HashMap<u64, String>>>,
+    pending_set_waiters: &Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>,
+    model: Option<&str>,
+    mode: Option<&str>,
+    effort: Option<&str>,
+) {
+    let matched_ids = {
+        let pending = pending_set.lock().await;
+        pending
+            .iter()
+            .filter_map(|(id, label)| pending_set_matches(label, model, mode, effort).then_some(*id))
+            .collect::<Vec<_>>()
+    };
+    if matched_ids.is_empty() {
+        return;
+    }
+    let mut pending = pending_set.lock().await;
+    let mut waiters = pending_set_waiters.lock().await;
+    for id in matched_ids {
+        pending.remove(&id);
+        if let Some(waiter) = waiters.remove(&id) {
+            let _ = waiter.send(Ok(()));
+        }
     }
 }
 
@@ -4873,13 +4985,6 @@ impl SessionBackend for CodexSessionBackend {
                 let profile_id = codex_perm::normalize_to_profile_id(&mode);
                 let tid = self.bound_thread().await?;
                 let id = self.next_rpc_id();
-                // Register the rpc id so the reader claims the response: a JSON-RPC
-                // error (codex rejected the profile) surfaces as a Notice instead of
-                // being dropped (success converges via thread/settings/updated).
-                self.pending_set
-                    .lock()
-                    .await
-                    .insert(id, format!("mode\u{2192}{profile_id}"));
                 let frame = json!({
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
                     "params": {
@@ -4887,7 +4992,8 @@ impl SessionBackend for CodexSessionBackend {
                         "permissions": profile_id
                     }
                 });
-                self.write_frame(frame).await?;
+                self.dispatch_config_update(id, format!("mode\u{2192}{profile_id}"), frame)
+                    .await?;
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -4901,22 +5007,14 @@ impl SessionBackend for CodexSessionBackend {
                     .await?;
                 // codex `thread/settings/update{threadId, model}` (verified frame:
                 // {"threadId":..,"model":"gpt-5.5"}). Applies to subsequent turns.
-                // Track it so a subsequent SetMode can build collaborationMode (M1).
                 let tid = self.bound_thread().await?;
-                *self.current_model.lock().await = Some(model.clone());
                 let id = self.next_rpc_id();
-                // Register the rpc id so the reader claims the response: a JSON-RPC
-                // error (codex rejected the model) surfaces as a Notice instead of
-                // being dropped (success converges via thread/settings/updated).
-                self.pending_set
-                    .lock()
-                    .await
-                    .insert(id, format!("model\u{2192}{model}"));
                 let frame = json!({
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
                     "params": { "threadId": tid, "model": model }
                 });
-                self.write_frame(frame).await?;
+                self.dispatch_config_update(id, format!("model\u{2192}{model}"), frame)
+                    .await?;
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -5123,18 +5221,12 @@ impl SessionBackend for CodexSessionBackend {
                     .await?;
                 let tid = self.bound_thread().await?;
                 let id = self.next_rpc_id();
-                // Register the rpc id so the reader claims the response: a JSON-RPC error
-                // (codex rejected the effort) surfaces as a Notice instead of being
-                // dropped (success converges via thread/settings/updated).
-                self.pending_set
-                    .lock()
-                    .await
-                    .insert(id, format!("effort\u{2192}{value}"));
                 let frame = json!({
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
                     "params": { "threadId": tid, "effort": value }
                 });
-                self.write_frame(frame).await?;
+                self.dispatch_config_update(id, format!("effort\u{2192}{value}"), frame)
+                    .await?;
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -6983,6 +7075,28 @@ mod tests {
         fake
     }
 
+    fn fake_with_gated_settings(
+        tid: &str,
+        settings: serde_json::Value,
+    ) -> (FakeAgentIo, impl Fn() + Send + Sync + 'static) {
+        let prefix = format!(r#"{{"jsonrpc":"2.0","method":"thread/started","params":{{"thread":{{"id":"{tid}"}}}}}}"#)
+            .into_bytes();
+        let mut prefix = prefix;
+        prefix.push(b'\n');
+        let tail = format!(
+            "{}\n",
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "thread/settings/updated",
+                "params": { "threadId": tid, "threadSettings": settings }
+            })
+        )
+        .into_bytes();
+        let fake = FakeAgentIo::never_exits(prefix).with_gated_tail(tail);
+        let release = fake.stdout_releaser();
+        (fake, release)
+    }
+
     /// Drain the captured-stdin buffer to a String after dispatch settles. Polls
     /// briefly because the duplex→capture copy is on a background task.
     async fn captured_str(captured: &Arc<tokio::sync::Mutex<Vec<u8>>>) -> String {
@@ -6996,6 +7110,23 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         String::new()
+    }
+
+    async fn dispatch_config_with_release(
+        backend: Arc<CodexSessionBackend>,
+        command: Command,
+        captured: Arc<tokio::sync::Mutex<Vec<u8>>>,
+        release: impl Fn() + Send + Sync + 'static,
+    ) {
+        let task = tokio::spawn(async move { backend.dispatch(command).await });
+        for _ in 0..40 {
+            if !captured.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        release();
+        task.await.expect("dispatch task").expect("config update accepted");
     }
 
     #[tokio::test]
@@ -7877,15 +8008,35 @@ mod tests {
     #[tokio::test]
     async fn dispatch_set_model_writes_thread_settings_update() {
         // R6 SetModel → `thread/settings/update{threadId, model}` (verified frame).
-        let fake = fake_with_binding("th-5", None);
+        let prefix = br#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-5"}}}"#
+            .iter()
+            .copied()
+            .chain(std::iter::once(b'\n'))
+            .collect();
+        let tail = br#"{"jsonrpc":"2.0","method":"thread/settings/updated","params":{"threadId":"th-5","threadSettings":{"model":"gpt-5.5"}}}"#.to_vec();
+        let fake = FakeAgentIo::never_exits(prefix)
+            .with_gated_tail(format!("{}\n", String::from_utf8_lossy(&tail)).into_bytes());
+        let release = fake.stdout_releaser();
         let captured = fake.captured_stdin();
-        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
-        backend
-            .dispatch(Command::SetModel {
-                model: "gpt-5.5".into(),
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await);
+        let task = {
+            let backend = Arc::clone(&backend);
+            tokio::spawn(async move {
+                backend
+                    .dispatch(Command::SetModel {
+                        model: "gpt-5.5".into(),
+                    })
+                    .await
             })
-            .await
-            .expect("accepted");
+        };
+        for _ in 0..40 {
+            if !captured.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        release();
+        task.await.expect("dispatch task").expect("accepted");
         let written = captured_str(&captured).await;
         assert!(
             written.contains(r#""method":"thread/settings/update""#),
@@ -7908,15 +8059,48 @@ mod tests {
         // so SetConfigOption{effort} routes through the same wire as SetModel/SetMode —
         // NOT a CommandNotSupported reject. Each effort alias id maps to the `effort` key.
         for option_id in ["effort", "reasoning_effort", "thought_level"] {
-            let fake = fake_with_binding("th-7", None);
-            let captured = fake.captured_stdin();
-            let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
-            backend
-                .dispatch(Command::SetConfigOption {
-                    option_id: option_id.into(),
-                    value: "high".into(),
+            let prefix = br#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-7"}}}"#
+                .iter()
+                .copied()
+                .chain(std::iter::once(b'\n'))
+                .collect();
+            let tail = format!(
+                "{}\n",
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "thread/settings/updated",
+                    "params": {
+                        "threadId": "th-7",
+                        "threadSettings": { "effort": "high" }
+                    }
                 })
-                .await
+            )
+            .into_bytes();
+            let fake = FakeAgentIo::never_exits(prefix).with_gated_tail(tail);
+            let release = fake.stdout_releaser();
+            let captured = fake.captured_stdin();
+            let backend = Arc::new(CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await);
+            let task = {
+                let backend = Arc::clone(&backend);
+                let option_id = option_id.to_string();
+                tokio::spawn(async move {
+                    backend
+                        .dispatch(Command::SetConfigOption {
+                            option_id,
+                            value: "high".into(),
+                        })
+                        .await
+                })
+            };
+            for _ in 0..40 {
+                if !captured.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            release();
+            task.await
+                .expect("dispatch task")
                 .unwrap_or_else(|e| panic!("effort id `{option_id}` must be accepted, got: {e:?}"));
             let written = captured_str(&captured).await;
             assert!(
@@ -7965,17 +8149,23 @@ mod tests {
         // legacy bare value (`full-access`) normalizes onto its colon id. NOT the old
         // collaborationMode object, and NOT a bare id (codex rejects a colon-less id).
         // Needs no known model.
-        let fake = fake_with_binding("th-6", None);
+        let (fake, release) = fake_with_gated_settings(
+            "th-6",
+            serde_json::json!({ "activePermissionProfile": { "id": ":danger-full-access" } }),
+        );
         let captured = fake.captured_stdin();
-        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await);
         // A discovered colon id flows through unchanged (legacy-ACP parity: the wire id IS
         // the selector value).
-        backend
-            .dispatch(Command::SetMode {
+        dispatch_config_with_release(
+            Arc::clone(&backend),
+            Command::SetMode {
                 mode: ":danger-full-access".into(),
-            })
-            .await
-            .expect("accepted");
+            },
+            captured.clone(),
+            release,
+        )
+        .await;
         let written = captured_str(&captured).await;
         assert!(
             written.contains(r#""method":"thread/settings/update""#),
@@ -8001,13 +8191,19 @@ mod tests {
         // pre-discovery alias — normalizes onto the `:danger-full-access` colon id, so an
         // upgrading user's stored mode applies straight through with zero fallback. This is
         // the codex analogue of legacy ACP `normalize_requested_mode` (alias → native id).
-        let fake = fake_with_binding("th-6", None);
+        let (fake, release) = fake_with_gated_settings(
+            "th-6",
+            serde_json::json!({ "activePermissionProfile": { "id": ":danger-full-access" } }),
+        );
         let captured = fake.captured_stdin();
-        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
-        backend
-            .dispatch(Command::SetMode { mode: "yolo".into() })
-            .await
-            .expect("accepted");
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await);
+        dispatch_config_with_release(
+            Arc::clone(&backend),
+            Command::SetMode { mode: "yolo".into() },
+            captured.clone(),
+            release,
+        )
+        .await;
         let written = captured_str(&captured).await;
         assert!(
             written.contains(r#""permissions":":danger-full-access""#),
@@ -8021,15 +8217,21 @@ mod tests {
         // and NOT one of the built-in tiers — must reach the wire UNCHANGED. This is the
         // heart of the legacy-ACP parity: codex owns the value set, AionCore only transports
         // it (no fixed-enum whitelist that would drop a custom profile).
-        let fake = fake_with_binding("th-6", None);
+        let (fake, release) = fake_with_gated_settings(
+            "th-6",
+            serde_json::json!({ "activePermissionProfile": { "id": ":team-review" } }),
+        );
         let captured = fake.captured_stdin();
-        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
-        backend
-            .dispatch(Command::SetMode {
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await);
+        dispatch_config_with_release(
+            Arc::clone(&backend),
+            Command::SetMode {
                 mode: ":team-review".into(),
-            })
-            .await
-            .expect("accepted");
+            },
+            captured.clone(),
+            release,
+        )
+        .await;
         let written = captured_str(&captured).await;
         assert!(
             written.contains(r#""permissions":":team-review""#),
@@ -8087,8 +8289,55 @@ mod tests {
             "an ERROR response must NOT emit a ConfigChanged (no false convergence)"
         );
         assert!(
-            backend.current_model.lock().await.is_none(),
-            "a rejected model update must clear the optimistic current_model seed"
+            backend.current_model.lock().await.as_deref() == Some("gpt-bogus"),
+            "a rejected model update must preserve the last observed model"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_set_model_waits_for_confirmation_and_preserves_previous_model_on_error() {
+        let prefix = br#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-switch"}}}"#
+            .iter()
+            .copied()
+            .chain(std::iter::once(b'\n'))
+            .collect();
+        let error = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"model not found"}}"#;
+        let fake = FakeAgentIo::never_exits(prefix)
+            .with_gated_tail(format!("{}\n", String::from_utf8_lossy(error)).into_bytes());
+        let release = fake.stdout_releaser();
+        let captured = fake.captured_stdin();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-switch", Box::new(fake)).await);
+        *backend.current_model.lock().await = Some("gpt-previous".into());
+
+        let task = {
+            let backend = Arc::clone(&backend);
+            tokio::spawn(async move {
+                backend
+                    .dispatch(Command::SetModel {
+                        model: "gpt-broken".into(),
+                    })
+                    .await
+            })
+        };
+        for _ in 0..40 {
+            if !captured.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        release();
+        let error = task
+            .await
+            .expect("dispatch task")
+            .expect_err("a rejected model must fail the switch");
+        assert!(
+            matches!(error, BackendError::Transport(ref message) if message.contains("model not found")),
+            "the real Codex rejection must reach the caller, got {error:?}"
+        );
+        assert_eq!(
+            backend.current_model.lock().await.as_deref(),
+            Some("gpt-previous"),
+            "failed switching must not replace the last observed model"
         );
     }
 
@@ -8100,13 +8349,19 @@ mod tests {
         // collaboration-maps but lands on the workspace profile, proving the
         // collaborationMode axis is gone. (Validation of a stale DISCOVERED colon id is the
         // reconcile/reader's job against the live catalog, not this normalize step.)
-        let fake = fake_with_binding("th-6", None);
+        let (fake, release) = fake_with_gated_settings(
+            "th-6",
+            serde_json::json!({ "activePermissionProfile": { "id": ":workspace" } }),
+        );
         let captured = fake.captured_stdin();
-        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
-        backend
-            .dispatch(Command::SetMode { mode: "plan".into() })
-            .await
-            .expect("plan normalizes to :workspace, accepted");
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await);
+        dispatch_config_with_release(
+            Arc::clone(&backend),
+            Command::SetMode { mode: "plan".into() },
+            captured.clone(),
+            release,
+        )
+        .await;
         let written = captured_str(&captured).await;
         assert!(
             written.contains(r#""permissions":":workspace""#),
