@@ -2544,7 +2544,7 @@ impl ConversationService {
             .filter(|id| !id.is_empty())
             .collect::<Vec<_>>();
         if skill_additions.is_empty() && mcp_additions.is_empty() {
-            return Ok(row_to_response(existing, &self.workspace_root)?);
+            return row_to_response(existing, &self.workspace_root);
         }
 
         let mut changed = false;
@@ -2566,13 +2566,11 @@ impl ConversationService {
                     changed = true;
                 }
             }
-            if changed {
-                if let Some(extra_obj) = extra.as_object_mut() {
-                    extra_obj.insert(
-                        "skills".to_owned(),
-                        serde_json::Value::Array(skills.into_iter().map(serde_json::Value::String).collect()),
-                    );
-                }
+            if changed && let Some(extra_obj) = extra.as_object_mut() {
+                extra_obj.insert(
+                    "skills".to_owned(),
+                    serde_json::Value::Array(skills.into_iter().map(serde_json::Value::String).collect()),
+                );
             }
         }
 
@@ -2703,7 +2701,7 @@ impl ConversationService {
         }
 
         if !changed {
-            return Ok(row_to_response(existing, &self.workspace_root)?);
+            return row_to_response(existing, &self.workspace_root);
         }
 
         self.conversation_repo
