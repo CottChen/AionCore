@@ -114,6 +114,20 @@ impl ConversationRuntimeStateService {
             .and_then(|state| state.active_turns.get(conversation_id).cloned())
     }
 
+    /// Clear a stale in-memory turn claim after its task has disappeared.
+    /// This is used by runtime reconciliation paths after an ACP task is
+    /// force-killed or fails during session initialization.
+    pub fn clear_stale_turn(&self, conversation_id: &str) -> Option<String> {
+        let turn_id = self.state.lock().ok()?.active_turns.remove(conversation_id);
+        if turn_id.is_some() {
+            if let Ok(mut state) = self.state.lock() {
+                state.cancelling_conversations.remove(conversation_id);
+            }
+            self.release_notify.notify_waiters();
+        }
+        turn_id
+    }
+
     pub async fn wait_until_unclaimed(&self, conversation_id: &str) {
         loop {
             let notified = self.release_notify.notified();
