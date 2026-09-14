@@ -789,7 +789,7 @@ impl IConversationRepository for SqliteConversationRepository {
                  FROM message_text_search mts \
                  INNER JOIN messages m ON m.rowid = mts.rowid \
                  INNER JOIN conversations c ON m.conversation_id = c.id \
-                 WHERE c.user_id = ? AND message_text_search MATCH ?",
+                 WHERE c.user_id = ? AND m.position = 'right' AND m.type = 'text' AND message_text_search MATCH ?",
             )
             .bind(user_id)
             .bind(&search_value)
@@ -801,7 +801,7 @@ impl IConversationRepository for SqliteConversationRepository {
                  FROM message_text_search mts \
                  INNER JOIN messages m ON m.rowid = mts.rowid \
                  INNER JOIN conversations c ON m.conversation_id = c.id \
-                 WHERE c.user_id = ? AND mts.content LIKE ? ESCAPE '\\'",
+                 WHERE c.user_id = ? AND m.position = 'right' AND m.type = 'text' AND mts.content LIKE ? ESCAPE '\\'",
             )
             .bind(user_id)
             .bind(&search_value)
@@ -820,7 +820,7 @@ impl IConversationRepository for SqliteConversationRepository {
              FROM message_text_search mts \
              INNER JOIN messages m ON m.rowid = mts.rowid \
              INNER JOIN conversations c ON m.conversation_id = c.id \
-             WHERE c.user_id = ? AND message_text_search MATCH ? \
+             WHERE c.user_id = ? AND m.position = 'right' AND m.type = 'text' AND message_text_search MATCH ? \
              ORDER BY m.created_at DESC, m.id DESC \
              LIMIT ? OFFSET ?"
         } else {
@@ -834,7 +834,7 @@ impl IConversationRepository for SqliteConversationRepository {
              FROM message_text_search mts \
              INNER JOIN messages m ON m.rowid = mts.rowid \
              INNER JOIN conversations c ON m.conversation_id = c.id \
-             WHERE c.user_id = ? AND mts.content LIKE ? ESCAPE '\\' \
+             WHERE c.user_id = ? AND m.position = 'right' AND m.type = 'text' AND mts.content LIKE ? ESCAPE '\\' \
              ORDER BY m.created_at DESC, m.id DESC \
              LIMIT ? OFFSET ?"
         };
@@ -893,7 +893,7 @@ impl IConversationRepository for SqliteConversationRepository {
                  FROM message_text_search mts \
                  INNER JOIN messages m ON m.rowid = mts.rowid \
                  INNER JOIN conversations c ON m.conversation_id = c.id \
-                 WHERE c.user_id = ? AND message_text_search MATCH ?{} \
+                 WHERE c.user_id = ? AND m.position = 'right' AND m.type = 'text' AND message_text_search MATCH ?{} \
                  ORDER BY m.created_at DESC, m.id DESC \
                  LIMIT ?",
                 cursor_clause
@@ -910,7 +910,7 @@ impl IConversationRepository for SqliteConversationRepository {
                  FROM message_text_search mts \
                  INNER JOIN messages m ON m.rowid = mts.rowid \
                  INNER JOIN conversations c ON m.conversation_id = c.id \
-                 WHERE c.user_id = ? AND mts.content LIKE ? ESCAPE '\\\\'{} \
+                 WHERE c.user_id = ? AND m.position = 'right' AND m.type = 'text' AND mts.content LIKE ? ESCAPE '\\\\'{} \
                  ORDER BY m.created_at DESC, m.id DESC \
                  LIMIT ?",
                 cursor_clause

@@ -112,6 +112,9 @@ pub struct CopyFilesRequest {
     pub workspace: String,
     #[serde(default)]
     pub source_root: Option<String>,
+    /// Optional destination directory relative to `workspace`.
+    #[serde(default)]
+    pub target_relative_path: Option<String>,
 }
 
 /// Request body for `POST /api/fs/remove` — remove file or directory.
@@ -423,6 +426,7 @@ mod tests {
         assert_eq!(req.file_paths, vec!["/a.txt", "/b.txt"]);
         assert_eq!(req.workspace, "/ws");
         assert_eq!(req.source_root.as_deref(), Some("/src"));
+        assert!(req.target_relative_path.is_none());
     }
 
     #[test]
@@ -433,6 +437,7 @@ mod tests {
         });
         let req: CopyFilesRequest = serde_json::from_value(raw).unwrap();
         assert!(req.source_root.is_none());
+        assert!(req.target_relative_path.is_none());
     }
 
     #[test]

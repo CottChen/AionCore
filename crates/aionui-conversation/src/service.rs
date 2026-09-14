@@ -2778,26 +2778,7 @@ impl ConversationService {
             )
         };
 
-        let elapsed = started.elapsed();
-        if elapsed >= Duration::from_millis(500) {
-            warn!(
-                page,
-                page_size,
-                cursor_mode,
-                matches = result.total,
-                elapsed_ms = elapsed.as_millis(),
-                "Slow conversation message search"
-            );
-        } else {
-            debug!(
-                page,
-                page_size,
-                cursor_mode,
-                matches = result.total,
-                elapsed_ms = elapsed.as_millis(),
-                "Searched conversation messages"
-            );
-        }
+        let query_elapsed = started.elapsed();
 
         let next_cursor = if cursor_mode && result.has_more {
             result
@@ -2818,16 +2799,44 @@ impl ConversationService {
             None
         };
 
+        let result_total = result.total;
+        let result_has_more = result.has_more;
+        let convert_started = Instant::now();
         let items = result
             .items
             .into_iter()
             .map(|row| search_row_to_item(row, &self.workspace_root))
             .collect::<Result<Vec<_>, _>>()?;
+        let convert_elapsed = convert_started.elapsed();
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            warn!(
+                page,
+                page_size,
+                cursor_mode,
+                matches = items.len(),
+                query_ms = query_elapsed.as_millis(),
+                convert_ms = convert_elapsed.as_millis(),
+                elapsed_ms = elapsed.as_millis(),
+                "Slow conversation message search"
+            );
+        } else {
+            debug!(
+                page,
+                page_size,
+                cursor_mode,
+                matches = items.len(),
+                query_ms = query_elapsed.as_millis(),
+                convert_ms = convert_elapsed.as_millis(),
+                elapsed_ms = elapsed.as_millis(),
+                "Searched conversation messages"
+            );
+        }
 
         Ok(MessageSearchResponse {
             items,
-            total: result.total,
-            has_more: result.has_more,
+            total: result_total,
+            has_more: result_has_more,
             next_cursor,
         })
     }

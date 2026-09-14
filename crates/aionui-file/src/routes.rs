@@ -25,6 +25,7 @@ use aionui_common::ApiError;
 
 use crate::browse;
 use crate::error::FileError;
+use crate::path_safety::has_traversal;
 use crate::traits::{
     ChatFileOperation, ChatFileResolverRef, FileServiceRef, FileWatchServiceRef, SnapshotServiceRef,
     UploadWorkspaceResolverRef,
@@ -462,6 +463,25 @@ async fn copy_files(
 ) -> Result<Json<ApiResponse<CopyFilesResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     require_workspace_access(&state, &user, &req.workspace).await?;
+    let target_workspace = match req.target_relative_path.as_deref().map(str::trim) {
+        Some(relative) if !relative.is_empty() => {
+            if has_traversal(relative) || Path::new(relative).is_absolute() {
+                return Err(ApiError::BadRequest("invalid target_relative_path".to_owned()));
+            }
+            let workspace_root = std::fs::canonicalize(&req.workspace)
+                .map_err(|_| ApiError::NotFound("workspace not found".to_owned()))?;
+            let target = workspace_root.join(relative);
+            std::fs::create_dir_all(&target)
+                .map_err(|error| ApiError::Internal(format!("cannot create target directory: {error}")))?;
+            let canonical_target = std::fs::canonicalize(&target)
+                .map_err(|error| ApiError::Internal(format!("cannot resolve target directory: {error}")))?;
+            if !canonical_target.starts_with(&workspace_root) {
+                return Err(ApiError::BadRequest("invalid target_relative_path".to_owned()));
+            }
+            canonical_target.to_string_lossy().into_owned()
+        }
+        _ => req.workspace.clone(),
+    };
     if !user.is_admin {
         for path in &req.file_paths {
             state
@@ -477,7 +497,7 @@ async fn copy_files(
     }
     let result = state
         .file_service
-        .copy_files_to_workspace(&req.file_paths, &req.workspace, req.source_root.as_deref())
+        .copy_files_to_workspace(&req.file_paths, &target_workspace, req.source_root.as_deref())
         .await?;
     Ok(Json(ApiResponse::ok(to_copy_response(result))))
 }
