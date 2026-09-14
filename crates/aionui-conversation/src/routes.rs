@@ -11,7 +11,8 @@ use aionui_api_types::{
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse,
     ConversationRatingResponse, ConversationRatingVote, ConversationResponse, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    ConversationTurnPreviewListResponse, EnsureConversationRuntimeResponse, ListConversationsQuery,
+    ListMessagesQuery, MessageListResponse, MessageResponse,
     MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
     SubmitConversationRatingRequest, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
@@ -115,6 +116,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
+        .route("/api/conversations/{id}/turn-previews", get(list_turn_previews))
         .route("/api/conversations/{id}/ratings/{answerMessageId}", post(submit_rating))
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
@@ -463,6 +465,24 @@ async fn search_messages(
     let result = state
         .service
         .search_messages(&user.id, query)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+/// Return lightweight text-only conversation turns for the title search panel.
+///
+/// This endpoint must stay independent from the paginated full-message API:
+/// the renderer uses it to avoid loading an entire long conversation merely
+/// to build the local minimap/search index.
+async fn list_turn_previews(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<ConversationTurnPreviewListResponse>>, ApiError> {
+    let result = state
+        .service
+        .list_turn_previews(&user.id, &id)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))
