@@ -206,14 +206,13 @@ pub(super) async fn build(
         }
     }
 
-    warmup_guard.disarm();
-
     let instance = AgentInstance::Acp(Arc::clone(&arc));
 
     // Hand the service the domain event receiver so it can
     // persist user intent changes without reverse-engineering
     // them from CLI observations.
     deps.acp_agent_service.attach(ctx.conversation_id, domain_rx).await;
+    warmup_guard.disarm();
 
     Ok(instance)
 }
