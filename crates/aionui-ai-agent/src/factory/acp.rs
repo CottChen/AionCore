@@ -23,6 +23,34 @@ use tracing::{info, warn};
 
 use crate::runtime_status::{conversation_acp_tool_runtime_reporter, conversation_runtime_reporter};
 
+struct AcpWarmupGuard {
+    agent: Arc<AcpAgentManager>,
+    armed: bool,
+}
+
+impl AcpWarmupGuard {
+    fn new(agent: Arc<AcpAgentManager>) -> Self {
+        Self { agent, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AcpWarmupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let agent = Arc::clone(&self.agent);
+            tokio::spawn(async move {
+                agent
+                    .kill_and_wait(Some(aionui_common::AgentKillReason::AgentErrorRecovery))
+                    .await;
+            });
+        }
+    }
+}
+
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AcpSessionBuildContext,
@@ -136,6 +164,7 @@ pub(super) async fn build(
     let (agent, domain_rx, notification_rx) = AcpAgentManager::build(params, skill_mgr, &catalog_tx).await?;
 
     let arc = Arc::new(agent);
+    let mut warmup_guard = AcpWarmupGuard::new(Arc::clone(&arc));
     arc.start_permission_handler();
     arc.start_session_event_tracker(notification_rx);
     CatalogForwarder::spawn(
@@ -159,21 +188,25 @@ pub(super) async fn build(
     // ACP session/load can wait forever when the child process or transport
     // is half-dead. Bound initialization and terminate that private process
     // before returning, so a later turn can retry with a fresh connection.
-    let warmup = tokio::time::timeout(Duration::from_secs(120), arc.warmup_session()).await;
+    let warmup = tokio::time::timeout(Duration::from_secs(30), arc.warmup_session()).await;
     match warmup {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
+            warmup_guard.disarm();
             arc.kill_and_wait(Some(aionui_common::AgentKillReason::AgentErrorRecovery))
                 .await;
             return Err(err);
         }
         Err(_) => {
+            warmup_guard.disarm();
             warn!(conversation_id = %ctx.conversation_id, "ACP session warmup timed out; terminating child process");
             arc.kill_and_wait(Some(aionui_common::AgentKillReason::AgentErrorRecovery))
                 .await;
             return Err(AgentError::timeout("ACP session warmup timed out"));
         }
     }
+
+    warmup_guard.disarm();
 
     let instance = AgentInstance::Acp(Arc::clone(&arc));
 
