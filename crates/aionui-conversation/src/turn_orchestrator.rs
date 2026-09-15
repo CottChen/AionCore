@@ -95,40 +95,28 @@ impl ConversationTurnOrchestrator {
             "Agent task build started"
         );
 
-        let build = self.task_manager.get_or_build_task(&input.conv_id, input.build_options);
-        tokio::pin!(build);
-        let agent = loop {
-            tokio::select! {
-                result = &mut build => break match result {
-                    Ok(agent) => agent,
-                    Err(err) => {
-                        let top_level_code = agent_error_top_level_code(&err);
-                        let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, backend.as_deref());
-                        let failure_message = send_error_display_message(&send_error);
-                        error!(conversation_id = %input.conv_id, turn_id = %input.turn_id, error_code = ?send_error.code(), error = %ErrorChain(&err), "Agent task build failed");
-                        self.service.persist_and_broadcast_send_failure_tip(&input.conv_id, &input.turn_id, &send_error, Some(top_level_code)).await;
-                        return Err(ConversationTurnResult { status: ConversationTurnStatus::Failed, error_message: Some(failure_message) });
-                    }
-                },
-                _ = sleep(Duration::from_millis(200)) => {
-                    if self.service.runtime_state().is_cancelling(&input.conv_id) {
-                        warn!(conversation_id = %input.conv_id, turn_id = %input.turn_id, "Agent task build cancelled before ACP session became ready");
-                        self.task_manager.kill_and_wait(&input.conv_id, Some(aionui_common::AgentKillReason::UserCancelTimeout)).await;
+        let build_result = {
+            let build = self.task_manager.get_or_build_task(&input.conv_id, input.build_options);
+            tokio::pin!(build);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = async {
+                        loop {
+                            if self.service.runtime_state().lifecycle_for(&input.conv_id) != RuntimeLifecycleState::Active {
+                                break;
+                            }
+                            sleep(Duration::from_millis(100)).await;
+                        }
+                    } => {
+                        info!(conversation_id = %input.conv_id, turn_id = %input.turn_id, "Agent task build cancelled");
                         return Err(ConversationTurnResult { status: ConversationTurnStatus::Completed, error_message: None });
                     }
+                    result = &mut build => break result,
                 }
             }
         };
-        /*
-         * The build future is owned by this turn. Cancellation is observed
-         * while ACP session/load is pending, so the turn owner can release
-         * its claim instead of leaving the renderer in a permanent starting
-         * state.
-         */
-        /* legacy error handling below intentionally removed */
-        /*
-        let agent = match ...
-        {
+        let agent = match build_result {
             Ok(agent) => agent,
             Err(err) => {
                 let top_level_code = agent_error_top_level_code(&err);
@@ -159,7 +147,7 @@ impl ConversationTurnOrchestrator {
                 let failure_message = send_error_display_message(&send_error);
                 record_agent_session_failure(
                     &self.service,
-                    availability_agent_id.as_deref(),
+                    feedback_agent_id.as_deref(),
                     "session_build_failed",
                     &failure_message,
                 )
@@ -178,7 +166,15 @@ impl ConversationTurnOrchestrator {
                 });
             }
         };
-        */
+        if self.service.runtime_state().lifecycle_for(&input.conv_id) != RuntimeLifecycleState::Active {
+            self.task_manager
+                .kill_and_wait(&input.conv_id, Some(aionui_common::AgentKillReason::UserCancelTimeout))
+                .await;
+            return Err(ConversationTurnResult {
+                status: ConversationTurnStatus::Completed,
+                error_message: None,
+            });
+        }
 
         if let Err(err) = self
             .service

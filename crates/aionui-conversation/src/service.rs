@@ -3326,9 +3326,10 @@ impl ConversationService {
         }
 
         let Some(agent) = task_manager.get_task(conversation_id) else {
+            self.runtime_state.mark_cancelling(conversation_id);
             info!(
                 conversation_id,
-                turn_id, "No active agent to cancel; returning runtime summary"
+                turn_id, "Cancellation requested during agent initialization"
             );
             return Ok(CancelConversationResponse {
                 runtime: self.runtime_summary_for(conversation_id).await,
