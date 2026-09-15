@@ -582,22 +582,6 @@ impl ConversationService {
         let task_status = agent.as_ref().and_then(|agent| agent.status());
         let pending_confirmations = agent.as_ref().map(|agent| agent.get_confirmations().len()).unwrap_or(0);
 
-        // A forced ACP kill can leave the in-memory turn claim behind after
-        // the task and persisted conversation have already become idle.
-        // Reconcile that impossible state before exposing it to the renderer.
-        if !has_task
-            && task_status.is_none()
-            && !self
-                .conversation_repo
-                .get(conversation_id)
-                .await
-                .ok()
-                .flatten()
-                .is_some_and(|row| row.status.as_deref() == Some("running"))
-        {
-            self.runtime_state.clear_stale_turn(conversation_id);
-        }
-
         self.runtime_state
             .summary_from_parts(conversation_id, task_status, has_task, pending_confirmations)
     }
@@ -3347,7 +3331,6 @@ impl ConversationService {
                 conversation_id,
                 turn_id, "No active agent to cancel; returning runtime summary"
             );
-            self.runtime_state.clear_stale_turn(conversation_id);
             return Ok(CancelConversationResponse {
                 runtime: self.runtime_summary_for(conversation_id).await,
             });
@@ -3380,7 +3363,6 @@ impl ConversationService {
                     task_manager
                         .kill_and_wait(&conv_id, Some(AgentKillReason::UserCancelTimeout))
                         .await;
-                    runtime_state.clear_stale_turn(&conv_id);
                 }
             });
         }

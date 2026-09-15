@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::agent_task::AgentInstance;
 use crate::error::AgentError;
@@ -155,7 +156,24 @@ pub(super) async fn build(
     // session/new (or claude-meta-resume / session/load) and the first
     // reconcile pass have completed. Matches aionrs factory behaviour:
     // the caller sees "warmed up" == "ready for PUT /mode | /model".
-    arc.warmup_session().await?;
+    // ACP session/load can wait forever when the child process or transport
+    // is half-dead. Bound initialization and terminate that private process
+    // before returning, so a later turn can retry with a fresh connection.
+    let warmup = tokio::time::timeout(Duration::from_secs(120), arc.warmup_session()).await;
+    match warmup {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            arc.kill_and_wait(Some(aionui_common::AgentKillReason::AgentErrorRecovery))
+                .await;
+            return Err(err);
+        }
+        Err(_) => {
+            warn!(conversation_id = %ctx.conversation_id, "ACP session warmup timed out; terminating child process");
+            arc.kill_and_wait(Some(aionui_common::AgentKillReason::AgentErrorRecovery))
+                .await;
+            return Err(AgentError::timeout("ACP session warmup timed out"));
+        }
+    }
 
     let instance = AgentInstance::Acp(Arc::clone(&arc));
 

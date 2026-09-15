@@ -5,6 +5,7 @@ use aionui_ai_agent::{AgentError, AgentInstance, AgentSendError, AgentSessionKin
 use aionui_common::{AgentType, ConversationStatus, ErrorChain, now_ms};
 use aionui_db::models::ConversationRow;
 use tokio::sync::oneshot;
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
@@ -86,7 +87,7 @@ impl ConversationTurnOrchestrator {
 
     async fn run_attempt(&self, input: TurnAttemptInput) -> Result<TurnAttemptResult, ConversationTurnResult> {
         let build_started_at = now_ms();
-        let availability_agent_id = availability_agent_id(&input.build_options);
+        let feedback_agent_id = availability_agent_id(&input.build_options);
         let backend = acp_backend_from_build_options(&input.build_options).map(str::to_owned);
         info!(
             conversation_id = %input.conv_id,
@@ -94,10 +95,39 @@ impl ConversationTurnOrchestrator {
             "Agent task build started"
         );
 
-        let agent = match self
-            .task_manager
-            .get_or_build_task(&input.conv_id, input.build_options)
-            .await
+        let build = self.task_manager.get_or_build_task(&input.conv_id, input.build_options);
+        tokio::pin!(build);
+        let agent = loop {
+            tokio::select! {
+                result = &mut build => break match result {
+                    Ok(agent) => agent,
+                    Err(err) => {
+                        let top_level_code = agent_error_top_level_code(&err);
+                        let send_error = AgentSendError::from_agent_error_ref_for_backend(&err, backend.as_deref());
+                        let failure_message = send_error_display_message(&send_error);
+                        error!(conversation_id = %input.conv_id, turn_id = %input.turn_id, error_code = ?send_error.code(), error = %ErrorChain(&err), "Agent task build failed");
+                        self.service.persist_and_broadcast_send_failure_tip(&input.conv_id, &input.turn_id, &send_error, Some(top_level_code)).await;
+                        return Err(ConversationTurnResult { status: ConversationTurnStatus::Failed, error_message: Some(failure_message) });
+                    }
+                },
+                _ = sleep(Duration::from_millis(200)) => {
+                    if self.service.runtime_state().is_cancelling(&input.conv_id) {
+                        warn!(conversation_id = %input.conv_id, turn_id = %input.turn_id, "Agent task build cancelled before ACP session became ready");
+                        self.task_manager.kill_and_wait(&input.conv_id, Some(aionui_common::AgentKillReason::UserCancelTimeout)).await;
+                        return Err(ConversationTurnResult { status: ConversationTurnStatus::Completed, error_message: None });
+                    }
+                }
+            }
+        };
+        /*
+         * The build future is owned by this turn. Cancellation is observed
+         * while ACP session/load is pending, so the turn owner can release
+         * its claim instead of leaving the renderer in a permanent starting
+         * state.
+         */
+        /* legacy error handling below intentionally removed */
+        /*
+        let agent = match ...
         {
             Ok(agent) => agent,
             Err(err) => {
@@ -148,6 +178,7 @@ impl ConversationTurnOrchestrator {
                 });
             }
         };
+        */
 
         if let Err(err) = self
             .service
@@ -261,7 +292,7 @@ impl ConversationTurnOrchestrator {
             let conv_id_send = input.conv_id.clone();
             let turn_id_for_send = input.turn_id.clone();
             let feedback_service = self.service.clone();
-            let feedback_agent_id = availability_agent_id.clone();
+            let feedback_agent_id = feedback_agent_id.clone();
             let (send_error_tx, send_error_rx) = oneshot::channel();
 
             tokio::spawn(async move {
