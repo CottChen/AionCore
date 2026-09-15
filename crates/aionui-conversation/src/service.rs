@@ -1773,9 +1773,8 @@ impl ConversationService {
             .conversation_repo
             .list_paginated(user_id, &filters)
             .await
-            .map_err(|err| {
-                error!(error = %ErrorChain(&err), "Failed to query conversation list");
-                err
+            .inspect_err(|err| {
+                error!(error = %ErrorChain(err), "Failed to query conversation list");
             })?;
 
         // Tolerate per-row deserialization failures — a single legacy row

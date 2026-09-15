@@ -40,11 +40,11 @@ fn normalize_object(object: &mut Map<String, Value>) -> bool {
             let Value::Object(model) = model else {
                 return false;
             };
-            if !model.contains_key("modelId") {
-                if let Some(id) = model.remove("model_id").or_else(|| model.remove("id")) {
-                    model.insert("modelId".to_owned(), id);
-                    changed = true;
-                }
+            if !model.contains_key("modelId")
+                && let Some(id) = model.remove("model_id").or_else(|| model.remove("id"))
+            {
+                model.insert("modelId".to_owned(), id);
+                changed = true;
             }
             model
                 .get("modelId")
