@@ -2751,27 +2751,28 @@ impl ConversationService {
 
         let page = query.page.unwrap_or(1);
         let page_size = query.page_size.unwrap_or(20);
+        let user_only = query.user_only.unwrap_or(false);
 
         let started = Instant::now();
         let (result, cursor_mode) = if let Some(raw_cursor) = query.cursor.as_deref() {
-            let cursor = decode_search_message_cursor(raw_cursor, &query.keyword, user_id)?;
+            let cursor = decode_search_message_cursor(raw_cursor, &query.keyword, user_id, user_only)?;
             (
                 self.conversation_repo
-                    .search_messages_cursor(user_id, &query.keyword, Some(&cursor), page_size)
+                    .search_messages_cursor(user_id, &query.keyword, user_only, Some(&cursor), page_size)
                     .await?,
                 true,
             )
         } else if query.page.is_some() {
             (
                 self.conversation_repo
-                    .search_messages(user_id, &query.keyword, page, page_size)
+                    .search_messages(user_id, &query.keyword, user_only, page, page_size)
                     .await?,
                 false,
             )
         } else {
             (
                 self.conversation_repo
-                    .search_messages_cursor(user_id, &query.keyword, None, page_size)
+                    .search_messages_cursor(user_id, &query.keyword, user_only, None, page_size)
                     .await?,
                 true,
             )
@@ -2791,6 +2792,7 @@ impl ConversationService {
                         },
                         &query.keyword,
                         user_id,
+                        user_only,
                     )
                 })
                 .transpose()?
@@ -2812,6 +2814,7 @@ impl ConversationService {
             warn!(
                 page,
                 page_size,
+                user_only,
                 cursor_mode,
                 matches = items.len(),
                 query_ms = query_elapsed.as_millis(),
@@ -2823,6 +2826,7 @@ impl ConversationService {
             debug!(
                 page,
                 page_size,
+                user_only,
                 cursor_mode,
                 matches = items.len(),
                 query_ms = query_elapsed.as_millis(),

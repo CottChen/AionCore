@@ -2438,6 +2438,7 @@ mod tests {
                 &self,
                 _user_id: &str,
                 _keyword: &str,
+                _user_only: bool,
                 _page: u32,
                 _page_size: u32,
             ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
@@ -2905,6 +2906,7 @@ mod tests {
             &self,
             _user_id: &str,
             _keyword: &str,
+            _user_only: bool,
             _page: u32,
             _page_size: u32,
         ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
@@ -3099,6 +3101,7 @@ mod tests {
             &self,
             _user_id: &str,
             _keyword: &str,
+            _user_only: bool,
             _page: u32,
             _page_size: u32,
         ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {

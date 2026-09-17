@@ -767,6 +767,7 @@ impl IConversationRepository for SqliteConversationRepository {
         &self,
         user_id: &str,
         keyword: &str,
+        user_only: bool,
         page: u32,
         page_size: u32,
     ) -> Result<PaginatedResult<MessageSearchRow>, DbError> {
@@ -782,35 +783,41 @@ impl IConversationRepository for SqliteConversationRepository {
         } else {
             escaped_like_pattern(keyword)
         };
+        // The transcript on both sides is searchable by default; `user_only` narrows the
+        // scope to messages authored by the user (`position = 'right'`).
+        let scope_clause = if user_only { " AND m.position = 'right'" } else { "" };
 
         let total: i64 = if use_fts {
-            sqlx::query_scalar(
+            let count_sql = format!(
                 "SELECT COUNT(*) \
                  FROM message_text_search mts \
                  INNER JOIN messages m ON m.rowid = mts.rowid \
                  INNER JOIN conversations c ON m.conversation_id = c.id \
-                 WHERE c.user_id = ? AND m.position = 'right' AND m.type = 'text' AND message_text_search MATCH ?",
-            )
-            .bind(user_id)
-            .bind(&search_value)
-            .fetch_one(&self.pool)
-            .await?
+                 WHERE c.user_id = ? AND m.type = 'text'{scope_clause} AND message_text_search MATCH ?",
+            );
+            sqlx::query_scalar(&count_sql)
+                .bind(user_id)
+                .bind(&search_value)
+                .fetch_one(&self.pool)
+                .await?
         } else {
-            sqlx::query_scalar(
+            let count_sql = format!(
                 "SELECT COUNT(*) \
                  FROM message_text_search mts \
                  INNER JOIN messages m ON m.rowid = mts.rowid \
                  INNER JOIN conversations c ON m.conversation_id = c.id \
-                 WHERE c.user_id = ? AND m.position = 'right' AND m.type = 'text' AND mts.content LIKE ? ESCAPE '\\'",
-            )
-            .bind(user_id)
-            .bind(&search_value)
-            .fetch_one(&self.pool)
-            .await?
+                 WHERE c.user_id = ? AND m.type = 'text'{scope_clause} AND mts.content LIKE ? ESCAPE '\\'",
+            );
+            sqlx::query_scalar(&count_sql)
+                .bind(user_id)
+                .bind(&search_value)
+                .fetch_one(&self.pool)
+                .await?
         };
 
         let select_sql = if use_fts {
-            "SELECT \
+            format!(
+                "SELECT \
                 m.id AS message_id, m.type, m.content, m.created_at, \
                 c.id AS conversation_id, c.name AS conversation_name, c.type AS conversation_type, \
                 c.extra AS conversation_extra, c.model AS conversation_model, c.status AS conversation_status, \
@@ -820,11 +827,13 @@ impl IConversationRepository for SqliteConversationRepository {
              FROM message_text_search mts \
              INNER JOIN messages m ON m.rowid = mts.rowid \
              INNER JOIN conversations c ON m.conversation_id = c.id \
-             WHERE c.user_id = ? AND m.position = 'right' AND m.type = 'text' AND message_text_search MATCH ? \
+             WHERE c.user_id = ? AND m.type = 'text'{scope_clause} AND message_text_search MATCH ? \
              ORDER BY m.created_at DESC, m.id DESC \
              LIMIT ? OFFSET ?"
+            )
         } else {
-            "SELECT \
+            format!(
+                "SELECT \
                 m.id AS message_id, m.type, m.content, m.created_at, \
                 c.id AS conversation_id, c.name AS conversation_name, c.type AS conversation_type, \
                 c.extra AS conversation_extra, c.model AS conversation_model, c.status AS conversation_status, \
@@ -834,11 +843,12 @@ impl IConversationRepository for SqliteConversationRepository {
              FROM message_text_search mts \
              INNER JOIN messages m ON m.rowid = mts.rowid \
              INNER JOIN conversations c ON m.conversation_id = c.id \
-             WHERE c.user_id = ? AND m.position = 'right' AND m.type = 'text' AND mts.content LIKE ? ESCAPE '\\' \
+             WHERE c.user_id = ? AND m.type = 'text'{scope_clause} AND mts.content LIKE ? ESCAPE '\\' \
              ORDER BY m.created_at DESC, m.id DESC \
              LIMIT ? OFFSET ?"
+            )
         };
-        let rows = sqlx::query_as::<_, MessageSearchRow>(select_sql)
+        let rows = sqlx::query_as::<_, MessageSearchRow>(&select_sql)
             .bind(user_id)
             .bind(&search_value)
             .bind(fetch_limit)
@@ -864,6 +874,7 @@ impl IConversationRepository for SqliteConversationRepository {
         &self,
         user_id: &str,
         keyword: &str,
+        user_only: bool,
         cursor: Option<&MessagePageCursor>,
         page_size: u32,
     ) -> Result<PaginatedResult<MessageSearchRow>, DbError> {
@@ -876,6 +887,7 @@ impl IConversationRepository for SqliteConversationRepository {
         } else {
             escaped_like_pattern(keyword)
         };
+        let scope_clause = if user_only { " AND m.position = 'right'" } else { "" };
         let cursor_clause = if cursor.is_some() {
             " AND (m.created_at < ? OR (m.created_at = ? AND m.id < ?))"
         } else {
@@ -893,10 +905,9 @@ impl IConversationRepository for SqliteConversationRepository {
                  FROM message_text_search mts \
                  INNER JOIN messages m ON m.rowid = mts.rowid \
                  INNER JOIN conversations c ON m.conversation_id = c.id \
-                 WHERE c.user_id = ? AND m.position = 'right' AND m.type = 'text' AND message_text_search MATCH ?{} \
+                 WHERE c.user_id = ? AND m.type = 'text'{scope_clause} AND message_text_search MATCH ?{cursor_clause} \
                  ORDER BY m.created_at DESC, m.id DESC \
-                 LIMIT ?",
-                cursor_clause
+                 LIMIT ?"
             )
         } else {
             format!(
@@ -910,10 +921,9 @@ impl IConversationRepository for SqliteConversationRepository {
                  FROM message_text_search mts \
                  INNER JOIN messages m ON m.rowid = mts.rowid \
                  INNER JOIN conversations c ON m.conversation_id = c.id \
-                 WHERE c.user_id = ? AND m.position = 'right' AND m.type = 'text' AND mts.content LIKE ? ESCAPE '\\\\'{} \
+                 WHERE c.user_id = ? AND m.type = 'text'{scope_clause} AND mts.content LIKE ? ESCAPE '\\'{cursor_clause} \
                  ORDER BY m.created_at DESC, m.id DESC \
-                 LIMIT ?",
-                cursor_clause
+                 LIMIT ?"
             )
         };
 
@@ -1890,7 +1900,10 @@ mod tests {
         msg2.content = r#"{"content":"Python 测试"}"#.to_string();
         repo.insert_message(&msg2).await.unwrap();
 
-        let result = repo.search_messages(SYSTEM_USER_ID, "审查", 1, 20).await.unwrap();
+        let result = repo
+            .search_messages(SYSTEM_USER_ID, "审查", false, 1, 20)
+            .await
+            .unwrap();
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.total, 1);
         assert_eq!(result.items[0].conversation_name, "Test Conversation");
@@ -1906,7 +1919,7 @@ mod tests {
         repo.insert_message(&msg).await.unwrap();
 
         let result = repo
-            .search_messages(SYSTEM_USER_ID, "xxxxnotexist", 1, 20)
+            .search_messages(SYSTEM_USER_ID, "xxxxnotexist", false, 1, 20)
             .await
             .unwrap();
         assert!(result.items.is_empty());
@@ -1927,7 +1940,10 @@ mod tests {
             repo.insert_message(&msg).await.unwrap();
         }
 
-        let result = repo.search_messages(SYSTEM_USER_ID, "keyword", 1, 2).await.unwrap();
+        let result = repo
+            .search_messages(SYSTEM_USER_ID, "keyword", false, 1, 2)
+            .await
+            .unwrap();
         assert_eq!(result.items.len(), 2);
         assert_eq!(result.total, 5);
         assert!(result.has_more);
@@ -1948,7 +1964,7 @@ mod tests {
         }
 
         let first = repo
-            .search_messages_cursor(SYSTEM_USER_ID, "keyword", None, 2)
+            .search_messages_cursor(SYSTEM_USER_ID, "keyword", false, None, 2)
             .await
             .unwrap();
         assert_eq!(first.items.len(), 2);
@@ -1959,12 +1975,96 @@ mod tests {
             id: first.items[1].message_id.clone(),
         };
         let second = repo
-            .search_messages_cursor(SYSTEM_USER_ID, "keyword", Some(&cursor), 2)
+            .search_messages_cursor(SYSTEM_USER_ID, "keyword", false, Some(&cursor), 2)
             .await
             .unwrap();
         assert_eq!(second.items.len(), 2);
         assert!(second.items.iter().all(|item| item.created_at < cursor.created_at));
         assert!(second.has_more);
+    }
+
+    #[tokio::test]
+    async fn search_messages_defaults_to_whole_transcript() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        // `position = 'left'` marks assistant output; it must be searchable by default.
+        let mut assistant = sample_message(&conv.id);
+        assistant.position = Some("left".to_string());
+        assistant.content = r#"{"content":"assistant keyword answer"}"#.to_string();
+        repo.insert_message(&assistant).await.unwrap();
+
+        let paged = repo
+            .search_messages(SYSTEM_USER_ID, "keyword", false, 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(paged.total, 1);
+        assert_eq!(paged.items[0].message_id, assistant.id);
+
+        let cursor_page = repo
+            .search_messages_cursor(SYSTEM_USER_ID, "keyword", false, None, 20)
+            .await
+            .unwrap();
+        assert_eq!(cursor_page.items.len(), 1);
+        assert_eq!(cursor_page.items[0].message_id, assistant.id);
+    }
+
+    #[tokio::test]
+    async fn search_messages_user_only_excludes_assistant_messages() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        let mut user = sample_message(&conv.id);
+        user.content = r#"{"content":"keyword from user"}"#.to_string();
+        repo.insert_message(&user).await.unwrap();
+
+        let mut assistant = sample_message(&conv.id);
+        assistant.id = aionui_common::generate_prefixed_id("msg");
+        assistant.position = Some("left".to_string());
+        assistant.content = r#"{"content":"keyword from assistant"}"#.to_string();
+        repo.insert_message(&assistant).await.unwrap();
+
+        let whole = repo
+            .search_messages(SYSTEM_USER_ID, "keyword", false, 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(whole.total, 2);
+
+        let user_only = repo
+            .search_messages(SYSTEM_USER_ID, "keyword", true, 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(user_only.total, 1);
+        assert_eq!(user_only.items[0].message_id, user.id);
+
+        let user_only_cursor = repo
+            .search_messages_cursor(SYSTEM_USER_ID, "keyword", true, None, 20)
+            .await
+            .unwrap();
+        assert_eq!(user_only_cursor.items.len(), 1);
+        assert_eq!(user_only_cursor.items[0].message_id, user.id);
+    }
+
+    #[tokio::test]
+    async fn search_messages_cursor_supports_short_keywords() {
+        let (repo, _db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+
+        // Keywords shorter than three characters take the LIKE branch, which must stay
+        // valid under cursor pagination (single-character ESCAPE clause).
+        let mut message = sample_message(&conv.id);
+        message.content = r#"{"content":"数据"}"#.to_string();
+        repo.insert_message(&message).await.unwrap();
+
+        let page = repo
+            .search_messages_cursor(SYSTEM_USER_ID, "数据", false, None, 20)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].message_id, message.id);
     }
 
     #[tokio::test]
@@ -1983,7 +2083,10 @@ mod tests {
         tool.content = r#"{"content":"hidden needle"}"#.to_string();
         repo.insert_message(&tool).await.unwrap();
 
-        let result = repo.search_messages(SYSTEM_USER_ID, "needle", 1, 20).await.unwrap();
+        let result = repo
+            .search_messages(SYSTEM_USER_ID, "needle", false, 1, 20)
+            .await
+            .unwrap();
         assert_eq!(result.total, 1);
         assert_eq!(result.items[0].message_id, text.id);
     }
@@ -2001,11 +2104,11 @@ mod tests {
         repo.insert_message(&message).await.unwrap();
 
         let first = repo
-            .search_messages(SYSTEM_USER_ID, "document for search", 1, 20)
+            .search_messages(SYSTEM_USER_ID, "document for search", false, 1, 20)
             .await
             .unwrap();
         let nested = repo
-            .search_messages(SYSTEM_USER_ID, "feature implementation", 1, 20)
+            .search_messages(SYSTEM_USER_ID, "feature implementation", false, 1, 20)
             .await
             .unwrap();
         assert_eq!(first.total, 1);
@@ -2029,11 +2132,14 @@ mod tests {
             repo.insert_message(&message).await.unwrap();
         }
 
-        let chinese = repo.search_messages(SYSTEM_USER_ID, "数据", 1, 20).await.unwrap();
+        let chinese = repo
+            .search_messages(SYSTEM_USER_ID, "数据", false, 1, 20)
+            .await
+            .unwrap();
         assert_eq!(chinese.total, 1);
         assert_eq!(chinese.items[0].message_id, "short-cn");
 
-        let percent = repo.search_messages(SYSTEM_USER_ID, "%", 1, 20).await.unwrap();
+        let percent = repo.search_messages(SYSTEM_USER_ID, "%", false, 1, 20).await.unwrap();
         assert_eq!(percent.total, 1);
         assert_eq!(percent.items[0].message_id, "literal-percent");
     }
@@ -2059,14 +2165,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            repo.search_messages(SYSTEM_USER_ID, "before", 1, 20)
+            repo.search_messages(SYSTEM_USER_ID, "before", false, 1, 20)
                 .await
                 .unwrap()
                 .total,
             0
         );
         assert_eq!(
-            repo.search_messages(SYSTEM_USER_ID, "after", 1, 20)
+            repo.search_messages(SYSTEM_USER_ID, "after", false, 1, 20)
                 .await
                 .unwrap()
                 .total,
@@ -2075,7 +2181,7 @@ mod tests {
 
         repo.delete_messages_by_conversation(&conv.id).await.unwrap();
         assert_eq!(
-            repo.search_messages(SYSTEM_USER_ID, "after", 1, 20)
+            repo.search_messages(SYSTEM_USER_ID, "after", false, 1, 20)
                 .await
                 .unwrap()
                 .total,
@@ -2105,7 +2211,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            repo.search_messages(SYSTEM_USER_ID, "streaming", 1, 20)
+            repo.search_messages(SYSTEM_USER_ID, "streaming", false, 1, 20)
                 .await
                 .unwrap()
                 .total,
@@ -2123,7 +2229,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            repo.search_messages(SYSTEM_USER_ID, "searchable answer", 1, 20)
+            repo.search_messages(SYSTEM_USER_ID, "searchable answer", false, 1, 20)
                 .await
                 .unwrap()
                 .total,

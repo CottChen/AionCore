@@ -136,10 +136,15 @@ pub trait IConversationRepository: Send + Sync {
     }
 
     /// Full-text search across messages, joining conversation name.
+    ///
+    /// `user_only` narrows the search to messages authored by the user
+    /// (`position = 'right'`); pass `false` to search the whole transcript,
+    /// assistant replies included.
     async fn search_messages(
         &self,
         user_id: &str,
         keyword: &str,
+        user_only: bool,
         page: u32,
         page_size: u32,
     ) -> Result<PaginatedResult<MessageSearchRow>, DbError>;
@@ -149,11 +154,12 @@ pub trait IConversationRepository: Send + Sync {
         &self,
         user_id: &str,
         keyword: &str,
+        user_only: bool,
         cursor: Option<&MessagePageCursor>,
         page_size: u32,
     ) -> Result<PaginatedResult<MessageSearchRow>, DbError> {
         let _ = cursor;
-        self.search_messages(user_id, keyword, 1, page_size).await
+        self.search_messages(user_id, keyword, user_only, 1, page_size).await
     }
 
     /// Returns persisted conversation artifacts ordered by `created_at`.

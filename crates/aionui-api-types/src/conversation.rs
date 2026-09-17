@@ -226,6 +226,9 @@ pub struct SearchMessagesQuery {
     pub keyword: String,
     /// Opaque cursor returned by the previous page. Results are ordered newest first.
     pub cursor: Option<String>,
+    /// When `true`, only messages authored by the user are searched. Defaults to `false`,
+    /// which searches the whole transcript, assistant replies included.
+    pub user_only: Option<bool>,
     pub page: Option<u32>,
     pub page_size: Option<u32>,
 }
@@ -908,7 +911,6 @@ mod tests {
             }],
             total: 1,
             has_more: false,
-            next_cursor: None,
         };
         let json = serde_json::to_value(&list).unwrap();
         assert_eq!(json["items"].as_array().unwrap().len(), 1);

@@ -841,7 +841,7 @@ async fn search_messages_across_conversations() {
     let msg3 = make_message(&c1.id, "unrelated content");
     repo.insert_message(&msg3).await.unwrap();
 
-    let result = repo.search_messages(USER_ID, "审查", 1, 20).await.unwrap();
+    let result = repo.search_messages(USER_ID, "审查", false, 1, 20).await.unwrap();
     assert_eq!(result.total, 2);
     assert_eq!(result.items.len(), 2);
 
@@ -861,7 +861,7 @@ async fn search_messages_empty_result() {
     repo.insert_message(&msg).await.unwrap();
 
     let result = repo
-        .search_messages(USER_ID, "nonexistent_keyword", 1, 20)
+        .search_messages(USER_ID, "nonexistent_keyword", false, 1, 20)
         .await
         .unwrap();
     assert!(result.items.is_empty());
@@ -881,16 +881,16 @@ async fn search_messages_pagination() {
         repo.insert_message(&msg).await.unwrap();
     }
 
-    let p1 = repo.search_messages(USER_ID, "searchable", 1, 2).await.unwrap();
+    let p1 = repo.search_messages(USER_ID, "searchable", false, 1, 2).await.unwrap();
     assert_eq!(p1.items.len(), 2);
     assert_eq!(p1.total, 5);
     assert!(p1.has_more);
 
-    let p2 = repo.search_messages(USER_ID, "searchable", 2, 2).await.unwrap();
+    let p2 = repo.search_messages(USER_ID, "searchable", false, 2, 2).await.unwrap();
     assert_eq!(p2.items.len(), 2);
     assert!(p2.has_more);
 
-    let p3 = repo.search_messages(USER_ID, "searchable", 3, 2).await.unwrap();
+    let p3 = repo.search_messages(USER_ID, "searchable", false, 3, 2).await.unwrap();
     assert_eq!(p3.items.len(), 1);
     assert!(!p3.has_more);
 }

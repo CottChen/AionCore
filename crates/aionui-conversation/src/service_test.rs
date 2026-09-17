@@ -569,6 +569,7 @@ impl IConversationRepository for MockRepo {
         &self,
         _user_id: &str,
         _keyword: &str,
+        _user_only: bool,
         _page: u32,
         _page_size: u32,
     ) -> Result<PaginatedResult<MessageSearchRow>, aionui_db::DbError> {
@@ -2449,6 +2450,7 @@ async fn search_messages_empty_keyword_returns_bad_request() {
 
     let query = SearchMessagesQuery {
         keyword: "".into(),
+        user_only: None,
         cursor: None,
         page: None,
         page_size: None,
@@ -2463,6 +2465,7 @@ async fn search_messages_whitespace_keyword_returns_bad_request() {
 
     let query = SearchMessagesQuery {
         keyword: "   ".into(),
+        user_only: None,
         cursor: None,
         page: None,
         page_size: None,
