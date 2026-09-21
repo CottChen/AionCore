@@ -716,22 +716,26 @@ impl AcpSession {
         models
     }
 
-    fn preserve_desired_model_in_catalog(&self, models: SessionModelState) -> SessionModelState {
-        let Some(desired_model) = self.desired.model_id.as_ref() else {
-            return models;
-        };
-        let desired_model_id = desired_model.as_str();
-        if models.current_model_id.to_string() == desired_model_id {
-            return models;
+    /// Align future reconciliation only after the CLI has confirmed a config value.
+    /// Keeping a previous startup selection here would undo a successful user switch.
+    pub(crate) fn confirm_config_selection(&mut self, option_id: &str, value: &str) -> bool {
+        if !self.config_snapshot().observed_matches(option_id, value) {
+            return false;
         }
-        if models
-            .available_models
-            .iter()
-            .any(|model| model.model_id.to_string() == desired_model_id)
-        {
-            return SessionModelState::new(desired_model_id.to_owned(), models.available_models.clone());
+        let category = self.advertised.config_options.as_ref().and_then(|options| {
+            options
+                .iter()
+                .find(|option| option.id.to_string() == option_id)
+                .and_then(|option| option.category.clone())
+        });
+        if let Some(category) = category {
+            self.clear_legacy_desired_for_config_category(&category);
+            self.desired
+                .pending_startup_config
+                .retain(|seed| seed.category != category);
         }
-        models
+        self.set_desired_config(ConfigKey::new(option_id), ConfigValue::new(value));
+        true
     }
 
     pub fn apply_advertised_config_options(&mut self, options: Vec<SessionConfigOption>) {
@@ -764,7 +768,8 @@ impl AcpSession {
         }
 
         if let Some(models) = derive_models_from_config_options(&options) {
-            self.apply_advertised_models(self.preserve_desired_model_in_catalog(models));
+            // Observations must reflect the CLI, never a desired model substituted locally.
+            self.apply_advertised_models(models);
         }
 
         let mut changed = false;

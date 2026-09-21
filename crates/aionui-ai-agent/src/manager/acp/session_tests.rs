@@ -892,7 +892,7 @@ fn apply_advertised_config_options_merges_partial_updates_and_keeps_model_reason
 }
 
 #[test]
-fn apply_advertised_config_options_preserves_confirmed_explicit_model_when_current_values_lag() {
+fn apply_advertised_config_options_reports_cli_model_even_when_desired_model_differs() {
     let mut session = make_session();
     session.apply_advertised_config_options(vec![
         SessionConfigOption::select(
@@ -947,10 +947,51 @@ fn apply_advertised_config_options_preserves_confirmed_explicit_model_when_curre
     let models = session.model_info().expect("model catalog");
     assert_eq!(
         models.current_model_id.to_string(),
-        "gpt-5.4",
-        "lagging config option current values must not overwrite an explicitly confirmed model"
+        "gpt-5.5",
+        "desired state must not fabricate an observed model different from config_options"
     );
     assert_eq!(models.available_models.len(), 2);
+}
+
+#[test]
+fn confirmed_config_switch_replaces_startup_selection_without_rollback() {
+    let mut session = AcpSession::new(None, None, Default::default());
+    let options = |current: &str| {
+        vec![
+            SessionConfigOption::select(
+                "model",
+                "Model",
+                current.to_owned(),
+                vec![
+                    SessionConfigSelectOption::new("old", "Old"),
+                    SessionConfigSelectOption::new("new", "New"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Model),
+        ]
+    };
+    session.apply_advertised_config_options(options("old"));
+    session.set_desired_config(ConfigKey::new("model"), ConfigValue::new("old"));
+    assert!(!session.confirm_config_selection("model", "new"));
+    assert_eq!(
+        session
+            .desired_config_selections()
+            .get(&ConfigKey::new("model"))
+            .unwrap()
+            .as_str(),
+        "old"
+    );
+    session.apply_advertised_config_options(options("new"));
+    assert!(session.confirm_config_selection("model", "new"));
+    assert!(
+        session.plan_reconcile().is_empty(),
+        "next prompt must not restore the old model"
+    );
+    assert_eq!(session.observed_model(), Some("new"));
+    assert_eq!(
+        session.config_snapshot().option_current("model").as_deref(),
+        Some("new")
+    );
 }
 
 #[test]

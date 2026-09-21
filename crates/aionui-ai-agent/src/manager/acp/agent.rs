@@ -738,6 +738,7 @@ impl AcpAgentManager {
                     self.commit_session_changes(&mut session).await;
                 }
                 self.wait_for_observed_config_option(
+                    &session_id,
                     &config_id,
                     &resolved_value,
                     OBSERVED_CONFIRMATION_TIMEOUT,
@@ -898,6 +899,7 @@ impl AcpAgentManager {
 
     async fn wait_for_observed_config_option(
         &self,
+        expected_session_id: &str,
         option_id: &str,
         requested: &str,
         timeout: Duration,
@@ -907,7 +909,15 @@ impl AcpAgentManager {
         let started = Instant::now();
         loop {
             let snapshot = {
-                let session = self.session.read().await;
+                let mut session = self.session.write().await;
+                if session.session_id() != Some(expected_session_id) {
+                    return Err(AgentError::conflict(
+                        "Active ACP session changed while confirming config option",
+                    ));
+                }
+                if session.confirm_config_selection(option_id, requested) {
+                    self.commit_session_changes(&mut session).await;
+                }
                 session.config_snapshot()
             };
             if snapshot.observed_matches(option_id, requested) {
