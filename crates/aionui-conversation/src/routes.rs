@@ -113,6 +113,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/associated", get(associated))
+        .route("/api/conversations/{id}/native-sessions", get(native_sessions))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
         .route("/api/conversations/{id}/turn-previews", get(list_turn_previews))
@@ -130,6 +131,19 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/clone", post(clone))
         .route("/api/messages/search", get(search_messages))
         .with_state(state)
+}
+
+async fn native_sessions(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<aionui_api_types::NativeSessionsQuery>,
+) -> Result<Json<ApiResponse<aionui_api_types::NativeSessionsResponse>>, ApiError> {
+    let result = state
+        .service
+        .native_sessions(&user.id, user.is_admin, &id, query)
+        .await?;
+    Ok(Json(ApiResponse::ok(result)))
 }
 
 #[derive(serde::Deserialize)]

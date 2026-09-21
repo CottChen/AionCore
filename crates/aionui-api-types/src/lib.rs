@@ -1,6 +1,8 @@
 #![warn(clippy::disallowed_types)]
 
 //! All HTTP request/response DTOs shared across the API surface.
+mod native_sessions;
+pub use native_sessions::*;
 mod acp;
 mod acp_prompt_hook;
 mod agent_build_extra;

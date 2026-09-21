@@ -35,6 +35,57 @@ fn create_body_with_extra(name: &str, extra: serde_json::Value) -> serde_json::V
     })
 }
 
+#[tokio::test]
+async fn native_sessions_requires_auth_and_returns_project_scoped_metadata() {
+    let (mut app, services) = build_app().await;
+    let unauthenticated = app
+        .clone()
+        .oneshot(get_request("/api/conversations/missing/native-sessions?backend=pi"))
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let created = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/conversations",
+            create_body("Native catalog"),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = body_json(created).await;
+    let id = created["data"]["id"].as_str().unwrap();
+    let url = format!("/api/conversations/{id}/native-sessions?backend=pi");
+    let result = app.clone().oneshot(get_with_token(&url, &token)).await.unwrap();
+    assert_eq!(result.status(), StatusCode::OK);
+    let data = body_json(result).await;
+    assert_eq!(data["data"]["conversation_id"], id);
+    assert_eq!(data["data"]["workspace"], created["data"]["extra"]["workspace"]);
+    assert_eq!(data["data"]["items"], json!([]));
+    assert_eq!(data["data"]["status"], "missing");
+    let missing = app
+        .clone()
+        .oneshot(get_with_token(
+            "/api/conversations/missing/native-sessions?backend=pi",
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let invalid = app
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{id}/native-sessions?backend=invalid"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
 // ── T1: Create ────────────────────────────────────────────────────────
 
 #[tokio::test]

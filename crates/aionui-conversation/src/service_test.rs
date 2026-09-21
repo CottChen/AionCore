@@ -1911,6 +1911,52 @@ async fn get_not_found() {
     assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
+#[tokio::test]
+async fn native_sessions_rejects_non_admin_and_cross_user_access() {
+    use aionui_api_types::{NativeSessionBackend, NativeSessionsQuery};
+    let (svc, _, _, _) = make_service();
+    let created = svc.create("user_1", make_create_req()).await.unwrap();
+    let query = || NativeSessionsQuery {
+        backend: NativeSessionBackend::Pi,
+        cursor: None,
+    };
+    let error = svc
+        .native_sessions("user_1", false, &created.id, query())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::Forbidden { .. }));
+    let error = svc
+        .native_sessions("user_2", true, &created.id, query())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::NotFound { .. }));
+    let error = svc
+        .native_sessions("user_1", true, "missing-id", query())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::NotFound { .. }));
+}
+
+#[tokio::test]
+async fn native_sessions_rejects_invalid_cursor_before_reading_storage() {
+    use aionui_api_types::{NativeSessionBackend, NativeSessionsQuery};
+    let (svc, _, _, _) = make_service();
+    let created = svc.create("user_1", make_create_req()).await.unwrap();
+    let error = svc
+        .native_sessions(
+            "user_1",
+            true,
+            &created.id,
+            NativeSessionsQuery {
+                backend: NativeSessionBackend::Pi,
+                cursor: Some("invalid!".to_owned()),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::BadRequest { reason } if reason == "Invalid native session cursor"));
+}
+
 // ── List tests ─────────────────────────────────────────────────────
 
 #[tokio::test]

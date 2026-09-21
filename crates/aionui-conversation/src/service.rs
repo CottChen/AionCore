@@ -1754,6 +1754,51 @@ impl ConversationService {
         Ok(response)
     }
 
+    /// Read host CLI session catalogs only for an administrator's own conversation workspace.
+    /// Catalogs are host-user data, not isolated by AionUI account; never expose them to ordinary WebUI users.
+    pub async fn native_sessions(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        id: &str,
+        query: aionui_api_types::NativeSessionsQuery,
+    ) -> Result<aionui_api_types::NativeSessionsResponse, ConversationError> {
+        if !is_admin {
+            return Err(ConversationError::Forbidden {
+                reason: "Native CLI sessions require administrator access".to_owned(),
+            });
+        }
+        let conversation = self.get(user_id, id).await?;
+        let workspace = conversation
+            .extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| ConversationError::bad_request("Conversation has no workspace"))?
+            .to_owned();
+        let cursor = crate::native_sessions::decode_cursor(query.cursor.as_deref(), query.backend, &workspace)?;
+        let session = self.acp_session_repo.get(id).await?;
+        let (mut items, status) = match crate::native_sessions::native_root(query.backend) {
+            Some(root) => crate::native_sessions::read_catalog(&root, query.backend, &workspace, cursor.as_ref()).await,
+            None => (vec![], "missing".to_owned()),
+        };
+        let next_cursor = crate::native_sessions::page(&mut items, query.backend, &workspace);
+        Ok(aionui_api_types::NativeSessionsResponse {
+            conversation_id: id.to_owned(),
+            current_session_id: session.and_then(|row| row.session_id),
+            current_backend: conversation
+                .extra
+                .get("backend")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            backend: query.backend,
+            workspace,
+            items,
+            next_cursor,
+            status,
+        })
+    }
+
     /// List conversations with cursor-based pagination and optional filters.
     #[tracing::instrument(skip_all, fields(user_id = %user_id))]
     pub async fn list(

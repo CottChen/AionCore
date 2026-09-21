@@ -7,6 +7,7 @@ mod convert;
 pub mod error;
 pub(crate) mod message_cursor;
 mod message_persistence;
+mod native_sessions;
 pub mod response_middleware;
 pub mod routes;
 pub mod routes_aux;
