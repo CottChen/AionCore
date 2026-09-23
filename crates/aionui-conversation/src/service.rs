@@ -1799,6 +1799,40 @@ impl ConversationService {
         })
     }
 
+    /// Read the host-wide CLI catalog. Host session data is administrator-only.
+    pub async fn native_session_catalog(
+        &self,
+        is_admin: bool,
+        query: aionui_api_types::NativeSessionsQuery,
+    ) -> Result<aionui_api_types::NativeSessionCatalogResponse, ConversationError> {
+        if !is_admin {
+            return Err(ConversationError::Forbidden {
+                reason: "Native CLI sessions require administrator access".to_owned(),
+            });
+        }
+        crate::native_sessions::catalog::list(query.backend, query.cursor.as_deref(), query.search.as_deref())
+            .await
+            .map_err(crate::native_sessions::browser_error)
+    }
+
+    /// Read one page of a host CLI session without starting or modifying the CLI.
+    pub async fn native_session_detail(
+        &self,
+        is_admin: bool,
+        backend: aionui_api_types::NativeSessionBackend,
+        id: &str,
+        query: aionui_api_types::NativeSessionDetailQuery,
+    ) -> Result<aionui_api_types::NativeSessionDetailResponse, ConversationError> {
+        if !is_admin {
+            return Err(ConversationError::Forbidden {
+                reason: "Native CLI sessions require administrator access".to_owned(),
+            });
+        }
+        crate::native_sessions::detail::get(backend, id, query.cursor.as_deref(), query.limit)
+            .await
+            .map_err(crate::native_sessions::browser_error)
+    }
+
     /// List conversations with cursor-based pagination and optional filters.
     #[tracing::instrument(skip_all, fields(user_id = %user_id))]
     pub async fn list(

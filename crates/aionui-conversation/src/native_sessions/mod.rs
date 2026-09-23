@@ -10,10 +10,11 @@ use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 use crate::ConversationError;
 
 pub(crate) const PAGE_SIZE: usize = 20;
-static CATALOG_READS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+pub(crate) const DETAIL_PAGE_SIZE: usize = 20;
+pub(crate) static CATALOG_READS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)));
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Cursor {
     backend: NativeSessionBackend,
     workspace: String,
@@ -173,6 +174,8 @@ pub(crate) async fn read_catalog(
                     title: row.try_get("title")?,
                     workspace: workspace.to_owned(),
                     updated_at: row.try_get::<i64, _>("updated")?.saturating_mul(scale),
+                    created_at: None,
+                    model: None,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()?;
@@ -268,6 +271,8 @@ fn read_pi(root: &Path, workspace: &str, after: Option<&(i64, String)>) -> (Vec<
                 title: String::new(),
                 workspace: workspace.to_owned(),
                 updated_at,
+                created_at: None,
+                model: None,
             },
             entry.path(),
         ));
@@ -309,6 +314,25 @@ fn read_pi(root: &Path, workspace: &str, after: Option<&(i64, String)>) -> (Vec<
     )
 }
 
+pub(crate) fn browser_error(status: String) -> ConversationError {
+    match status.as_str() {
+        "bad_request" => ConversationError::bad_request("Invalid native session request or cursor"),
+        "stale_cursor" => ConversationError::Busy {
+            reason: "Native session changed or catalog expired; refresh to continue".into(),
+        },
+        "missing" => ConversationError::not_found_reason("Native session storage or session not found"),
+        "unsupported_schema" | "partial" => ConversationError::Unprocessable {
+            reason: "Native session format is unsupported or discovery limit was reached".into(),
+        },
+        _ => ConversationError::internal("Native session storage could not be read"),
+    }
+}
+
+pub(crate) mod catalog;
+pub(crate) mod detail;
+mod pi_files;
+mod transcript;
+
 #[cfg(test)]
-#[path = "native_sessions_test.rs"]
+#[path = "tests.rs"]
 mod tests;

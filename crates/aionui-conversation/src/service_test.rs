@@ -1919,6 +1919,7 @@ async fn native_sessions_rejects_non_admin_and_cross_user_access() {
     let query = || NativeSessionsQuery {
         backend: NativeSessionBackend::Pi,
         cursor: None,
+        search: None,
     };
     let error = svc
         .native_sessions("user_1", false, &created.id, query())
@@ -1950,11 +1951,60 @@ async fn native_sessions_rejects_invalid_cursor_before_reading_storage() {
             NativeSessionsQuery {
                 backend: NativeSessionBackend::Pi,
                 cursor: Some("invalid!".to_owned()),
+                search: None,
             },
         )
         .await
         .unwrap_err();
     assert!(matches!(error, ConversationError::BadRequest { reason } if reason == "Invalid native session cursor"));
+}
+
+#[tokio::test]
+async fn native_sessions_global_catalog_and_content_are_admin_only() {
+    use aionui_api_types::{NativeSessionBackend, NativeSessionDetailQuery, NativeSessionsQuery};
+    let (service, _, _, _) = make_service();
+    let list_error = service
+        .native_session_catalog(
+            false,
+            NativeSessionsQuery {
+                backend: NativeSessionBackend::Codex,
+                cursor: None,
+                search: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(list_error, ConversationError::Forbidden { reason } if reason == "Native CLI sessions require administrator access")
+    );
+    let detail_error = service
+        .native_session_detail(
+            false,
+            NativeSessionBackend::Pi,
+            "session-id",
+            NativeSessionDetailQuery {
+                cursor: None,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(detail_error, ConversationError::Forbidden { reason } if reason == "Native CLI sessions require administrator access")
+    );
+    let invalid = service
+        .native_session_detail(
+            true,
+            NativeSessionBackend::Pi,
+            "session-id",
+            NativeSessionDetailQuery {
+                cursor: None,
+                limit: Some(10000),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid, ConversationError::BadRequest { .. }));
 }
 
 // ── List tests ─────────────────────────────────────────────────────

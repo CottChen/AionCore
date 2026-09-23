@@ -86,6 +86,24 @@ async fn native_sessions_requires_auth_and_returns_project_scoped_metadata() {
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn native_sessions_browser_routes_require_auth_and_validate_cursors() {
+    let (mut app, services) = build_app().await;
+    for path in ["/api/native-sessions?backend=pi", "/api/native-sessions/codex/id"] {
+        let response = app.clone().oneshot(get_request(path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let (token, _) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    for path in [
+        "/api/native-sessions?backend=codex&cursor=invalid",
+        "/api/native-sessions?backend=invalid",
+        "/api/native-sessions/pi/id?limit=10000",
+    ] {
+        let response = app.clone().oneshot(get_with_token(path, &token)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
 // ── T1: Create ────────────────────────────────────────────────────────
 
 #[tokio::test]

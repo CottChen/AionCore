@@ -114,6 +114,8 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/native-sessions", get(native_sessions))
+        .route("/api/native-sessions", get(native_session_catalog))
+        .route("/api/native-sessions/{backend}/{id}", get(native_session_detail))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
         .route("/api/conversations/{id}/turn-previews", get(list_turn_previews))
@@ -144,6 +146,30 @@ async fn native_sessions(
         .native_sessions(&user.id, user.is_admin, &id, query)
         .await?;
     Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn native_session_catalog(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Query(query): Query<aionui_api_types::NativeSessionsQuery>,
+) -> Result<Json<ApiResponse<aionui_api_types::NativeSessionCatalogResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state.service.native_session_catalog(user.is_admin, query).await?,
+    )))
+}
+
+async fn native_session_detail(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((backend, id)): Path<(aionui_api_types::NativeSessionBackend, String)>,
+    Query(query): Query<aionui_api_types::NativeSessionDetailQuery>,
+) -> Result<Json<ApiResponse<aionui_api_types::NativeSessionDetailResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .native_session_detail(user.is_admin, backend, &id, query)
+            .await?,
+    )))
 }
 
 #[derive(serde::Deserialize)]
