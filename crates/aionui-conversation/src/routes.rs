@@ -12,8 +12,9 @@ use aionui_api_types::{
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse,
     ConversationRatingResponse, ConversationRatingVote, ConversationResponse, ConversationTurnPreviewListResponse,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
-    MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, SubmitConversationRatingRequest, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    MessageListResponse, MessageResponse, MessageSearchResponse, RebuildContextRequest, RebuildContextResponse,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SubmitConversationRatingRequest,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::{ApiError, MessagePosition, MessageType, generate_short_id, now_ms};
@@ -112,6 +113,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations", post(create).get(list))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/reset", post(reset))
+        .route("/api/conversations/{id}/context/rebuild", post(rebuild_context))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/native-sessions", get(native_sessions))
         .route("/api/native-sessions", get(native_session_catalog))
@@ -356,6 +358,22 @@ async fn reset(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     state.service.reset(&user.id, &id).await.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
+}
+
+/// Rebuild the conversation's ACP session in place so another model can take
+/// over, re-injecting a bounded slice of the stored history.
+async fn rebuild_context(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(req): Json<RebuildContextRequest>,
+) -> Result<Json<ApiResponse<RebuildContextResponse>>, ApiError> {
+    let response = state
+        .service
+        .rebuild_context(&user.id, &id, req)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 async fn associated(

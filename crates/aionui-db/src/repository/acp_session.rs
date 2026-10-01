@@ -78,6 +78,11 @@ pub trait IAcpSessionRepository: Send + Sync {
     /// `session/load` succeeds. Returns `true` when the row existed.
     async fn update_session_id(&self, conversation_id: &str, session_id: &str) -> Result<bool, DbError>;
 
+    /// Drop the stored `session_id` so the next runtime ensure rebuilds the ACP
+    /// session via `session/new` instead of resuming it. Returns `true` when
+    /// the row existed. Used by the in-place context rebuild.
+    async fn clear_session_id(&self, conversation_id: &str) -> Result<bool, DbError>;
+
     /// Delete the row. Called by the conversation delete hook — no DB
     /// foreign key, so this must be invoked explicitly.
     async fn delete(&self, conversation_id: &str) -> Result<bool, DbError>;

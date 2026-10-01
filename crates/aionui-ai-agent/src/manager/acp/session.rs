@@ -99,6 +99,13 @@ pub struct AcpSession {
     /// Starts `false` so resume paths, warmup-only flows, and aborted
     /// session/new attempts all correctly observe "no prelude pending".
     pending_session_new_prelude: bool,
+    /// Transcript captured by an in-place context rebuild, replayed on the
+    /// first prompt after `session/new` so the rebuilt session keeps working
+    /// context. Consumed by `ContextRebuildPreludeHook`.
+    ///
+    /// Only armed by `open_session_new` — resume paths already hold the CLI's
+    /// own history and must not replay it.
+    pending_context_rebuild: Option<String>,
     /// Why the session most recently terminated, if at all.
     ///
     /// Lifecycle (see also `CloseReason` doc comment):
@@ -158,6 +165,7 @@ impl AcpSession {
             session_id: None,
             opened: false,
             pending_session_new_prelude: false,
+            pending_context_rebuild: None,
             desired: Desired {
                 mode_id: initial_mode,
                 model_id: initial_model,
@@ -266,6 +274,17 @@ impl AcpSession {
     /// post-`session/new` payload. Idempotent.
     pub fn mark_pending_session_new_prelude(&mut self) {
         self.pending_session_new_prelude = true;
+    }
+
+    /// Arm the rebuilt-context transcript for the next prompt.
+    pub fn mark_pending_context_rebuild(&mut self, transcript: String) {
+        self.pending_context_rebuild = Some(transcript);
+    }
+
+    /// Consume the rebuilt-context transcript. Returns `Some` exactly once per
+    /// `mark_pending_context_rebuild`.
+    pub fn take_pending_context_rebuild(&mut self) -> Option<String> {
+        self.pending_context_rebuild.take()
     }
 
     pub fn has_pending_session_new_prelude(&self) -> bool {

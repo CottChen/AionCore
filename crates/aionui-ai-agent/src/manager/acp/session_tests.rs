@@ -1598,3 +1598,14 @@ fn mark_pending_session_new_prelude_is_idempotent() {
     assert!(s.take_pending_session_new_prelude());
     assert!(!s.take_pending_session_new_prelude());
 }
+
+#[test]
+fn pending_context_rebuild_is_absent_until_armed_and_consumed_once() {
+    let mut s = make_session();
+    assert_eq!(s.take_pending_context_rebuild(), None);
+
+    s.mark_pending_context_rebuild("历史记录".into());
+
+    assert_eq!(s.take_pending_context_rebuild().as_deref(), Some("历史记录"));
+    assert_eq!(s.take_pending_context_rebuild(), None);
+}

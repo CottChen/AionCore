@@ -204,6 +204,49 @@ pub struct ListConversationsQuery {
     pub pinned: Option<bool>,
 }
 
+/// Request for `POST /api/conversations/:id/context/rebuild`.
+///
+/// The conversation keeps its id and history; only the ACP session is rebuilt
+/// (`session/new` instead of `session/load`) so a different model can take over.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RebuildContextRequest {
+    /// How many of the most recent turns to re-inject. Defaults to 20, capped at 50.
+    pub max_turns: Option<u32>,
+    /// Model to apply to the rebuilt session. `None` keeps the current selection.
+    pub model_id: Option<String>,
+}
+
+/// Result of a context rebuild.
+#[derive(Debug, Clone, Serialize)]
+pub struct RebuildContextResponse {
+    pub conversation_id: String,
+    /// Turns available in the stored history.
+    pub available_turns: u32,
+    /// Turns actually injected into the rebuilt session's first prompt.
+    pub injected_turns: u32,
+    /// Characters of transcript injected.
+    pub injected_chars: u64,
+    /// True when older turns were dropped to stay within the injected budget.
+    pub truncated: bool,
+    /// Model the rebuilt session will use.
+    pub model_id: Option<String>,
+    /// Session id that was discarded by this rebuild, when one existed.
+    pub previous_session_id: Option<String>,
+}
+
+/// Transcript handed to the agent on the first prompt after a rebuild.
+///
+/// Persisted under `conversations.extra.context_rebuild` and consumed by the
+/// ACP factory, so it survives an app restart between rebuild and next turn.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingContextRebuild {
+    pub text: String,
+    pub turns: u32,
+    pub model_id: Option<String>,
+    pub created_at: i64,
+}
+
 /// Query parameters for `GET /api/conversations/:id/messages`.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListMessagesQuery {

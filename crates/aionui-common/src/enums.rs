@@ -249,6 +249,10 @@ pub enum AgentKillReason {
     /// The requested runtime capabilities changed, so the in-memory task must
     /// be rebuilt before handling the next turn.
     RuntimeCapabilityChanged,
+    /// The user rebuilt the conversation context in place so a different model
+    /// could take over. The conversation and its history are preserved; the ACP
+    /// session is recreated (`session/new`) with a bounded history prelude.
+    ContextRebuild,
 }
 
 /// Preview content type for document preview history.

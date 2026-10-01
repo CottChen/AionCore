@@ -104,6 +104,70 @@ async fn native_sessions_browser_routes_require_auth_and_validate_cursors() {
     }
 }
 
+#[tokio::test]
+async fn context_rebuild_requires_auth_and_rejects_conversations_without_history() {
+    let (mut app, services) = build_app().await;
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/conversations/missing/context/rebuild")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{\"max_turns\":5}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // State-changing requests are CSRF-guarded, so an anonymous POST is rejected
+    // with 403 before the auth middleware can answer 401.
+    assert_eq!(unauthenticated.status(), StatusCode::FORBIDDEN);
+
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let missing = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/conversations/missing/context/rebuild",
+            json!({ "max_turns": 5 }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let created = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/conversations",
+            create_body("Rebuild without history"),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let id = body_json(created).await["data"]["id"].as_str().unwrap().to_owned();
+
+    // No text history yet: there is nothing to replay, and the request must not
+    // silently clear a working session.
+    let empty = app
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/conversations/{id}/context/rebuild"),
+            json!({ "max_turns": 5, "model_id": "deepseek-flash" }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+}
+
 // ── T1: Create ────────────────────────────────────────────────────────
 
 #[tokio::test]

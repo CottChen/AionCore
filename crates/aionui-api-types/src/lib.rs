@@ -87,9 +87,9 @@ pub use conversation::{
     ConversationRatingResponse, ConversationRatingVote, ConversationResponse, ConversationRuntimeStateKind,
     ConversationRuntimeSummary, ConversationTurnPreview, ConversationTurnPreviewListResponse,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
-    MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, SubmitConversationRatingRequest, UpdateConversationArtifactRequest,
-    UpdateConversationRequest,
+    MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse, PendingContextRebuild,
+    RebuildContextRequest, RebuildContextResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SubmitConversationRatingRequest, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,

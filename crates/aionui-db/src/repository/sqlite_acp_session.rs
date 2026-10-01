@@ -76,6 +76,21 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn clear_session_id(&self, conversation_id: &str) -> Result<bool, DbError> {
+        // Forces the next runtime ensure down the `session/new` path instead of
+        // `session/load`: used by the in-place context rebuild, where the old
+        // CLI session must not be resumed.
+        let now = now_ms();
+        let result = sqlx::query(
+            "UPDATE acp_session SET session_id = NULL, session_status = 'idle', last_active_at = ? WHERE conversation_id = ?",
+        )
+        .bind(now)
+        .bind(conversation_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn delete(&self, conversation_id: &str) -> Result<bool, DbError> {
         let result = sqlx::query("DELETE FROM acp_session WHERE conversation_id = ?")
             .bind(conversation_id)
@@ -244,6 +259,20 @@ mod tests {
         repo.create(&create_params("conv-1")).await.unwrap();
         let err = repo.create(&create_params("conv-1")).await.unwrap_err();
         assert!(matches!(err, DbError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn clear_session_id_drops_the_id_so_the_next_ensure_rebuilds() {
+        let (repo, _db) = setup().await;
+        repo.create(&create_params("conv-1")).await.unwrap();
+        repo.update_session_id("conv-1", "sess-abc").await.unwrap();
+
+        assert!(repo.clear_session_id("conv-1").await.unwrap());
+
+        let fetched = repo.get("conv-1").await.unwrap().unwrap();
+        assert_eq!(fetched.session_id, None);
+        assert_eq!(fetched.session_status, "idle");
+        assert!(!repo.clear_session_id("missing").await.unwrap());
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::TeamMcpStdioConfig;
+use crate::{PendingContextRebuild, TeamMcpStdioConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -73,6 +73,10 @@ pub struct AcpBuildExtra {
     pub session_mcp_servers: Vec<SessionMcpServer>,
     #[serde(default)]
     pub user_id: Option<String>,
+    /// Transcript captured by an in-place context rebuild, injected on the
+    /// first prompt of the rebuilt session. See `RebuildContextRequest`.
+    #[serde(default)]
+    pub context_rebuild: Option<PendingContextRebuild>,
 }
 
 /// Aionrs-specific fields extracted from `extra` in build task options.

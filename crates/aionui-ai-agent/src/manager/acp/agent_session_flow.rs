@@ -57,6 +57,11 @@ impl AcpAgentManager {
             // Mark that the next prompt should carry the first-prompt prelude
             // (preset_context + skill index). Consumed by SessionNewPreludeHook.
             session.mark_pending_session_new_prelude();
+            // A rebuilt session starts with no CLI-side history: replay the
+            // bounded transcript captured by the in-place context rebuild.
+            if let Some(transcript) = self.params.context_rebuild.clone() {
+                session.mark_pending_context_rebuild(transcript);
+            }
             self.commit_session_changes(&mut session).await;
         }
         self.emit_snapshot_events().await;

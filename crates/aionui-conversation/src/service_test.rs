@@ -24,8 +24,8 @@ use aionui_api_types::{
     SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
-    SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
+    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, RebuildContextRequest,
+    SearchMessagesQuery, SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
@@ -978,6 +978,10 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
     }
     async fn update_session_id(&self, _conversation_id: &str, session_id: &str) -> Result<bool, DbError> {
         *self.session_id.lock().unwrap() = Some(session_id.to_owned());
+        Ok(true)
+    }
+    async fn clear_session_id(&self, _conversation_id: &str) -> Result<bool, DbError> {
+        *self.session_id.lock().unwrap() = None;
         Ok(true)
     }
     async fn delete(&self, _conversation_id: &str) -> Result<bool, DbError> {
@@ -7754,5 +7758,122 @@ async fn cron_required_runtime_mode_wins_over_resolved_permission_seed() {
         agent.set_config_option_calls.lock().unwrap().as_slice(),
         &[("mode".to_owned(), "default".to_owned())],
         "cron required-runtime-mode must override the rebuild permission seed"
+    );
+}
+
+// ── In-place context rebuild ───────────────────────────────────────
+
+fn text_message(id: &str, conversation_id: &str, position: &str, text: &str, created_at: i64) -> MessageRow {
+    MessageRow {
+        id: id.to_owned(),
+        conversation_id: conversation_id.to_owned(),
+        msg_id: None,
+        r#type: "text".into(),
+        content: json!({ "content": text }).to_string(),
+        position: Some(position.to_owned()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at,
+    }
+}
+
+async fn seed_two_turns(repo: &Arc<MockRepo>, conversation_id: &str) {
+    repo.insert_message(&text_message("m-0", conversation_id, "right", "问题一", 1))
+        .await
+        .unwrap();
+    repo.insert_message(&text_message("m-1", conversation_id, "left", "回答一", 2))
+        .await
+        .unwrap();
+    repo.insert_message(&text_message("m-2", conversation_id, "right", "问题二", 3))
+        .await
+        .unwrap();
+    repo.insert_message(&text_message("m-3", conversation_id, "left", "回答二", 4))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rebuild_context_reinjects_recent_turns_and_forces_a_fresh_session() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-old"));
+    let (svc, broadcaster, repo, _task_mgr) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_repo.clone(),
+    );
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+    seed_two_turns(&repo, &conv.id).await;
+
+    let response = svc
+        .rebuild_context(
+            "user_1",
+            &conv.id,
+            RebuildContextRequest {
+                max_turns: Some(1),
+                model_id: Some("deepseek-flash".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.available_turns, 2);
+    assert_eq!(response.injected_turns, 1);
+    assert!(response.truncated, "the older turn does not fit the requested window");
+    assert_eq!(response.previous_session_id.as_deref(), Some("sess-old"));
+    assert_eq!(response.model_id.as_deref(), Some("deepseek-flash"));
+
+    assert_eq!(
+        acp_repo.session_id.lock().unwrap().clone(),
+        None,
+        "the stored session id must be dropped so the next ensure rebuilds via session/new"
+    );
+
+    let updated = repo.get(&conv.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&updated.extra).unwrap();
+    assert_eq!(extra["current_model_id"], json!("deepseek-flash"));
+    let transcript = extra["context_rebuild"]["text"].as_str().unwrap();
+    assert!(
+        transcript.contains("问题二") && transcript.contains("回答二"),
+        "newest turn must be replayed: {transcript}"
+    );
+    assert!(
+        !transcript.contains("问题一"),
+        "max_turns=1 must drop the older turn: {transcript}"
+    );
+    assert_eq!(extra["context_rebuild"]["turns"], json!(1));
+
+    let events = broadcaster.take_events();
+    assert!(
+        events.iter().any(|event| event.name == "conversation.listChanged"),
+        "the sidebar must be told the conversation was updated"
+    );
+}
+
+#[tokio::test]
+async fn rebuild_context_rejects_unsupported_conversations_and_missing_history() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+
+    let non_acp = insert_conversation_with_type(&repo, "user_1", AgentType::Aionrs).await;
+    assert!(matches!(
+        svc.rebuild_context("user_1", &non_acp.id, RebuildContextRequest::default())
+            .await,
+        Err(ConversationError::BadRequest { .. })
+    ));
+
+    let acp = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+    assert!(
+        matches!(
+            svc.rebuild_context("user_1", &acp.id, RebuildContextRequest::default())
+                .await,
+            Err(ConversationError::BadRequest { .. })
+        ),
+        "a conversation without text history has nothing to replay"
+    );
+
+    assert!(
+        matches!(
+            svc.rebuild_context("someone_else", &acp.id, RebuildContextRequest::default())
+                .await,
+            Err(ConversationError::NotFound { .. })
+        ),
+        "the rebuild must stay scoped to the owning user"
     );
 }

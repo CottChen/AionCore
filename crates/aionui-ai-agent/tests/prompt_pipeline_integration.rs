@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use aionui_ai_agent::capability::prompt_pipeline::{PromptCtx, PromptPipeline};
 use aionui_ai_agent::factory::acp_assembler::{AcpSessionParams, WorkspaceInfo, assemble_acp_params};
-use aionui_ai_agent::manager::acp::{AcpSession, SessionNewPreludeHook};
+use aionui_ai_agent::manager::acp::{AcpSession, ContextRebuildPreludeHook, SessionNewPreludeHook};
 use aionui_ai_agent::registry::AgentRegistry;
 use aionui_ai_agent::shared_kernel::ModelId;
 use aionui_ai_agent::{AcpBuildExtra, AcpSkillManager, AgentRuntime};
@@ -19,10 +19,20 @@ use aionui_db::{SqliteAgentMetadataRepository, init_database_memory};
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
+/// Thin wrapper used by the prelude tests (no rebuilt-context transcript).
 async fn fixture_params(
     backend: &str,
     preset_context: Option<&str>,
     is_custom_workspace: bool,
+) -> Arc<AcpSessionParams> {
+    fixture_params_with(backend, preset_context, is_custom_workspace, None).await
+}
+
+async fn fixture_params_with(
+    backend: &str,
+    preset_context: Option<&str>,
+    is_custom_workspace: bool,
+    context_rebuild: Option<&str>,
 ) -> Arc<AcpSessionParams> {
     let db = init_database_memory().await.unwrap();
     let repo = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
@@ -51,6 +61,12 @@ async fn fixture_params(
         mcp_server_ids: None,
         session_mcp_servers: vec![],
         user_id: None,
+        context_rebuild: context_rebuild.map(|text| aionui_api_types::PendingContextRebuild {
+            text: text.to_owned(),
+            turns: 1,
+            model_id: None,
+            created_at: 0,
+        }),
     };
 
     Arc::new(
@@ -92,6 +108,14 @@ fn fixture_runtime() -> AgentRuntime {
 
 fn make_pipeline() -> PromptPipeline {
     PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)])
+}
+
+/// Mirrors the production hook order registered by `AcpAgentManager::new`.
+fn make_rebuild_pipeline() -> PromptPipeline {
+    PromptPipeline::new(vec![
+        Arc::new(ContextRebuildPreludeHook),
+        Arc::new(SessionNewPreludeHook),
+    ])
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -220,4 +244,45 @@ async fn prelude_io_failure_emits_prompt_hook_warning() {
     // payload deserializes to AcpPromptHookWarningPayload with
     // hook == "session_new_prelude".
     let _ = fixture_params("claude", Some("ctx"), true).await;
+}
+
+/// In-place context rebuild: the captured transcript is replayed once, between
+/// the preset rules and the user's message.
+#[tokio::test(flavor = "current_thread")]
+async fn rebuilt_session_replays_transcript_between_rules_and_user_message() {
+    let transcript = "【第 1 轮】\n用户：之前的问题\n助手：之前的回答";
+    let params = fixture_params_with("claude", Some("Rule A"), true, Some(transcript)).await;
+    let skill_manager = fixture_skill_manager();
+    let runtime = fixture_runtime();
+    let mut session = AcpSession::new(None, None, HashMap::new());
+
+    // Simulate `open_session_new` arming both one-shot blocks.
+    session.mark_pending_session_new_prelude();
+    session.mark_pending_context_rebuild(transcript.to_owned());
+
+    let pipeline = make_rebuild_pipeline();
+    let mut ctx = PromptCtx {
+        session: &mut session,
+        params: &params,
+        skill_manager: &skill_manager,
+        runtime: &runtime,
+    };
+
+    let out = pipeline.pre_send(&mut ctx, "新的问题".into()).await;
+
+    let rules_at = out.find("Rule A").expect("preset rules missing");
+    let transcript_at = out.find("之前的问题").expect("transcript missing");
+    let user_at = out.find("新的问题").expect("user message missing");
+    assert!(rules_at < transcript_at, "rules must precede the transcript: {out}");
+    assert!(
+        transcript_at < user_at,
+        "transcript must precede the user message: {out}"
+    );
+    assert!(out.ends_with("新的问题"), "user content should stay last: {out}");
+
+    assert_eq!(
+        session.take_pending_context_rebuild(),
+        None,
+        "transcript must be one-shot"
+    );
 }

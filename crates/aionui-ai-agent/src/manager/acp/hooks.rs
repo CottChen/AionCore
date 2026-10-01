@@ -38,6 +38,28 @@ impl PreSendHook for SessionNewPreludeHook {
     }
 }
 
+/// Replays the transcript captured by an in-place context rebuild.
+///
+/// Runs before `SessionNewPreludeHook` so the final prompt reads
+/// `preset rules → history transcript → user message`.
+#[derive(Default)]
+pub struct ContextRebuildPreludeHook;
+
+const CONTEXT_REBUILD_SEPARATOR: &str = "\n\n---\n\n";
+
+#[async_trait::async_trait]
+impl PreSendHook for ContextRebuildPreludeHook {
+    async fn pre_send(&self, ctx: &mut PromptCtx<'_>, prompt: String) -> String {
+        let Some(transcript) = ctx.session.take_pending_context_rebuild() else {
+            return prompt;
+        };
+        if transcript.trim().is_empty() {
+            return prompt;
+        }
+        format!("{transcript}{CONTEXT_REBUILD_SEPARATOR}{prompt}")
+    }
+}
+
 /// Emit a non-blocking toast warning back to the UI via the stream
 /// channel. Used by hook adapters when their underlying helper fails
 /// but the pipeline must keep the prompt flowing.

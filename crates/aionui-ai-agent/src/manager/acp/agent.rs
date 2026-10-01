@@ -5,7 +5,9 @@ use crate::capability::prompt_pipeline::PromptPipeline;
 use crate::capability::skill_manager::AcpSkillManager;
 use crate::error::AgentError;
 use crate::factory::acp_assembler::AcpSessionParams;
-use crate::manager::acp::{AcpSession, AcpSessionEvent, PermissionRouter, SessionNewPreludeHook};
+use crate::manager::acp::{
+    AcpSession, AcpSessionEvent, ContextRebuildPreludeHook, PermissionRouter, SessionNewPreludeHook,
+};
 use crate::manager::process_registry::{register_session_process, unregister_agent_process};
 use crate::protocol::acp::AcpProtocol;
 use crate::protocol::error::{AcpError, CloseReason};
@@ -492,7 +494,12 @@ impl AcpAgentManager {
         );
         seed_startup_config_preferences(&mut session, &params, &startup_config_seed_base);
 
-        let pipeline = PromptPipeline::new(vec![Arc::new(SessionNewPreludeHook)]);
+        // Order matters: each hook prepends, so the rebuild transcript lands
+        // between the preset rules and the user's own message.
+        let pipeline = PromptPipeline::new(vec![
+            Arc::new(ContextRebuildPreludeHook),
+            Arc::new(SessionNewPreludeHook),
+        ]);
 
         let manager = Self {
             params,

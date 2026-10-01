@@ -27,6 +27,9 @@ pub struct AcpSessionParams {
     pub config: AcpBuildExtra,
     pub mcp_servers: Vec<McpServer>,
     pub preset_context: Option<String>,
+    /// Transcript replayed on the first prompt after `session/new` when the
+    /// conversation was rebuilt in place so another model could take over.
+    pub context_rebuild: Option<String>,
     pub session_snapshot: Option<PersistedSessionState>,
     /// Backend data directory (`AppConfig.data_dir`) used for process
     /// registration and optional prompt diagnostics.
@@ -70,6 +73,12 @@ pub async fn assemble_acp_params(
 ) -> AcpSessionParams {
     let mcp_servers = resolve_mcp_servers(&config, user_mcp_servers);
     let preset_context = compose_preset_context(config.preset_context.as_deref());
+    let context_rebuild = config
+        .context_rebuild
+        .as_ref()
+        .map(|pending| pending.text.trim())
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned);
 
     AcpSessionParams {
         conversation_id,
@@ -79,6 +88,7 @@ pub async fn assemble_acp_params(
         config,
         mcp_servers,
         preset_context,
+        context_rebuild,
         session_snapshot,
         data_dir,
         dump_prompts,
