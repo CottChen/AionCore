@@ -641,6 +641,6 @@ mod tests {
         pi.agent_source_info.binary_name = Some("pi".into());
         pi.agent_source_info.bridge_binary = Some("npx".into());
         pi.args = vec!["-y".into(), "pi-acp".into()];
-        assert_eq!(explicit_probe_args(&pi).unwrap(), ["-y", "pi-acp@0.0.31"]);
+        assert_eq!(explicit_probe_args(&pi).unwrap(), ["-y", "pi-acp@0.0.34"]);
     }
 }
