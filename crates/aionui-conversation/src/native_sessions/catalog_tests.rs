@@ -56,6 +56,24 @@ fn pi_catalog_reads_only_shallow_regular_files_and_cursor_stays_on_the_same_snap
             .all(|a| a.title == "Hello" && second.iter().all(|b| a.id != b.id))
     );
 }
+#[test]
+fn pi_catalog_finds_title_beyond_large_system_prompt_entry() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("project");
+    std::fs::create_dir(&dir).unwrap();
+    let dump = "s".repeat(40 * 1024);
+    std::fs::write(
+        dir.join("0.jsonl"),
+        format!(
+            "{{\"type\":\"session\",\"id\":\"pi-0\",\"cwd\":\"/project\"}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"system\",\"content\":\"{dump}\"}}}}\n{{\"type\":\"message\",\"message\":{{\"role\":\"user\",\"content\":\"Hello after system\"}}}}\n"
+        ),
+    )
+    .unwrap();
+    let (items, _, _) = list_pi(root.path(), None, "").unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].title, "Hello after system");
+}
+
 #[cfg(unix)]
 #[test]
 fn pi_metadata_rechecks_a_cached_file_before_opening_it() {

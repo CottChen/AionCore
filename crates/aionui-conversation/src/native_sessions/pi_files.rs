@@ -167,8 +167,10 @@ pub(super) fn enrich(root: &Path, entry: &Entry) -> Result<NativeSessionItem, St
     let mut item = entry.item.clone();
     let mut file = super::transcript::open_file(root, &entry.path)?;
     let mut head = Vec::new();
+    // pi >= 1.0 persists a large system prompt dump before the first user
+    // message; keep the title scan bounded but big enough to clear it.
     Read::by_ref(&mut file)
-        .take(32768)
+        .take(262144)
         .read_to_end(&mut head)
         .map_err(io_status)?;
     for line in head.split(|b| *b == b'\n') {
